@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import itertools
 import math
+import os
 import re
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass
 
@@ -34,6 +35,15 @@ _CACHE = ContextVar("einfold_dense_computed_cache", default=None)
 
 class _ComputedCache:
     def __init__(self, max_bytes):
+        mode = os.environ.get("EINFOLD_DENSE_OPTIMIZE", "cse")
+        if mode not in {"0", "off", "facts", "cse", "all"}:
+            raise ValueError(
+                "EINFOLD_DENSE_OPTIMIZE must be off, facts, cse or all"
+            )
+        self.facts = mode in {"facts", "all"}
+        self.cse = mode in {"cse", "all"}
+        self.nodes = {}
+        self.optimizations = Counter()
         self.max_bytes = max_bytes
         self.bytes = 0
         self.peak = 0
@@ -62,6 +72,23 @@ class _ComputedCache:
 def _remember(tensor):
     cache = _CACHE.get()
     return cache.remember(tensor) if cache is not None else tensor.cached
+
+
+def _node(kind, axes=(), args=(), value=None, axis=None, *, key=None):
+    """Share pure expressions within one invocation, never numerical inputs."""
+    cache = _CACHE.get()
+    if cache is None or not cache.cse:
+        return _Tensor(kind, axes, args, value, axis)
+    signature = kind, tuple(axes), tuple(args), axis, key
+    if signature in cache.nodes:
+        cache.optimizations["dense_cse_hits"] += 1
+        return cache.nodes[signature]
+    result = _Tensor(kind, axes, args, value, axis)
+    # Bound graph metadata independently of the computed-array LRU. Nodes
+    # already referenced by a result remain alive after this limit is hit.
+    if len(cache.nodes) < 32768:
+        cache.nodes[signature] = result
+    return result
 
 
 def _numpy(value):
@@ -203,10 +230,18 @@ class _Tensor:
     def rename(self, mapping):
         if not any(a in mapping for a in self.axes):
             return self
-        return _Tensor(
+        parent = self
+        axes = tuple(mapping.get(a, a) for a in self.axes)
+        if (
+            self.kind == "rename"
+            and _CACHE.get() is not None
+            and _CACHE.get().cse
+        ):
+            parent = self.args[0]
+        return _node(
             "rename",
-            tuple(mapping.get(a, a) for a in self.axes),
-            (self,),
+            axes,
+            (parent,),
             axis=mapping.get(self.axis, self.axis),
         )
 
@@ -225,7 +260,8 @@ class _Tensor:
 
 
 def _const(value):
-    return _Tensor("array", value=value)
+    data = np.asarray(value)
+    return _node("array", value=value, key=(data.dtype.str, data.tobytes()))
 
 
 def _truth(value):
@@ -284,6 +320,10 @@ def _op(kind, *args):
             return _const(False)
         if len(args) == 1:
             return args[0]
+    if kind in {"and", "or"} and _CACHE.get() is not None and _CACHE.get().cse:
+        args = tuple(dict.fromkeys(args))
+        if len(args) == 1:
+            return args[0]
     if kind in {"and", "or"} and len(args) > 2:
         return _op(kind, args[0], _op(kind, *args[1:]))
     if kind == "where":
@@ -303,7 +343,7 @@ def _op(kind, *args):
             return args[1]
         if _is(args[0], False):
             return args[2]
-    return _Tensor(kind, _axes(*(a.axes for a in args)), args)
+    return _node(kind, _axes(*(a.axes for a in args)), args)
 
 
 def _divide(a, b):
@@ -586,6 +626,21 @@ def _factors(value):
 
 
 def _sum(value, mask, row_axes, kept):
+    cache = _CACHE.get()
+    if (
+        cache is not None
+        and cache.facts
+        and _is(value, 1)
+        and np.asarray(value.value).dtype.kind in "bi"
+    ):
+        # COUNT over a full Cartesian domain is independent of numerical
+        # values. Empty reductions still have count zero and NULL SUM/AVG.
+        count = math.prod(len(a) for a in row_axes if a not in kept)
+        if (_is(mask, True) or _is(mask, False)) and count < 1 << 63:
+            cache.optimizations["dense_count_proofs"] += 1
+            result = _const(np.int64(count if _is(mask, True) else 0))
+            result.count_bound = count
+            return result
     factors = _factors(value)
     if not _is(mask, True):
         factors.append(mask)
@@ -654,7 +709,14 @@ def _sum(value, mask, row_axes, kept):
         operands.append([labels[a] for a in output])
         return np.einsum(*operands, optimize=True) * repeated
 
-    result = _Tensor("reduce", output, value=compute)
+    result = _node(
+        "reduce",
+        output,
+        factors,
+        value=compute,
+        # Product provenance also determines narrow-integer overflow checks.
+        key=(tuple(row_axes), tuple(kept), repeated, len(_factors(value)) > 1),
+    )
     result.host_only = value.host_only and mask.host_only
     if _is(value, 1):
         result.count_bound = math.prod(
