@@ -42,6 +42,16 @@ class _ComputedCache:
             )
         self.facts = mode in {"facts", "all"}
         self.cse = mode in {"cse", "all"}
+        predicates = os.environ.get(
+            "EINFOLD_DENSE_PREDICATES",
+            "off" if mode in {"0", "off"} else "boolean",
+        )
+        if predicates not in {"0", "off", "boolean", "presence", "all"}:
+            raise ValueError(
+                "EINFOLD_DENSE_PREDICATES must be off, boolean, presence or all"
+            )
+        self.boolean = predicates in {"boolean", "all"}
+        self.presence = predicates in {"presence", "all"}
         self.nodes = {}
         self.optimizations = Counter()
         self.max_bytes = max_bytes
@@ -129,6 +139,7 @@ class _Tensor:
         self.cached = None
         self.domain = axis
         self.count_bound = None
+        self.positive = None
         self.host_only = (
             np.asarray(value).dtype.kind in "biuUS"
             if kind == "array"
@@ -238,12 +249,15 @@ class _Tensor:
             and _CACHE.get().cse
         ):
             parent = self.args[0]
-        return _node(
+        result = _node(
             "rename",
             axes,
             (parent,),
             axis=mapping.get(self.axis, self.axis),
         )
+        if self.positive is not None:
+            result.positive = self.positive.rename(mapping)
+        return result
 
     def take(self, axis, indexes, replacement):
         if axis not in self.axes:
@@ -256,6 +270,8 @@ class _Tensor:
         runtime = _EXECUTION.get()
         if runtime is not None and runtime.owns(indexes):
             result.host_only = False
+        if self.positive is not None:
+            result.positive = self.positive.take(axis, indexes, replacement)
         return result
 
 
@@ -286,6 +302,38 @@ def _is(value, literal):
 
 
 def _op(kind, *args):
+    cache = _CACHE.get()
+    if cache is not None and cache.boolean:
+        if kind == "not":
+            if _is(args[0], True) or _is(args[0], False):
+                cache.optimizations["dense_boolean_proofs"] += 1
+                return _const(not bool(args[0].value))
+            if args[0].kind == "not":
+                cache.optimizations["dense_boolean_proofs"] += 1
+                return _op("bool", args[0].args[0])
+        if kind == "bool" and args[0].kind == "bool":
+            return args[0]
+        if (
+            kind == "where"
+            and all(
+                a.kind == "array"
+                and not a.axes
+                and np.asarray(a.value).dtype.kind == "b"
+                for a in args[1:]
+            )
+            and bool(args[1].value) != bool(args[2].value)
+        ):
+            cache.optimizations["dense_boolean_proofs"] += 1
+            return _op("bool" if args[1].value else "not", args[0])
+    if (
+        kind == ">"
+        and cache is not None
+        and cache.presence
+        and args[0].positive is not None
+        and _is(args[1], 0)
+    ):
+        cache.optimizations["dense_presence_proofs"] += 1
+        return args[0].positive
     if kind in {"+", "-", "*", "/", "%", "neg", "abs", "power", "pow"} and any(
         a.domain is not None for a in args
     ):
@@ -722,6 +770,14 @@ def _sum(value, mask, row_axes, kept):
         result.count_bound = math.prod(
             len(a) for a in row_axes if a not in kept
         )
+        if (
+            cache is not None
+            and cache.presence
+            and np.asarray(value.value).dtype.kind in "bi"
+            and result.count_bound < 1 << 63
+            and set(mask.axes).issubset(kept)
+        ):
+            result.positive = mask if result.count_bound else _const(False)
     return result
 
 
