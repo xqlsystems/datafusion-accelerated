@@ -118,6 +118,35 @@ class _Axis:
         return len(self.values)
 
 
+@dataclass(frozen=True)
+class _Reduction:
+    """SQL reduction provenance, independent of any numerical backend.
+
+    ``mask`` includes both row presence and column validity. ``row_axes``
+    describes the joined rows, including axes a constant value omits.
+    ``kept`` describes SQL group keys, not just the value's output axes.
+    A host may select an equivalent primitive from these facts; returning
+    no implementation retains the original aggregate and its NULL flags.
+    """
+
+    kind: str
+    value: _Tensor
+    mask: _Tensor
+    row_axes: tuple
+    kept: tuple
+    factors: tuple = ()
+    repeated: int = 1
+
+
+@dataclass(frozen=True)
+class _UnionPart:
+    """One ordered, masked partial contribution to a grouped SQL UNION ALL."""
+
+    value: _Tensor
+    mask: _Tensor
+    axes: tuple
+
+
 def _axes(*groups):
     return tuple(dict.fromkeys(itertools.chain.from_iterable(groups)))
 
@@ -136,6 +165,9 @@ class _Tensor:
     def __init__(self, kind, axes=(), args=(), value=None, axis=None):
         self.kind, self.axes, self.args = kind, tuple(axes), tuple(args)
         self.value, self.axis = value, axis
+        self.reduction = None
+        self.union = None
+        self.presence = None
         self.cached = None
         self.domain = axis
         self.count_bound = None
@@ -224,7 +256,15 @@ class _Tensor:
                         else np.take(parent.get(), indexes, axis=at)
                     )
             elif self.kind == "reduce":
-                self.cached = self.value()
+                runtime = _EXECUTION.get()
+                lower = getattr(runtime, "reduction", None)
+                lowered = (
+                    lower(self)
+                    if lower is not None
+                    and (self.reduction is not None or self.union is not None)
+                    else None
+                )
+                self.cached = self.value() if lowered is None else lowered
             else:
                 runtime = _EXECUTION.get()
                 if runtime is not None:
@@ -766,6 +806,15 @@ def _sum(value, mask, row_axes, kept):
         key=(tuple(row_axes), tuple(kept), repeated, len(_factors(value)) > 1),
     )
     result.host_only = value.host_only and mask.host_only
+    result.reduction = _Reduction(
+        "sum",
+        value,
+        mask,
+        tuple(row_axes),
+        tuple(kept),
+        tuple(factors),
+        repeated,
+    )
     if _is(value, 1):
         result.count_bound = math.prod(
             len(a) for a in row_axes if a not in kept
@@ -828,7 +877,10 @@ def _reduce(kind, column, table, kept):
                 values, axis=axes, initial=initial
             )
 
-        value = _Tensor("reduce", output, value=compute)
+        value = _Tensor("reduce", output, (column.tensor, mask), value=compute)
+        value.reduction = _Reduction(
+            kind, column.tensor, mask, tuple(table.axes), tuple(kept)
+        )
     else:
         raise _Decline(f"aggregate {kind}")
     return _Column(value, _truth(_op(">", count, _const(0))))
@@ -1386,6 +1438,10 @@ def _group_flags(parts, keys, axes, key=None):
         return result
 
     result = _Tensor("reduce", output, value=compute)
+    result.presence = tuple(
+        _UnionPart(_const(1), mask, tuple(source[i] for i in selected))
+        for source, mask in zip(sources, masks)
+    )
     result.host_only = all(m.host_only for m in masks)
     return _truth(result)
 
@@ -1471,7 +1527,17 @@ def _aggregate_bag(bag, groups, aggregates):
                     result[...] += np.where(valid, data, 0)
             return result
 
-        return _Tensor("reduce", axes, value=compute)
+        result = _Tensor("reduce", axes, value=compute)
+        if not present:
+            result.union = tuple(
+                _UnionPart(
+                    p.columns[key].tensor,
+                    _op("and", p.present, p.columns[key].valid),
+                    tuple(p.columns[k].tensor.axis for k in keys),
+                )
+                for p in parts
+            )
+        return result
 
     columns = [(k, _column(a.values, (a,), a)) for k, a in zip(keys, axes)]
     present = _group_flags(parts, keys, axes) if groups else _const(True)
