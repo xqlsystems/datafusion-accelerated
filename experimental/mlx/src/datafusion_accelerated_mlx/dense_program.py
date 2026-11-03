@@ -52,6 +52,13 @@ class _ComputedCache:
             )
         self.boolean = predicates in {"boolean", "all"}
         self.presence = predicates in {"presence", "all"}
+        self.group_proofs = (
+            os.environ.get(
+                "EINFOLD_DENSE_GROUP_PROOFS",
+                "0" if mode in {"0", "off"} else "1",
+            )
+            != "0"
+        )
         self.nodes = {}
         self.optimizations = Counter()
         self.max_bytes = max_bytes
@@ -1262,7 +1269,12 @@ def _segment(table, groups, aggregates, keys, dependent):
                 "GPU grouping requires a proven finite integer domain"
             )
         unique = key.domain.values
-        inverse, found = _indexes(key.domain, values)
+        cache = _CACHE.get()
+        if cache is not None and cache.group_proofs:
+            inverse, found = _key_indexes(key.domain, key)
+            cache.optimizations["dense_group_domain_proofs"] += 1
+        else:
+            inverse, found = _indexes(key.domain, values)
         table = _Table(
             table.axes,
             table.columns.items(),
@@ -1394,6 +1406,24 @@ def _group_flags(parts, keys, axes, key=None):
         for p in parts
     ]
     sources = [tuple(p.columns[k].tensor.axis for k in keys) for p in parts]
+    cache = _CACHE.get()
+    if (
+        cache is not None
+        and cache.group_proofs
+        and any(
+            _is(mask, True)
+            and len(set(source)) == len(source)
+            and all(
+                np.array_equal(a.values, s.values) for a, s in zip(axes, source)
+            )
+            for mask, source in zip(masks, sources)
+        )
+    ):
+        # One complete, valid branch reaches every output coordinate. The
+        # other branches can add duplicates or values, but cannot remove
+        # that branch's rows or make all contributions NULL.
+        cache.optimizations["dense_union_presence_proofs"] += 1
+        return _const(True)
     needed = set()
     for source, mask in zip(sources, masks):
         needed.update(source.index(a) for a in mask.axes)
