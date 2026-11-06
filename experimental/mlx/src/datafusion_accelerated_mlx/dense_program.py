@@ -59,6 +59,7 @@ class _ComputedCache:
             )
             != "0"
         )
+        self.reshape_layout = os.environ.get("EINFOLD_DENSE_LAYOUT") == "1"
         self.nodes = {}
         self.optimizations = Counter()
         self.max_bytes = max_bytes
@@ -168,6 +169,19 @@ def _align(array, source, target):
     return array.reshape(tuple(len(a) if a in source else 1 for a in target))
 
 
+def _reshape_layout(indexes, replacement, occupied, source_size):
+    """Prove row-major positions, constant along already present axes."""
+    if not isinstance(indexes, np.ndarray) or not source_size:
+        return None
+    layout = tuple(a for a in replacement if a not in occupied)
+    if not layout or math.prod(len(a) for a in layout) != source_size:
+        return None
+    shape = tuple(len(a) if a in layout else 1 for a in replacement)
+    if np.all(indexes == np.arange(source_size).reshape(shape)):
+        return layout
+    return None
+
+
 class _Tensor:
     def __init__(self, kind, axes=(), args=(), value=None, axis=None):
         self.kind, self.axes, self.args = kind, tuple(axes), tuple(args)
@@ -237,6 +251,22 @@ class _Tensor:
             elif self.kind == "take":
                 source, indexes, at, replacement = self.value
                 parent = self.args[0]
+                if cache is not None and cache.reshape_layout:
+                    layout = _reshape_layout(
+                        indexes, replacement, parent.axes, len(source)
+                    )
+                    if layout is not None:
+                        axes = (
+                            *parent.axes[:at],
+                            *layout,
+                            *parent.axes[at + 1 :],
+                        )
+                        array = parent.get().reshape(
+                            tuple(len(a) for a in axes)
+                        )
+                        self.cached = _align(array, axes, self.axes)
+                        cache.optimizations["dense_gather_reshapes"] += 1
+                        return _remember(self)
                 overlap = set(replacement) & (set(parent.axes) - {source})
                 if overlap:
                     selectors = []
@@ -1321,10 +1351,31 @@ def _segment(table, groups, aggregates, keys, dependent):
             _align(inverse.reshape(values.shape), key.axes, local), shape
         )
     ).reshape(rows, -1)
+    cache = _CACHE.get()
+    flat_layout = (
+        cache is not None
+        and cache.reshape_layout
+        and isinstance(inverse, np.ndarray)
+        and not set(key.axes) & set(independent)
+        and _reshape_layout(
+            inverse.reshape(values.shape), key.axes, (), len(unique)
+        )
+        is not None
+    )
 
     def scatter(tensor):
         def compute():
             runtime = _EXECUTION.get()
+            if flat_layout:
+                data = tensor.get()
+                cache.optimizations["dense_scatter_reshapes"] += 1
+                if runtime is not None and runtime.owns(data):
+                    return runtime.broadcast(
+                        data, tensor.axes, local, shape
+                    ).reshape(result_shape)
+                return np.broadcast_to(
+                    _align(data, tensor.axes, local), shape
+                ).reshape(result_shape)
             if runtime is not None and (
                 runtime.owns(tensor.get()) or runtime.owns(indexes)
             ):
