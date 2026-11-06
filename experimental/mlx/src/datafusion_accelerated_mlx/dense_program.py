@@ -155,6 +155,15 @@ class _UnionPart:
     axes: tuple
 
 
+@dataclass(frozen=True)
+class _IndexedPartial:
+    """Values and lookup key before a grouped scatter."""
+
+    value: _Tensor
+    key: _Tensor
+    local: tuple
+
+
 def _axes(*groups):
     return tuple(dict.fromkeys(itertools.chain.from_iterable(groups)))
 
@@ -189,6 +198,7 @@ class _Tensor:
         self.reduction = None
         self.union = None
         self.presence = None
+        self.indexed = None
         self.cached = None
         self.domain = axis
         self.count_bound = None
@@ -1398,6 +1408,7 @@ def _segment(table, groups, aggregates, keys, dependent):
             return result.reshape(result_shape)
 
         result = _Tensor("reduce", output, value=compute)
+        result.indexed = _IndexedPartial(tensor, key, local)
         result.host_only = tensor.host_only and not (
             runtime is not None and runtime.owns(indexes)
         )
