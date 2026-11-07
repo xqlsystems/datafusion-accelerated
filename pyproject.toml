@@ -1,7 +1,7 @@
 [project]
-name = "runtime"
+name = "xql-runtime"
 version = "0.1.0"
-description = "Runs XQL programs: execution, device residency, kernels, memory and scheduling. The name is a placeholder."
+description = "Runs XQL programs: execution, device residency, kernels, memory and scheduling."
 readme = "README.md"
 authors = [
     { name = "Alex Merose", email = "al@merose.com" }
