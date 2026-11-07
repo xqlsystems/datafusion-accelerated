@@ -59,7 +59,9 @@ class _ComputedCache:
             )
             != "0"
         )
-        self.reshape_layout = os.environ.get("EINFOLD_DENSE_LAYOUT") == "1"
+        layout = os.environ.get("EINFOLD_DENSE_LAYOUT")
+        self.reshape_layout = layout in {"1", "extended"}
+        self.extended_layout = layout == "extended"
         self.nodes = {}
         self.optimizations = Counter()
         self.max_bytes = max_bytes
@@ -178,17 +180,53 @@ def _align(array, source, target):
     return array.reshape(tuple(len(a) if a in source else 1 for a in target))
 
 
-def _reshape_layout(indexes, replacement, occupied, source_size):
-    """Prove row-major positions, constant along already present axes."""
-    if not isinstance(indexes, np.ndarray) or not source_size:
+@dataclass(frozen=True)
+class _ReshapeLayout:
+    axes: tuple
+    shifts: tuple
+
+
+def _reshape_layout(
+    indexes, replacement, occupied, source_size, *, allow_shifts=False
+):
+    """Prove a full positional split, allowing cyclic shifts of its axes."""
+    if not isinstance(indexes, np.ndarray) or not indexes.size:
         return None
     layout = tuple(a for a in replacement if a not in occupied)
     if not layout or math.prod(len(a) for a in layout) != source_size:
         return None
     shape = tuple(len(a) if a in layout else 1 for a in replacement)
-    if np.all(indexes == np.arange(source_size).reshape(shape)):
-        return layout
-    return None
+    positions = np.arange(source_size).reshape(shape)
+    origin = int(indexes.flat[0])
+    if not 0 <= origin < source_size or (origin and not allow_shifts):
+        return None
+    shifts = ()
+    if origin:
+        shifts = tuple(
+            (axis, int(offset))
+            for axis, offset in zip(
+                replacement, np.unravel_index(origin, shape)
+            )
+            if offset
+        )
+    for axis, offset in shifts:
+        positions = np.roll(positions, -offset, axis=replacement.index(axis))
+    if not np.all(indexes == positions):
+        return None
+    return _ReshapeLayout(layout, shifts)
+
+
+def _shift_layout(array, axes, shifts, direction):
+    runtime = _EXECUTION.get()
+    for axis, offset in shifts:
+        at = axes.index(axis)
+        positions = (np.arange(len(axis)) + direction * offset) % len(axis)
+        array = (
+            runtime.take(array, positions, at)
+            if runtime is not None and runtime.owns(array)
+            else np.take(array, positions, axis=at)
+        )
+    return array
 
 
 class _Tensor:
@@ -263,19 +301,26 @@ class _Tensor:
                 parent = self.args[0]
                 if cache is not None and cache.reshape_layout:
                     layout = _reshape_layout(
-                        indexes, replacement, parent.axes, len(source)
+                        indexes,
+                        replacement,
+                        parent.axes,
+                        len(source),
+                        allow_shifts=cache.extended_layout,
                     )
                     if layout is not None:
                         axes = (
                             *parent.axes[:at],
-                            *layout,
+                            *layout.axes,
                             *parent.axes[at + 1 :],
                         )
                         array = parent.get().reshape(
                             tuple(len(a) for a in axes)
                         )
+                        array = _shift_layout(array, axes, layout.shifts, 1)
                         self.cached = _align(array, axes, self.axes)
                         cache.optimizations["dense_gather_reshapes"] += 1
+                        if layout.shifts:
+                            cache.optimizations["dense_gather_axis_shifts"] += 1
                         return _remember(self)
                 overlap = set(replacement) & (set(parent.axes) - {source})
                 if overlap:
@@ -1362,29 +1407,41 @@ def _segment(table, groups, aggregates, keys, dependent):
         )
     ).reshape(rows, -1)
     cache = _CACHE.get()
-    flat_layout = (
-        cache is not None
+    layout = (
+        _reshape_layout(
+            inverse.reshape(values.shape),
+            key.axes,
+            independent,
+            len(unique),
+            allow_shifts=cache.extended_layout,
+        )
+        if cache is not None
         and cache.reshape_layout
         and isinstance(inverse, np.ndarray)
-        and not set(key.axes) & set(independent)
-        and _reshape_layout(
-            inverse.reshape(values.shape), key.axes, (), len(unique)
-        )
-        is not None
+        and (cache.extended_layout or not set(key.axes) & set(independent))
+        else None
     )
 
     def scatter(tensor):
         def compute():
             runtime = _EXECUTION.get()
-            if flat_layout:
+            if layout is not None:
                 data = tensor.get()
+                flat_axes = (*independent, *layout.axes)
+                flat_shape = tuple(len(a) for a in flat_axes)
                 cache.optimizations["dense_scatter_reshapes"] += 1
+                if layout.shifts:
+                    cache.optimizations["dense_scatter_axis_shifts"] += 1
                 if runtime is not None and runtime.owns(data):
-                    return runtime.broadcast(
-                        data, tensor.axes, local, shape
-                    ).reshape(result_shape)
-                return np.broadcast_to(
-                    _align(data, tensor.axes, local), shape
+                    data = runtime.broadcast(
+                        data, tensor.axes, flat_axes, flat_shape
+                    )
+                else:
+                    data = np.broadcast_to(
+                        _align(data, tensor.axes, flat_axes), flat_shape
+                    )
+                return _shift_layout(
+                    data, flat_axes, layout.shifts, -1
                 ).reshape(result_shape)
             if runtime is not None and (
                 runtime.owns(tensor.get()) or runtime.owns(indexes)

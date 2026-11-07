@@ -18,17 +18,22 @@ from datafusion_accelerated_mlx.dense_program import (
 
 
 @pytest.mark.parametrize(
-    "layout", ["ordered", "permuted", "repeated", "unmatched", "varying"]
+    "layout",
+    ["ordered", "cyclic", "permuted", "repeated", "unmatched", "varying"],
 )
 @pytest.mark.parametrize("overlap", [False, True])
 def test_coordinate_split_and_regroup_match_datafusion(
     monkeypatch, layout, overlap
 ):
-    monkeypatch.setenv("EINFOLD_DENSE_LAYOUT", "1")
+    monkeypatch.setenv("EINFOLD_DENSE_LAYOUT", "extended")
     labels = np.array([10, 20, 40, 50, 60, 70])
     positions = np.arange(2)
     keys = np.broadcast_to(labels, (2, 6)).copy()
-    if layout == "permuted":
+    if layout == "cyclic":
+        keys = np.roll(keys.reshape(2, 2, 3), (-1, -2), axis=(1, 2)).reshape(
+            2, 6
+        )
+    elif layout == "permuted":
         keys = keys[:, ::-1]
     elif layout == "repeated":
         keys[:, 0] = keys[:, 1]
