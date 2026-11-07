@@ -20,6 +20,64 @@ from datafusion_accelerated_mlx.dense_program import (
 )
 
 
+@pytest.mark.parametrize("seed", range(12))
+def test_separable_join_masks_preserve_nullable_aggregates(monkeypatch, seed):
+    monkeypatch.setenv("EINFOLD_DENSE_SYMBOLIC_MASKS", "1")
+    monkeypatch.setenv("EINFOLD_DENSE_FACTOR_MASKS", "1")
+    rng = np.random.default_rng(seed)
+    i, r, s = (_Axis(np.arange(n)) for n in (3, seed % 4, (seed + 1) % 5))
+    tables, schemas = {}, {}
+    ctx = datafusion.SessionContext()
+    for name, axis in [("a", r), ("b", s)]:
+        shape = (len(i), len(axis))
+        values = rng.normal(size=shape)
+        valid = rng.random(shape) > 0.4
+        table = _Table(
+            (i, axis),
+            [
+                ((name, "i"), _column(i.values, (i,), i)),
+                (
+                    (name, "v"),
+                    _Column(
+                        _column(values, (i, axis)).tensor,
+                        _mask(valid, (i, axis)),
+                    ),
+                ),
+            ],
+        )
+        schema = pa.schema([("i", pa.int64()), ("v", pa.float64())])
+        rows = table.arrow(schema)
+        batches = rows.to_batches() or [
+            pa.RecordBatch.from_arrays(
+                [pa.array([], type=f.type) for f in schema], schema=schema
+            )
+        ]
+        ctx.register_record_batches(name, [batches])
+        tables[name] = table
+        schemas[name] = schema
+    for where in ["", " WHERE a.v>0 AND b.v<0"]:
+        query = f"""SELECT a.i,COUNT(*) AS n,COUNT(a.v*b.v) AS c,
+        SUM(a.v*b.v) AS total,AVG(a.v*b.v) AS mean
+        FROM a JOIN b ON a.i=b.i{where} GROUP BY a.i ORDER BY a.i"""
+        frame = ctx.sql(query)
+        token = _CACHE.set(_ComputedCache(1 << 20))
+        try:
+            actual = (
+                DenseProgram(frame.logical_plan(), frame.schema())
+                .run(lambda name: tables[name])
+                .arrow(frame.schema())
+            )
+        finally:
+            _CACHE.reset(token)
+        expected = frame.to_arrow_table()
+        assert actual.num_rows == expected.num_rows
+        for got, want in zip(actual.columns, expected.columns):
+            assert got.is_null().to_pylist() == want.is_null().to_pylist()
+            np.testing.assert_allclose(
+                got.to_numpy(), want.to_numpy(), equal_nan=True, atol=1e-12
+            )
+
+
 @pytest.mark.parametrize("mode", ["off", "facts", "cse", "all"])
 @pytest.mark.parametrize("seed", range(12))
 @pytest.mark.parametrize("symbolic", [False, True])

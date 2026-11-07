@@ -55,6 +55,7 @@ class _ComputedCache:
         self.symbolic_masks = (
             os.environ.get("EINFOLD_DENSE_SYMBOLIC_MASKS") == "1"
         )
+        self.factor_masks = os.environ.get("EINFOLD_DENSE_FACTOR_MASKS") == "1"
         self.group_proofs = (
             os.environ.get(
                 "EINFOLD_DENSE_GROUP_PROOFS",
@@ -1022,7 +1023,39 @@ def _sum(value, mask, row_axes, kept):
     return result
 
 
-def _group_validity(mask, row_axes, kept):
+def _mask_terms(mask):
+    if mask.kind == "and":
+        return [term for child in mask.args for term in _mask_terms(child)]
+    if mask.kind == "rename":
+        parent = mask.args[0]
+        mapping = dict(zip(parent.axes, mask.axes))
+        return [term.rename(mapping) for term in _mask_terms(parent)]
+    return [mask]
+
+
+def _factor_validity(mask, row_axes, kept):
+    """Existence of independent conjunctions factors over Cartesian axes."""
+    groups = []
+    for term in _mask_terms(mask):
+        reduced = set(term.axes) - set(kept)
+        overlapping = [g for g in groups if reduced & g[0]]
+        terms = [term]
+        for group in overlapping:
+            reduced |= group[0]
+            terms.extend(group[1])
+            groups.remove(group)
+        groups.append((reduced, terms))
+    if len(groups) < 2:
+        return None
+    results = []
+    for reduced, terms in groups:
+        part = _op("and", *terms)
+        axes = tuple(a for a in row_axes if a in kept or a in reduced)
+        results.append(_group_validity(part, axes, kept, factor=False))
+    return _op("and", *results)
+
+
+def _group_validity(mask, row_axes, kept, *, factor=True):
     """Prove existence without constructing counts for complete domains.
 
     If validity depends only on group keys, either every row in a group
@@ -1031,6 +1064,14 @@ def _group_validity(mask, row_axes, kept):
     """
     cache = _CACHE.get()
     count = math.prod(len(a) for a in row_axes if a not in kept)
+    if cache is not None and cache.factor_masks and count < 1 << 63:
+        if not count:
+            return _const(False)
+        if factor:
+            result = _factor_validity(mask, row_axes, kept)
+            if result is not None:
+                cache.optimizations["dense_factorized_group_validity"] += 1
+                return result
     if (
         cache is not None
         and cache.symbolic_masks
