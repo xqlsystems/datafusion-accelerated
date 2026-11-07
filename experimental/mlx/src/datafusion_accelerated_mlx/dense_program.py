@@ -56,6 +56,10 @@ class _ComputedCache:
             os.environ.get("EINFOLD_DENSE_SYMBOLIC_MASKS") == "1"
         )
         self.factor_masks = os.environ.get("EINFOLD_DENSE_FACTOR_MASKS") == "1"
+        self.value_identities = (
+            os.environ.get("EINFOLD_DENSE_VALUE_IDENTITIES") == "1"
+        )
+        self.numeric_values = {}
         self.group_proofs = (
             os.environ.get(
                 "EINFOLD_DENSE_GROUP_PROOFS",
@@ -119,11 +123,36 @@ def _node(kind, axes=(), args=(), value=None, axis=None, *, key=None):
         cache.optimizations["dense_cse_hits"] += 1
         return cache.nodes[signature]
     result = _Tensor(kind, axes, args, value, axis)
+    if cache.value_identities and kind in _OPS:
+        positions = {a: i for i, a in enumerate(axes)}
+        _share_numeric(
+            result,
+            (
+                "pointwise",
+                kind,
+                tuple(len(a) for a in axes),
+                tuple(
+                    (_value_source(a), tuple(positions[d] for d in a.axes))
+                    for a in args
+                ),
+            ),
+        )
     # Bound graph metadata independently of the computed-array LRU. Nodes
     # already referenced by a result remain alive after this limit is hit.
     if len(cache.nodes) < 32768:
         cache.nodes[signature] = result
     return result
+
+
+def _share_numeric(result, signature):
+    """Retain logical masks and axes while sharing one positional value."""
+    cache = _CACHE.get()
+    previous = cache.numeric_values.get(signature)
+    if previous is not None and previous is not result:
+        result.shared_numeric = _value_source(previous)
+        cache.optimizations["dense_shared_numeric_values"] += 1
+    elif previous is None and len(cache.numeric_values) < 32768:
+        cache.numeric_values[signature] = result
 
 
 def _numpy(value):
@@ -158,13 +187,17 @@ def _same_domain(left, right):
 
 def _value_source(tensor):
     """Strip views that preserve the exact order of a numerical buffer."""
-    while tensor.kind == "rename":
-        tensor = tensor.args[0]
-    if tensor.kind == "take" and tensor.shared_take is not None:
-        return tensor.shared_take
-    if tensor.kind == "reduce" and tensor.shared_reduction is not None:
-        return tensor.shared_reduction
-    return tensor
+    while True:
+        if tensor.kind == "rename":
+            tensor = tensor.args[0]
+        elif tensor.shared_numeric is not None:
+            tensor = tensor.shared_numeric
+        elif tensor.kind == "take" and tensor.shared_take is not None:
+            tensor = tensor.shared_take
+        elif tensor.kind == "reduce" and tensor.shared_reduction is not None:
+            tensor = tensor.shared_reduction
+        else:
+            return tensor
 
 
 @dataclass(frozen=True)
@@ -277,6 +310,7 @@ class _Tensor:
         self.presence = None
         self.indexed = None
         self.cached = None
+        self.shared_numeric = None
         self.domain = axis
         self.count_bound = None
         self.positive = None
@@ -313,6 +347,8 @@ class _Tensor:
                 self.domain = domains[0]
 
     def get(self):
+        if self.shared_numeric is not None:
+            return self.shared_numeric.get()
         if self.kind == "device":
             return self.value
         if self.kind == "rename":
@@ -978,10 +1014,12 @@ def _sum(value, mask, row_axes, kept):
         tuple(factors),
         repeated,
     )
-    if cache is not None and cache.share_reductions:
+    if cache is not None and (cache.share_reductions or cache.value_identities):
         work = math.prod(len(a) for a in used) * len(factors)
         elements = math.prod(len(a) for a in output)
-        if work >= 1 << 20 and work >= 64 * elements:
+        if cache.value_identities or (
+            work >= 1 << 20 and work >= 64 * elements
+        ):
             axes = _axes(output, used, row_axes, kept)
             positions = {axis: i for i, axis in enumerate(axes)}
             signature = (
@@ -1134,6 +1172,28 @@ def _reduce(kind, column, table, kept):
         value.reduction = _Reduction(
             kind, column.tensor, mask, tuple(table.axes), tuple(kept)
         )
+        cache = _CACHE.get()
+        if (
+            cache is not None
+            and cache.value_identities
+            and os.environ.get("EINFOLD_DENSE_SHARE_EXTREMA", "1") != "0"
+        ):
+            roles = _axes(output, used, table.axes, kept)
+            positions = {a: i for i, a in enumerate(roles)}
+            _share_numeric(
+                value,
+                (
+                    "extreme",
+                    kind,
+                    _value_source(column.tensor),
+                    tuple(positions[a] for a in column.tensor.axes),
+                    _value_source(mask),
+                    tuple(positions[a] for a in mask.axes),
+                    tuple(len(a) for a in roles),
+                    tuple(positions[a] for a in table.axes),
+                    tuple(positions[a] for a in kept),
+                ),
+            )
     else:
         raise _Decline(f"aggregate {kind}")
     return _Column(value, _group_validity(mask, table.axes, kept))
@@ -1669,6 +1729,31 @@ def _segment(table, groups, aggregates, keys, dependent):
             result.count_bound = tensor.count_bound * math.prod(
                 len(a) for a in local if a not in independent
             )
+        lookup = (
+            None if cache is None else cache.lookup_offsets.get(id(inverse))
+        )
+        if (
+            cache is not None
+            and cache.value_identities
+            and lookup is not None
+            and layout is None
+            and os.environ.get("EINFOLD_DENSE_SHARE_INDEXED", "1") != "0"
+        ):
+            _share_numeric(
+                result,
+                (
+                    "indexed_sum",
+                    _value_source(tensor),
+                    id(lookup.offsets),
+                    tuple(len(a) for a in local),
+                    tuple(local.index(a) for a in tensor.axes),
+                    tuple(local.index(a) for a in key.axes),
+                    len(unique),
+                    tuple(local.index(a) for a in independent),
+                    tuple(len(a) for a in table.axes),
+                    result.count_bound,
+                ),
+            )
         return result
 
     columns = [
@@ -1882,6 +1967,39 @@ def _aggregate_bag(bag, groups, aggregates):
                 )
                 for p in parts
             )
+            cache = _CACHE.get()
+            if (
+                cache is not None
+                and cache.value_identities
+                and all(
+                    len(part.axes) == len(axes)
+                    and all(
+                        _same_domain(a.values, b.values)
+                        for a, b in zip(part.axes, axes)
+                    )
+                    for part in result.union
+                )
+            ):
+                _share_numeric(
+                    result,
+                    (
+                        "ordered_union",
+                        tuple(len(a) for a in axes),
+                        tuple(
+                            (
+                                _value_source(part.value),
+                                tuple(
+                                    part.axes.index(a) for a in part.value.axes
+                                ),
+                                _value_source(part.mask),
+                                tuple(
+                                    part.axes.index(a) for a in part.mask.axes
+                                ),
+                            )
+                            for part in result.union
+                        ),
+                    ),
+                )
         return result
 
     columns = [(k, _column(a.values, (a,), a)) for k, a in zip(keys, axes)]

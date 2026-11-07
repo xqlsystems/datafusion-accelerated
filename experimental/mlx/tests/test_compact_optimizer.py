@@ -78,6 +78,86 @@ def test_separable_join_masks_preserve_nullable_aggregates(monkeypatch, seed):
             )
 
 
+@pytest.mark.parametrize("cache_bytes", [1, 1 << 20])
+def test_positional_values_keep_consumer_labels_masks_and_changed_inputs(
+    monkeypatch, cache_bytes
+):
+    monkeypatch.setenv("EINFOLD_DENSE_VALUE_IDENTITIES", "1")
+    i, j, u, v = (
+        _Axis(np.array(labels))
+        for labels in [[10, 20], [2, 4, 8], [-1, 3], [11, 12, 13]]
+    )
+    programs, snapshots = {}, []
+    for offset in [0.0, 7.0]:
+        data = np.arange(6.0).reshape(2, 3) + offset
+        source = _column(data, (i, j)).tensor
+        tables = {
+            "a": _Table(
+                (i, j),
+                [
+                    (("a", "i"), _column(i.values, (i,), i)),
+                    (("a", "j"), _column(j.values, (j,), j)),
+                    (("a", "x"), _Column(source, _mask(data % 2 == 0, (i, j)))),
+                ],
+            ),
+            "b": _Table(
+                (u, v),
+                [
+                    (("b", "u"), _column(u.values, (u,), u)),
+                    (("b", "v"), _column(v.values, (v,), v)),
+                    (
+                        ("b", "y"),
+                        _Column(
+                            source.rename({i: u, j: v}),
+                            _mask(data % 2 != 0, (u, v)),
+                        ),
+                    ),
+                ],
+            ),
+        }
+        token = _CACHE.set(_ComputedCache(cache_bytes))
+        try:
+            for name, dims, column in [
+                ("a", ("i", "j"), "x"),
+                ("b", ("u", "v"), "y"),
+            ]:
+                schema = pa.schema(
+                    [
+                        (dims[0], pa.int64()),
+                        (dims[1], pa.int64()),
+                        (column, pa.float64()),
+                    ]
+                )
+                ctx = datafusion.SessionContext()
+                ctx.register_record_batches(
+                    name, [tables[name].arrow(schema).to_batches()]
+                )
+                query = f"SELECT {','.join(dims)},sqrt({column}*{column}+1.0) AS z FROM {name} ORDER BY {','.join(dims)}"
+                frame = ctx.sql(query)
+                if name not in programs:
+                    programs[name] = DenseProgram(
+                        frame.logical_plan(), frame.schema()
+                    )
+                actual = (
+                    programs[name]
+                    .run(lambda key, current=tables: current[key])
+                    .arrow(frame.schema())
+                )
+                expected = frame.to_arrow_table()
+                for got, want in zip(actual.columns, expected.columns):
+                    assert (
+                        got.is_null().to_pylist() == want.is_null().to_pylist()
+                    )
+                    np.testing.assert_allclose(
+                        got.to_numpy(), want.to_numpy(), equal_nan=True
+                    )
+                snapshots.append((actual, actual.to_pydict()))
+        finally:
+            _CACHE.reset(token)
+    for snapshot, expected in snapshots:
+        assert snapshot.to_pydict() == expected
+
+
 @pytest.mark.parametrize("mode", ["off", "facts", "cse", "all"])
 @pytest.mark.parametrize("seed", range(12))
 @pytest.mark.parametrize("symbolic", [False, True])
