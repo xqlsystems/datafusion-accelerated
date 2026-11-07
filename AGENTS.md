@@ -97,6 +97,13 @@ docs, docstrings, issues, PR descriptions).
   placement, the schedule and bindings, and builds no compiler, allocator
   or communication library. If a feature could be a library of its own,
   used without the runtime, make it one, or use one that exists.
+- **Vanilla DataFusion, plus nodes** (principle R11). Extend DataFusion
+  only through its own extension points: builder methods, settings,
+  `RuntimeEnv`, physical rules, `ExecutionPlan` nodes, metrics and codecs.
+  Attach through the builder in Rust and `with_extensions` in Python, never
+  through an installer or a subclass of `SessionContext`.
+- **Rust and Python** (principle R12). Build every capability in Rust and
+  bind it to Python. A Rust program must never need Python.
 - **No hidden decisions** (principle R10). Every physical choice the
   runtime makes goes in the schedule, with who made it. An override is
   binding, and one the runtime can't obey is an error, never ignored.
