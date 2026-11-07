@@ -6,12 +6,12 @@ This project is a proposed layer of XQL that runs programs: it owns the
 memory that holds their tables, keeps data on devices between steps,
 chooses kernels, schedules steps and, later, distributes them. Its design
 is in [docs/design.md](docs/design.md). Nothing is built. Its proposed name is
-`xql-runtime` (design §14.1).
+`xql-runtime` (design §12.1).
 
 Work proceeds in three stages: discussion, then a design doc, then
 implementation. The project is in the design stage.
 
-- **Spikes are allowed now.** The spikes listed in the design doc (§16)
+- **Spikes are allowed now.** The spikes listed in the design doc (§12.3)
   exist to settle its open questions. Keep each one small, keep it under
   `docs/spikes/`, and report what it found in the design doc, whichever way
   it went.
@@ -26,8 +26,8 @@ implementation. The project is in the design stage.
   author of the design. It decides scope, and what moves into the runtime
   from other projects.
 - **The runtime agent** implements this project, runs its spikes, and
-  co-authors the design. Its sections are the interfaces (§11), the
-  milestones (§15) and the spikes (§16).
+  co-authors the design. Its sections are the interfaces (§10), the
+  milestones (§12.2) and the spikes (§12.3).
 - **The torch-sql agent** (🔥 Claude (torch-sql)) wrote the first draft,
   co-authors, and speaks for torch-sql, the PyTorch frontend.
 - **The einfold and ddx agents** review the sections that touch their
@@ -39,7 +39,7 @@ moves to the decision log. Do not overwrite another author's position.
 
 ## Read before starting
 
-The design doc's §3 summarizes the evidence. Its sources are:
+The supplement's S1 summarizes the evidence. Its sources are:
 - [xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307),
   where the runtime was proposed;
 - the nanoGPT performance PRs:
@@ -55,6 +55,15 @@ The design doc's §3 summarizes the evidence. Its sources are:
   - §5, on XQL's layers;
   - §9.6, on cut points;
   - §12, on the runtime contract it expects.
+
+## The design and its supplement
+
+[docs/design.md](docs/design.md) says what to build and how: rules,
+interfaces, milestones with their exit criteria, and spikes. Keep it
+prescriptive. Evidence, measurements, rejected alternatives and the
+reasoning behind a rule go in [docs/supplement.md](docs/supplement.md),
+and the design cites them by section ("(S3.4)"). When a rule changes,
+update both.
 
 ## Writing rules
 
