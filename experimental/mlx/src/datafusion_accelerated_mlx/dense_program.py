@@ -62,6 +62,13 @@ class _ComputedCache:
         layout = os.environ.get("EINFOLD_DENSE_LAYOUT")
         self.reshape_layout = layout in {"1", "extended"}
         self.extended_layout = layout == "extended"
+        self.share_index_maps = (
+            os.environ.get("EINFOLD_DENSE_INDEX_MAPS") == "1"
+        )
+        self.lookup_maps = {}
+        self.lookup_offsets = {}
+        self.lookup_bytes = 0
+        self.take_values = {}
         self.nodes = {}
         self.optimizations = Counter()
         self.max_bytes = max_bytes
@@ -126,6 +133,28 @@ class _Axis:
 
     def __len__(self):
         return len(self.values)
+
+
+@dataclass(frozen=True)
+class _CoordinateMap:
+    domain: np.ndarray
+    offsets: object
+    found: object
+
+
+def _same_domain(left, right):
+    return left is right or (
+        left.dtype == right.dtype and np.array_equal(left, right)
+    )
+
+
+def _value_source(tensor):
+    """Strip views that preserve the exact order of a numerical buffer."""
+    while tensor.kind == "rename":
+        tensor = tensor.args[0]
+    if tensor.kind == "take" and tensor.shared_take is not None:
+        return tensor.shared_take
+    return tensor
 
 
 @dataclass(frozen=True)
@@ -241,6 +270,8 @@ class _Tensor:
         self.domain = axis
         self.count_bound = None
         self.positive = None
+        if kind == "take":
+            self.shared_take = None
         self.host_only = (
             np.asarray(value).dtype.kind in "biuUS"
             if kind == "array"
@@ -297,6 +328,8 @@ class _Tensor:
                     else np.asarray(self.value)
                 )
             elif self.kind == "take":
+                if self.shared_take is not None:
+                    return self.shared_take.get()
                 source, indexes, at, replacement = self.value
                 parent = self.args[0]
                 if cache is not None and cache.reshape_layout:
@@ -402,6 +435,30 @@ class _Tensor:
         runtime = _EXECUTION.get()
         if runtime is not None and runtime.owns(indexes):
             result.host_only = False
+        cache = _CACHE.get()
+        if (
+            cache is not None
+            and cache.share_index_maps
+            and id(indexes) in cache.lookup_offsets
+            and len(set(self.axes)) == len(self.axes)
+            and len(set(replacement)) == len(replacement)
+        ):
+            # Relational aliases can rename every dimension. The positional
+            # overlap with surviving axes still determines the gather layout.
+            positions = {dim: i for i, dim in enumerate(self.axes)}
+            signature = (
+                _value_source(self),
+                id(indexes),
+                at,
+                tuple((positions.get(dim), len(dim)) for dim in replacement),
+                tuple(len(dim) for dim in new_axes),
+            )
+            shared = cache.take_values.get(signature)
+            if shared is not None:
+                result.shared_take = shared
+                cache.optimizations["dense_shared_take_values"] += 1
+            elif len(cache.take_values) < 8192:
+                cache.take_values[signature] = result
         if self.positive is not None:
             result.positive = self.positive.take(axis, indexes, replacement)
         return result
@@ -1163,12 +1220,47 @@ def _indexes(axis, values):
 
 
 def _key_indexes(axis, tensor):
+    cache = _CACHE.get()
+    if cache is not None and cache.share_index_maps:
+        source = _value_source(tensor)
+        if source.kind == "take":
+            original, offsets, _, _ = source.value
+            coordinate = source.args[0]
+            lookup = cache.lookup_offsets.get(id(offsets))
+            if (
+                lookup is not None
+                and coordinate.axis is original
+                and coordinate.axes == (original,)
+                and _same_domain(lookup.domain, original.values)
+                and _same_domain(lookup.domain, axis.values)
+            ):
+                # The gathered label is exactly domain[offset]. This only
+                # proves the new lookup, and leaves existing row masks intact.
+                cache.optimizations["dense_index_roundtrips_elided"] += 1
+                return offsets, np.ones(offsets.shape, dtype=bool)
+        signature = (source, tensor.domain, tuple(len(a) for a in tensor.axes))
+        for lookup in cache.lookup_maps.get(signature, ()):
+            if _same_domain(lookup.domain, axis.values):
+                cache.optimizations["dense_shared_index_maps"] += 1
+                return lookup.offsets, lookup.found
     indexes, found = _indexes(axis, tensor.get())
     if (
         tensor.domain is not None
         and np.isin(tensor.domain.values, axis.values).all()
     ):
         found = np.ones(tuple(len(a) for a in tensor.axes), dtype=bool)
+    if cache is not None and cache.share_index_maps:
+        size = indexes.nbytes + found.nbytes
+        limit = min(cache.max_bytes // 16, 64 << 20)
+        if (
+            size
+            and len(cache.lookup_offsets) < 512
+            and cache.lookup_bytes + size <= limit
+        ):
+            lookup = _CoordinateMap(axis.values, indexes, found)
+            cache.lookup_maps.setdefault(signature, []).append(lookup)
+            cache.lookup_offsets[id(indexes)] = lookup
+            cache.lookup_bytes += size
     return indexes, found
 
 
