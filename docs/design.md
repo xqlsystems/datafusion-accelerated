@@ -3,7 +3,7 @@
 _author_: Alex Merose
 _co-authors_: 🔥 Claude (torch-sql) and 🌀 Claude (xarray-sql), via Claude Code
 _reviewers_: 🪭 Claude (einfold) and ∂ Claude (ddx). Their reviews of v1.1 are in [reviews/](reviews/).
-_status_: Draft v1.3, for approval. Nothing is built.
+_status_: Draft v1.4, for approval. Nothing is built.
 _last updated_: 2026-11-07
 _supplement_: [supplement.md](supplement.md), with the evidence, the alternatives considered and the reasoning behind each rule. Citations such as "(S1.1)" point there.
 _origin_: [xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307)
@@ -47,6 +47,21 @@ experiments built three executors and a training session inside
 xarray-sql, and torch-sql's optimizer step runs a query per tensor (S1.3).
 The runtime is the one place where devices, memory and kernels are
 managed, behind interfaces every frontend uses.
+
+The runtime does one job. It is the bridge between relational plans and
+array hardware: it owns the lifetime and placement of every table, and
+runs each piece of work on another system's engine or kernel. Like every
+XQL project, it is one component of a composable data system, in the
+sense of Wes McKinney's *deconstructed database*: it builds no compiler,
+allocator or communication library of its own, and meets the systems
+that do through standard formats (§2.5, R11, S5.4).
+
+It also gives developers, and the agents working with them, every
+control. The SQL says what a program computes. Every physical choice the
+runtime makes, such as where a table lives, how it is laid out and which
+kernel computes it, is recorded in a *schedule* that anyone can read and
+override (§5.5). The runtime makes good default choices, never hidden
+ones: it should never be a compiler that its users have to outsmart.
 
 ---
 
@@ -131,6 +146,23 @@ managed, behind interfaces every frontend uses.
   NVLink-C2C, a link that lets a GPU read the CPU's memory directly. An
   NVL72 rack joins 72 GPUs with NVLink.
 
+### 2.5 Kernel compilers and GPU libraries
+
+The runtime calls these rather than replacing them (R11):
+- **Triton** is a language and compiler for GPU kernels, written in
+  Python. **CUTLASS** is NVIDIA's library of templates for fast matrix
+  kernels, and its *CuTe* layer describes how data is laid out across a
+  GPU's threads and memory.
+- **XLA** is the compiler behind JAX. It compiles **StableHLO**, a
+  portable set of array operations. Both are built on **MLIR**, a
+  framework for writing compilers as layers of intermediate
+  representations.
+- **`torch.compile`** is PyTorch's compiler, which generates Triton
+  kernels among others.
+- **RMM**, the RAPIDS Memory Manager, is a shared GPU memory allocator
+  that several libraries can draw from at once.
+- **NCCL** is NVIDIA's library for moving data between GPUs.
+
 ---
 
 ## 3. Goals and non-goals
@@ -147,11 +179,18 @@ managed, behind interfaces every frontend uses.
    reads.
 4. **Choose an implementation for each piece of work**: the engine by
    default, and the runtime's array backends for work einfold has marked.
-5. **Place values in memory**, and recompute values only under a policy the
-   user turns on.
+5. **Hold values across the memory hierarchy**: by default where the
+   runtime judges best, and wherever the schedule says. Recompute values
+   only under a policy the user turns on.
 6. **Schedule**: run independent steps concurrently, and prepare the next
    batch while a step runs.
 7. **Distribute**, later: run one program across GPUs and machines.
+8. **Give developers every control**: a schedule they can read and edit,
+   kernels of their own bound to any part of a program, and a report of
+   what each run cost (§5.5, §5.6, §6.6).
+9. **Compose**: meet engines, kernel compilers, allocators and array
+   libraries through standard formats, so that each can be replaced
+   without changing the others.
 
 ### 3.2 Non-goals
 
@@ -160,8 +199,12 @@ managed, behind interfaces every frontend uses.
   and the array work einfold has marked in them (S2.1).
 - **Differentiation, plan rewriting, or drawing a program's step
   boundaries.** Those are ddx's and einfold's (§6.4).
-- **A training framework.** Training loops, optimizers and schedules belong
-  to frontends. The runtime provides state that persists, atomic updates,
+- **A kernel compiler, a memory allocator or a communication library.**
+  Kernels come from Triton, CUTLASS, XLA, `torch.compile`, MLX or a
+  developer's own code. GPU memory comes from a shared allocator, and data
+  moves between GPUs through NCCL (§2.5).
+- **A training framework.** Training loops, optimizers and learning-rate
+  schedules belong to frontends. The runtime provides state that persists, atomic updates,
   and checkpoints of that state.
 - **Bitwise agreement across implementations.** Results agree with the
   engine's to the bound of §6.3.
@@ -189,16 +232,28 @@ managed, behind interfaces every frontend uses.
   capability is opt-in and measured on its own.
 - **R7. Where a value is held is never part of the program's meaning.**
   Keeping a value in an engine table, in host memory or on a device changes
-  neither results nor gradients. Recomputing a value instead of saving it
-  happens only under a user's policy, and only for plans that give the same
-  rows each time (§6.5).
-- **R8. Declines are visible.** The runtime counts every decline, with its
-  reason and the label of the code it came from (§5.4). *Strict* mode turns
-  declines into errors. *Checking* mode runs the engine beside a substitute
-  and compares them.
+  neither results nor gradients. That is what makes it safe to hand every
+  such choice to the developer (R10). Recomputing a value instead of saving
+  it happens only under a user's policy, and only for plans that give the
+  same rows each time (§6.5).
+- **R8. Declines and costs are visible.** The runtime counts every
+  decline, with its reason and the label of the code it came from (§5.4),
+  and reports what each run cost (§6.6). *Strict* mode turns declines into
+  errors. *Checking* mode runs the engine beside a substitute and compares
+  them.
 - **R9. Reproducibility is stated.** Each implementation says whether the
   same inputs give the same bits. A session may require reproducibility,
   and then gets only the implementations that give it (S3.7).
+- **R10. Defaults, not hidden decisions.** Every physical choice is an
+  entry in the schedule (§5.5). The runtime fills in defaults, and a
+  developer may override any entry. An override is binding: if the runtime
+  can't obey it, compiling fails and says why. Nothing is ignored silently
+  (S5.1).
+- **R11. One job, standard seams.** The runtime owns tables' lifetimes,
+  placement and the schedule, and delegates everything else. Tables cross
+  its boundaries as Arrow, arrays as DLPack, plans as Substrait, and
+  schedules as a documented, versioned format, so that each side of every
+  seam can be used without the other (S5.4).
 
 ---
 
@@ -230,19 +285,32 @@ Rules:
 - **Parameters are a one-row table** that the plans cross join and the
   runtime writes into before each run (S3.2).
 
-### 5.2 Tables, placements and names
+### 5.2 Tables and the memory hierarchy
 
-A **table handle** refers to a table the runtime owns. It carries the
-table's schema, its lifetime (one run, or until the caller releases it),
-and its placements:
-- **in an engine**, as the engine's own table;
-- **as Arrow**, in host memory, or in GPU memory through the C Device Data
-  Interface;
-- **as a compact array**, on the host or a device.
+A **table handle** refers to a table the runtime owns, as a buffer handle
+refers to an allocation. It carries the table's schema, its lifetime (one
+run, or until the caller releases it), and one or more *instances*. Each
+instance has three independent properties, as a PyTorch tensor has a
+device and, separately, strides:
+- **a tier**, where the bytes live: *device* memory (a GPU's), *host*
+  memory (pinned, meaning locked in place so a GPU can copy from it
+  directly, or the Grace memory a GB200's GPUs read directly), or
+  *storage* (Zarr or Arrow IPC files);
+- **a layout**, how they are arranged: long-format Arrow rows, or a compact
+  array;
+- **an owner**, who manages the buffer: an engine, as one of its own
+  tables, or the runtime.
 
 Rules:
-- A table can be in several placements at once. The runtime moves it when
-  a step needs it elsewhere.
+- A table can have several instances at once. The runtime copies one to
+  another tier or layout when a step needs it there, and the schedule
+  records each copy (§5.5).
+- Developers may move tables themselves: `prefetch` to a tier, `evict`
+  from one, and `pin` an instance so that it stays.
+- Each tier reports its capacity and what it holds.
+- Tables are values, as in SQL. A buffer is written in place only when
+  state is published (R5, §7), so aliasing never reaches a program's
+  meaning (S5.6).
 - Reading a handle's rows is the only way data leaves the runtime, and it
   is always explicit.
 - Each handle has a stable name, by which plans read it. The runtime passes
@@ -263,6 +331,12 @@ and placements, and runs the checks that need running only once. A
 compiled program is reused only while the backend's session key is
 unchanged, as ddx's `prepare` does.
 
+A run is asynchronous, as a kernel launch on a CUDA stream is. `run`
+returns at once with a future for its outputs. Runs on one session execute
+in order. A training loop overlaps loading with computing by prefetching
+the next batch while a run executes, and steps within a run overlap under
+the scheduler (§8).
+
 ### 5.4 Labels
 
 One marker names a part of the forward program for every layer:
@@ -280,20 +354,69 @@ Frontends choose the labels. torch-sql uses module paths, such as
 `unet.layers.3`, so a decline is reported against the module that caused
 it.
 
+### 5.5 The schedule
+
+The SQL is the program's *algorithm*: what it computes. The **schedule**
+is everything else: how the runtime computes it. Compiling a program
+produces its schedule, which holds, per step and per labelled node:
+- the implementation: the engine, einfold's node on an array backend, or
+  a developer's binding (§5.6);
+- each table's instances: tier, layout and owner;
+- copies between tiers, and when they happen;
+- save points and recompute policies, passed to ddx (§6.4, §6.5);
+- donation of state buffers (§7);
+- the precision each implementation computes in (§6.3).
+
+Rules:
+- Each entry records who chose it: a default, einfold, or the developer.
+- `compiled.schedule()` returns the schedule. It serializes to a
+  documented, versioned format that tools and agents can read and write
+  without the runtime.
+- `session.compile(program, schedule=...)` takes a whole or partial
+  schedule. The runtime fills in what is missing and obeys what is given
+  (R10).
+- Changing a schedule never changes a result beyond the bound of §6.3.
+  Checking mode verifies that.
+
+### 5.6 Bindings
+
+A **binding** says which implementation computes a labelled node or step.
+einfold's detection produces bindings automatically (§6.2). A developer,
+or an agent, can write one by hand:
+
+```python
+session.bind("attn.0", my_flash_attention, assumes=["complete", "no_nulls"])
+```
+
+Rules:
+- A bound implementation is a callable that takes and returns arrays as
+  DLPack, with each axis named. It may come from Triton, CUTLASS, XLA,
+  `torch.compile`, MLX or anywhere else (R11).
+- The node's SQL is its specification. If a binding declines, or its
+  assumptions fail a data check, the SQL runs.
+- `assumes` lists the facts the binding relies on (§6.2). The runtime
+  checks each on every run, unless a fact from a frontend states it.
+- einfold's nodes are proved exact from the plan's structure. A
+  developer's binding is only tested against its SQL, which is weaker
+  (S5.3). So checking mode samples hand-written bindings, their runs are
+  counted separately, and a session may refuse them in strict mode.
+
 ---
 
 ## 6. Execution
 
 ### 6.1 Three ways to run a step
 
-The runtime chooses per step:
+The schedule says, per step, which way it runs (§5.5). By default the
+runtime chooses:
 
 1. **On the engine**, as a plain query. This is the reference (R1), and
    always available.
-2. **As einfold nodes on the runtime's backends.** einfold marks the array
-   work it recognizes in the step's plan. The runtime runs each node on
-   compact arrays it keeps resident, or declines it, and then the node's
-   SQL runs on the engine. This is stage B-0 (§6.2).
+2. **As bound nodes.** einfold marks the array work it recognizes in the
+   step's plan, and a developer may bind their own implementations by
+   label (§5.6). The runtime runs each bound node on compact arrays it
+   keeps resident, or declines it, and then the node's SQL runs on the
+   engine. With einfold's nodes, this is stage B-0 (§6.2).
 3. **As a region**: several nodes, and the elementwise expressions between
    them, run as one array program with their intermediates kept compact.
    These are stages B-1 and B-2.
@@ -325,8 +448,10 @@ einfold annotates a step's plan with nodes of five kinds:
 - is one of einfold's published, versioned node types, with a conformance
   suite.
 
-How a backend lowers a node (to NumPy, MLX, `torch.compile` or JAX) is
-private to the backend and crosses no interface. Gathers on value indexes,
+Each node einfold detects becomes a binding (§5.6) to one of the runtime's
+array backends. How a backend lowers a node (to NumPy, MLX, Triton,
+`torch.compile`, or StableHLO through JAX) is private to the backend and
+crosses no interface. Gathers on value indexes,
 floating-point guards and index-table joins need particular care in
 torch-sql's programs (S2.4).
 
@@ -347,6 +472,14 @@ about values hold for one run only, so they stay data checks (S3.1). A
 frontend may also pass a *hint*, the array meaning it already knows, by
 label (§5.4). einfold uses hints to guide detection, never in place of its
 proof, and a hint it fails to confirm is a counted decline.
+
+**Near misses.** Where einfold almost detects a node, it says why it
+didn't: for example, "this would be a fold, but key `k` is nullable". The
+runtime reports near misses with the run (§6.6), so that a developer or an
+agent can change the SQL, state the missing fact, or bind an
+implementation by hand, instead of guessing how to spell the query. The
+SQL's spelling should decide correctness, never speed, and near misses are
+how the gap between the two gets closed.
 
 **Stages.** Build B in three stages, each measured and useful alone (S2.6):
 - **B-0, one node at a time.** einfold hands the runtime the node it
@@ -390,6 +523,8 @@ tensor columns, stays open through spike 1 (S2.3).
   computing in float32 on a GPU is an explicit choice.
 - **Reproducibility.** Each implementation declares whether it gives the
   same bits for the same inputs (R9).
+- **Hand-written bindings** are checked as einfold's nodes are, and
+  checking mode samples them more often, since nothing proves them (§5.6).
 
 ### 6.4 Step boundaries and saving
 
@@ -406,7 +541,9 @@ tensor columns, stays open through spike 1 (S2.3).
 - **Shared subplans come from SQL or from the frontend's program**, never
   from a Substrait plan. For plain queries, the runtime calls ddx's public
   form of ddx#168's split, and has no implementation of its own.
-- **The runtime chooses save points with einfold.** einfold reports whether
+- **Save points are schedule entries** (§5.5), so a developer can add,
+  remove or move one, and the runtime passes the result to ddx.
+- **The runtime chooses default save points with einfold.** einfold reports whether
   a candidate save point would split a node it can fuse, and the runtime
   prefers save points that don't. A split taken anyway is a counted
   decline (S3.5).
@@ -428,18 +565,34 @@ tensor columns, stays open through spike 1 (S2.3).
   region. Its random-state preservation comes free from the counter-based
   random function, or from masks uploaded as inputs (S3.6).
 
+### 6.6 Reports
+
+Every run can report, per step and per labelled node:
+- time, split into planning, execution and copies;
+- bytes moved between tiers, and the peak memory of each tier;
+- the schedule it ran, with who chose each entry;
+- declines and near misses, with their reasons.
+
+`compiled.explain()` shows the same before a run, from the schedule alone.
+Both are available as JSON, in a documented format, so that an agent can
+read a run's cost, change the schedule and run again.
+
 ---
 
 ## 7. Memory
 
-- **The runtime decides where each value is held** from the engine's
-  limits, the memory of each placement, and the session's policies.
+- **The runtime's defaults decide where each value is held**, from the
+  engine's limits, each tier's capacity and the session's policies. The
+  schedule records the choice, and a developer can override it (§5.5).
+- **The runtime allocates no GPU memory of its own.** It draws from a
+  shared allocator, RMM or the array library's own, so that it shares a
+  GPU with PyTorch or JAX instead of competing with them for it (S4.2).
 - **State has room for two copies** while a step runs, unless the program
   donates: once the validation flag has been read, each state update writes
   into the old table's memory, as JAX's buffer donation does (S3.9).
 - **A program that donates restarts from its last checkpoint** after a
   failure that isn't a check, such as an engine error.
-- **Grace memory is a placement** on the Beta cluster, for values a GPU
+- **Grace memory is a host tier** on the Beta cluster, for values a GPU
   reads directly. Spike 3 measures whether it is fast enough to spill to.
 
 ---
@@ -502,11 +655,18 @@ step = session.program(
     parameters=["lr"],
     outputs=["loss"],
 )
+session.bind("attn.0", my_attention_kernel)       # a kernel of one's own (§5.6)
 compiled = session.compile(step, strict=True)      # declines are errors (R8)
+print(compiled.explain())                          # the schedule, and who chose what (§6.6)
+
+schedule = compiled.schedule()                     # read, edit, recompile (§5.5)
+schedule["w"].tier = "device"
+compiled = session.compile(step, schedule=schedule, strict=True)
+
 for batch in loader:
     out = compiled.run(inputs={"x": batch}, parameters={"lr": 6e-4})
-    print(out["loss"].to_pyarrow())                # the only read
-print(compiled.statistics())                       # runs and declines, by reason and label
+    print(out.result()["loss"].to_pyarrow())       # a future; the only read
+print(compiled.report())                           # cost, declines and near misses (§6.6)
 ```
 
 - **torch-sql** hands ddx the runtime as its `Backend` at M0, with no other
@@ -543,12 +703,13 @@ first among ddx#261 to #265, since parameters are one-row tables.
 
 The runtime is einfold's host. It needs from einfold:
 1. the B-0 interface: each node's IR, checks and subplan, handed to the
-   runtime to run or decline (§6.2);
+   runtime as a binding to run or decline (§6.2);
 2. published, versioned node types, with a conformance suite;
 3. the fact table (einfold's M5);
 4. a report on whether a candidate save point splits a node einfold can
    fuse (§6.4);
-5. hints, by label (§5.4).
+5. hints, by label (§5.4);
+6. near misses, with their reasons (§6.2).
 
 ### 10.4 To engines and across the PyTorch boundary
 
@@ -573,6 +734,19 @@ its neighbours. torch-sql's hypothesis H1 is that a planner choosing the
 partitioning per join distributes Samudra better than PyTorch's FSDP
 (Fully Sharded Data Parallel). One NVL72 rack holds a whole Samudra run,
 so the first distribution stays within a rack.
+
+### 10.6 To kernel compilers and GPU libraries
+
+- **Kernels arrive as bindings** (§5.6): callables over DLPack arrays,
+  from any compiler. The runtime has no kernel language, and no compiler
+  of its own.
+- **Array backends** wrap an array library, and lower einfold's nodes
+  through it: NumPy and MLX first, then a CUDA backend (§13, question 1).
+- **StableHLO and MLIR** appear only inside a backend, as JAX's route to
+  XLA, never as XQL's representation of a program (D2).
+- **Memory** comes from RMM or the array library's allocator (§7).
+- **Data moves between GPUs through NCCL**, once the runtime distributes
+  (§10.5).
 
 ---
 
@@ -634,27 +808,34 @@ on the cloud or on the Beta cluster, are available half a day a week.
 **M0. A CPU runtime.**
 - *Builds:* `Session`, table handles, `Program`, DataFusion and DuckDB
   engines implementing `ddxdb.Backend` with `compile` and tables kept in
-  place, and the counters of R8.
+  place, the counters of R8, and the schedule and reports in their first
+  form: readable, serializable and binding, even while their only entries
+  are engine steps (§5.5, §6.6). They are cheap to build first and
+  expensive to add later.
 - *Done when:* torch-sql's test suite passes on both engines with the
-  runtime as its `Backend`, and demos 2 and 4 give the same results through
-  it as today.
+  runtime as its `Backend`, demos 2 and 4 give the same results through
+  it as today, and an override the runtime can't obey fails compilation
+  with a reason.
 
 **M1. Resident state.**
 - *Builds:* persistent tables, atomic publication, engine tables that read
-  a handle's current buffer (§5.2), and placements in which a device is one
-  more placement.
+  a handle's current buffer (§5.2), tiers in which a device is one more
+  tier, the moves `prefetch`, `evict` and `pin`, and asynchronous runs.
 - *Done when:* torch-sql's nanoGPT training step is one compiled program,
   with no query per tensor, and a failed check in a test leaves every state
   table unchanged.
 
 **M2. A GPU, with B-0** (D4).
 - *Builds:* an array backend for einfold's nodes on CUDA, with NumPy on the
-  CPU as the reference, and state resident on the device. MLX follows, or
-  comes first if the contributor's Apple work gets there sooner.
+  CPU as the reference, state resident on the device, memory from a shared
+  allocator, and bindings by label for developers' own kernels. MLX
+  follows, or comes first if the contributor's Apple work gets there
+  sooner.
 - *Needs:* einfold's B-0 interface and fact table, and spike 6.
 - *Done when:* demo 2 trains on an NVIDIA GPU in strict mode, its state
   never leaving the device between steps, within the bound of §6.3 against
-  NumPy, with the share of time in nodes reported.
+  NumPy, with the share of time in nodes reported. One node runs through a
+  hand-written Triton binding, and checking mode verifies it.
 
 **M3. Save points and memory policies.**
 - *Builds:* save points and recompute policies passed to ddx by label, and
@@ -704,10 +885,20 @@ first work for the GPU half days, since they wait on no decision.
 4. **Low precision.** Which nodes may compute in bfloat16, a 16-bit float
    format GB200 hardware is built for and SQL engines lack, and who
    chooses.
-5. **How often checking mode samples** in production.
+5. **How often checking mode samples** in production, for einfold's nodes
+   and for hand-written bindings.
 6. **einfold's roadmap.** M2 needs einfold's B-0 interface and fact table
    ahead of einfold's DuckDB and sparse-kernel milestones. That is Alex's
    decision as einfold's maintainer.
+7. **The shared allocator.** RMM, or whichever allocator the array library
+   in use provides, and what happens when two libraries in one process
+   each bring their own (§7).
+8. **The schedule's format.** Which existing format, if any, it should
+   follow, and how it is versioned as the runtime grows (§5.5).
+9. **einfold's node types as an MLIR dialect.** Publishing them that way
+   would let MLIR-based compilers consume einfold's nodes directly. That is
+   a seam to the compiler ecosystem, not a change of XQL's representation
+   (D2), and it is einfold's to decide.
 
 ---
 
@@ -734,9 +925,10 @@ first work for the GPU half days, since they wait on no decision.
 - **P-D.** The runtime implements ddx's and einfold's public interfaces,
   and depends on their published types, rather than either depending on
   the runtime.
-- **P-E.** Where a value is held is the runtime's choice (R7). ddx draws
-  step boundaries, and the runtime changes them only through ddx's options
-  and the limits its `Backend` reports (§6.4).
+- **P-E.** Where a value is held is the runtime's default, recorded in the
+  schedule and open to the developer's override (R7, R10). ddx draws step
+  boundaries, and the runtime changes them only through ddx's options and
+  the limits its `Backend` reports (§6.4).
 - **P-H.** Python first, with explicit handles and a thin core, until
   spike 4 shows Rust is needed.
 - **P-I.** The runtime chooses save points with einfold's report, and
@@ -749,3 +941,15 @@ first work for the GPU half days, since they wait on no decision.
   and counters (§5.4).
 - **P-L.** Reproducibility is stated per implementation, and a session may
   require it (R9).
+- **P-M.** The schedule is a first-class object: every physical choice is
+  an entry, overrides are binding, and impossible ones fail compilation
+  (R10, §5.5).
+- **P-N.** Developers bind their own kernels to labelled nodes, with the
+  node's SQL as the specification. einfold's nodes are bindings made
+  automatically (§5.6).
+- **P-O.** Tables live in a memory hierarchy of tiers, with tier, layout
+  and owner as independent properties, and runs are asynchronous (§5.2,
+  §5.3).
+- **P-P.** The runtime does one job, and builds no compiler, allocator or
+  communication library. It meets the systems that do through Arrow,
+  DLPack, Substrait and a versioned schedule format (R11).
