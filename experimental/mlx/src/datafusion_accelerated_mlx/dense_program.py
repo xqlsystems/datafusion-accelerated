@@ -52,6 +52,9 @@ class _ComputedCache:
             )
         self.boolean = predicates in {"boolean", "all"}
         self.presence = predicates in {"presence", "all"}
+        self.symbolic_masks = (
+            os.environ.get("EINFOLD_DENSE_SYMBOLIC_MASKS") == "1"
+        )
         self.group_proofs = (
             os.environ.get(
                 "EINFOLD_DENSE_GROUP_PROOFS",
@@ -876,7 +879,7 @@ def _sum(value, mask, row_axes, kept):
     cache = _CACHE.get()
     if (
         cache is not None
-        and cache.facts
+        and (cache.facts or cache.symbolic_masks)
         and _is(value, 1)
         and np.asarray(value.value).dtype.kind in "bi"
     ):
@@ -1019,6 +1022,26 @@ def _sum(value, mask, row_axes, kept):
     return result
 
 
+def _group_validity(mask, row_axes, kept):
+    """Prove existence without constructing counts for complete domains.
+
+    If validity depends only on group keys, either every row in a group
+    contributes or none does. Empty reduced domains have no contribution.
+    Masks depending on reduced axes retain the exact COUNT calculation.
+    """
+    cache = _CACHE.get()
+    count = math.prod(len(a) for a in row_axes if a not in kept)
+    if (
+        cache is not None
+        and cache.symbolic_masks
+        and count < 1 << 63
+        and set(mask.axes).issubset(kept)
+    ):
+        cache.optimizations["dense_symbolic_group_validity"] += 1
+        return mask if count else _const(False)
+    return _truth(_op(">", _sum(_const(1), mask, row_axes, kept), _const(0)))
+
+
 def _reduce(kind, column, table, kept):
     mask = _op("and", table.present, column.valid)
     value_input = column.tensor
@@ -1072,7 +1095,7 @@ def _reduce(kind, column, table, kept):
         )
     else:
         raise _Decline(f"aggregate {kind}")
-    return _Column(value, _truth(_op(">", count, _const(0))))
+    return _Column(value, _group_validity(mask, table.axes, kept))
 
 
 def _key(expr):
@@ -1456,7 +1479,7 @@ def _aggregate(table, groups, aggregates):
         )
     # An ungrouped empty aggregate produces one row, with NULL SUM.
     present = (
-        _op(">", _sum(_const(1), table.present, table.axes, kept), _const(0))
+        _group_validity(table.present, table.axes, kept)
         if groups
         else _const(True)
     )

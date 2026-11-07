@@ -22,15 +22,21 @@ from datafusion_accelerated_mlx.dense_program import (
 
 @pytest.mark.parametrize("mode", ["off", "facts", "cse", "all"])
 @pytest.mark.parametrize("seed", range(12))
+@pytest.mark.parametrize("symbolic", [False, True])
 def test_optimizer_matches_sql_with_empty_nullable_and_duplicate_rows(
-    monkeypatch, mode, seed
+    monkeypatch, mode, seed, symbolic
 ):
     monkeypatch.setenv("EINFOLD_DENSE_OPTIMIZE", mode)
+    monkeypatch.setenv("EINFOLD_DENSE_SYMBOLIC_MASKS", str(int(symbolic)))
     rng = np.random.default_rng(seed)
     n, m = seed % 4, int(rng.integers(1, 5))
     i, j = _Axis(np.arange(n)), _Axis(np.arange(m))
     data = rng.normal(size=(n, m))
     valid = rng.random((n, m)) > 0.35
+    validity_axes = (i, j)
+    if seed % 3 == 0:
+        valid = valid[:, 0]
+        validity_axes = (i,)
     table = _Table(
         (i, j),
         [
@@ -38,7 +44,9 @@ def test_optimizer_matches_sql_with_empty_nullable_and_duplicate_rows(
             (("t", "j"), _column(j.values, (j,), j)),
             (
                 ("t", "v"),
-                _Column(_column(data, (i, j)).tensor, _mask(valid, (i, j))),
+                _Column(
+                    _column(data, (i, j)).tensor, _mask(valid, validity_axes)
+                ),
             ),
         ],
     )
