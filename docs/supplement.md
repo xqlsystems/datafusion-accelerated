@@ -579,3 +579,130 @@ tests, as torch-sql's suite does by running every op on both engines. The
 alternative, a single reference engine for all programs, would make every
 run on the other engine a comparison, and the reference would still have
 bugs of its own, such as DataFusion's `MAX` skipping NaN.
+
+---
+
+## S5. Control and composition
+
+The design has three aims beyond running programs fast:
+- the model should match how systems programmers already think about
+  memory;
+- developers and agents should be able to reach every low-level choice,
+  rather than fight a compiler that makes the choices for them;
+- the runtime should be one component of a composable data system.
+
+This section records why the design takes the form it does for each.
+
+### S5.1 Algorithm and schedule
+
+Halide, a language for image-processing pipelines, separates a program's
+*algorithm*, what it computes, from its *schedule*, how it is computed:
+the order of loops, what is stored and where, and what runs in parallel.
+A developer can change the schedule freely, because no schedule changes the
+result. The design takes the same split. The SQL is the algorithm, and the
+schedule (design §5.5) holds every physical choice.
+
+The split matters because both of the traditions XQL draws on hid the
+schedule:
+- **Databases.** PostgreSQL has no query hints in its core, only through
+  an extension, and systems that do have hints often ignore an invalid one
+  without saying so. A developer who knows a better plan has to coax the
+  optimizer into finding it.
+- **GPU compilers.** Triton chooses layouts, pipelining and other
+  low-level details by heuristics, which made the last part of the
+  performance hard to reach. Newer tools hand those choices back: Triton's
+  own Gluon dialect exposes layouts the compiler used to choose, and
+  CUTLASS's CuTe DSL lets Python code state them directly.
+
+Agents change the trade-off further. An agent improves a program by a
+loop: change something, run, read the cost, repeat. That needs three
+things, which design R10, §5.5 and §6.6 provide: a schedule the agent can
+edit, a report it can parse, and a check that its change is still correct.
+XQL has an unusually strong version of the third, since the SQL computes
+the right answer on any engine, and checking mode compares against it.
+
+### S5.2 Why control is safe here
+
+Codd's relational model rests on *data independence*: how data is stored
+can change without changing what a query means. Design R7 is that
+principle applied to the runtime. Where a value lives, how it is laid out,
+which kernel computes it and what is recomputed never change a result
+beyond the stated bound. So handing those choices to a developer can make
+a program slower, but never wrong, and checking mode catches the
+exceptions. The relational model is what makes low-level control safe to
+give, not what stands in its way.
+
+### S5.3 Proof against test, for bindings
+
+einfold's nodes are exact by proof: einfold shows from the plan's
+structure that the array algorithm computes the SQL, and checks at run
+time the facts the proof needs. A developer's kernel has no such proof. It
+is tested against its SQL, on the runs that checking mode samples, which
+finds most errors but can miss one that appears only on rare inputs. The
+design therefore treats hand-written bindings as a separate class: counted
+apart, sampled more often, and refusable in strict mode (design §5.6). The
+two classes share one mechanism, so a binding can move from hand-written
+to detected when einfold learns its pattern.
+
+### S5.4 A deconstructed tensor runtime
+
+Wes McKinney's idea of the *deconstructed database* is that a database can
+be assembled from independent parts, joined by standard formats: Arrow for
+data in memory, Substrait for plans, and engines such as DataFusion and
+Velox as libraries rather than products. The *Composable Data Management
+System Manifesto* (Pedreira et al., VLDB 2023) states the case at length.
+XQL is built that way, and the runtime is meant to be the same thing for
+array programs: a *deconstructed tensor runtime*.
+
+That means the runtime builds only what no other component does:
+
+| Concern | Who provides it |
+|---|---|
+| Planning and running SQL | DataFusion, DuckDB, GPU engines |
+| Differentiation | ddx |
+| Recognizing array work in SQL | einfold |
+| Kernels | Triton, CUTLASS, XLA, `torch.compile`, MLX, or a developer's code |
+| GPU memory | RMM, or the array library's allocator |
+| Moving data between GPUs | NCCL |
+| Tables, arrays and plans across each seam | Arrow, DLPack, Substrait |
+| Lifetimes, placement across tiers, the schedule, bindings, checks and reports | the runtime |
+
+The risk of a bridge layer is that it grows into everything it connects.
+Design R11 is the test against that: if a feature could be a library of
+its own, used without the runtime, it should be one. Borrowing the
+allocator has a direct payoff too. JAX takes most of a GPU's memory when
+it starts (S4.2), and two libraries that each own their allocator compete
+for one GPU. A runtime that draws from a shared allocator doesn't.
+
+### S5.5 StableHLO and MLIR
+
+StableHLO and MLIR are the compiler ecosystem's standard formats, and a
+composable runtime should meet them. It does so at two seams, without
+making either XQL's representation of a program (design D2):
+- **Inside a backend.** A JAX backend lowers einfold's nodes to StableHLO
+  for XLA to compile. That stays private to the backend.
+- **At einfold's node types**, possibly. If einfold published its nodes as
+  an MLIR dialect, MLIR-based compilers could consume them directly. That
+  is einfold's decision (design §13, question 9).
+
+Building the runtime itself on MLIR would make it a compiler, which is a
+non-goal, and would tie the first, Python-only releases to a large C++
+framework.
+
+### S5.6 Values and buffers
+
+The memory hierarchy and the relational model disagree on one point. In
+SQL, a table is a value: it has no identity, nothing aliases it, and
+nothing changes it in place. In systems programming, a buffer is mutable
+and can be shared. The design keeps the two apart by allowing in-place
+writes in one place only, the publication of state (design R5 and §7),
+where buffer donation and ddxdb's `in_place` mode both live. Everywhere
+else, a new value is a new table.
+
+### S5.7 Who the memory model is for
+
+A memory hierarchy with tiers, moves and pins is the right model for
+someone tuning a training step, and the wrong one for a scientist querying
+a Dataset through xarray-sql. So every control has a default, and a
+program that names no tier, binding or save point runs well without them.
+The controls are there to be reached for, not required.

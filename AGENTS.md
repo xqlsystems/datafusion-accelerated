@@ -93,6 +93,13 @@ docs, docstrings, issues, PR descriptions).
   an array program, a GPU path) against it, on more than one engine where
   it can run. torch-sql found silent disagreements between DataFusion and
   DuckDB this way.
+- **One job** (principle R11). The runtime owns tables' lifetimes,
+  placement, the schedule and bindings, and builds no compiler, allocator
+  or communication library. If a feature could be a library of its own,
+  used without the runtime, make it one, or use one that exists.
+- **No hidden decisions** (principle R10). Every physical choice the
+  runtime makes goes in the schedule, with who made it. An override is
+  binding, and one the runtime can't obey is an error, never ignored.
 - **Cap memory in tests.** DataFusion can exhaust memory planning a deep
   query, which has crashed sessions on this machine. Run tests under a
   memory cap, for example
