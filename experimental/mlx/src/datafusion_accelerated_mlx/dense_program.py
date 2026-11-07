@@ -69,6 +69,10 @@ class _ComputedCache:
         self.lookup_offsets = {}
         self.lookup_bytes = 0
         self.take_values = {}
+        self.share_reductions = (
+            os.environ.get("EINFOLD_DENSE_REDUCTION_VALUES") == "1"
+        )
+        self.reduction_values = {}
         self.nodes = {}
         self.optimizations = Counter()
         self.max_bytes = max_bytes
@@ -154,6 +158,8 @@ def _value_source(tensor):
         tensor = tensor.args[0]
     if tensor.kind == "take" and tensor.shared_take is not None:
         return tensor.shared_take
+    if tensor.kind == "reduce" and tensor.shared_reduction is not None:
+        return tensor.shared_reduction
     return tensor
 
 
@@ -272,6 +278,8 @@ class _Tensor:
         self.positive = None
         if kind == "take":
             self.shared_take = None
+        if kind == "reduce":
+            self.shared_reduction = None
         self.host_only = (
             np.asarray(value).dtype.kind in "biuUS"
             if kind == "array"
@@ -389,6 +397,8 @@ class _Tensor:
                     and (self.reduction is not None or self.union is not None)
                     else None
                 )
+                if lowered is None and self.shared_reduction is not None:
+                    return self.shared_reduction.get()
                 self.cached = self.value() if lowered is None else lowered
             else:
                 runtime = _EXECUTION.get()
@@ -964,6 +974,36 @@ def _sum(value, mask, row_axes, kept):
         tuple(factors),
         repeated,
     )
+    if cache is not None and cache.share_reductions:
+        work = math.prod(len(a) for a in used) * len(factors)
+        elements = math.prod(len(a) for a in output)
+        if work >= 1 << 20 and work >= 64 * elements:
+            axes = _axes(output, used, row_axes, kept)
+            positions = {axis: i for i, axis in enumerate(axes)}
+            signature = (
+                tuple(
+                    (_value_source(f), tuple(positions[a] for a in f.axes))
+                    for f in factors
+                ),
+                tuple(len(a) for a in axes),
+                tuple(positions[a] for a in row_axes),
+                tuple(positions[a] for a in kept),
+                len(output),
+                repeated,
+                len(_factors(value)) > 1,
+            )
+            shared = cache.reduction_values.get(signature)
+            if shared is not None:
+                shared = _value_source(shared)
+            if (
+                shared is not None
+                and shared is not result
+                and result.shared_reduction is None
+            ):
+                result.shared_reduction = shared
+                cache.optimizations["dense_shared_reduction_values"] += 1
+            elif shared is None and len(cache.reduction_values) < 4096:
+                cache.reduction_values[signature] = result
     if _is(value, 1):
         result.count_bound = math.prod(
             len(a) for a in row_axes if a not in kept

@@ -175,3 +175,54 @@ def test_renamed_contractions_preserve_free_and_reduced_axes(monkeypatch, seed):
     np.testing.assert_allclose(
         actual["v"].to_numpy(), expected["v"].to_numpy(), atol=1e-12
     )
+
+
+@pytest.mark.parametrize("cache_bytes", [1, 1 << 20])
+def test_cost_gated_reductions_keep_masks_and_refresh_inputs(
+    monkeypatch, cache_bytes
+):
+    monkeypatch.setenv("EINFOLD_DENSE_REDUCTION_VALUES", "1")
+    rng = np.random.default_rng(17)
+    i, j = _Axis(np.arange(96)), _Axis(np.arange(96))
+    ctx = datafusion.SessionContext()
+    query = """WITH a AS (
+      SELECT x.i,y.i AS k,SUM(x.v*y.v) AS v
+      FROM t x JOIN t y ON x.j=y.j GROUP BY x.i,y.i),
+    b AS (
+      SELECT x.i,y.i AS k,SUM(x.v*y.v) AS v
+      FROM t x JOIN t y ON x.j=y.j GROUP BY x.i,y.i),
+    c AS (
+      SELECT x.i,y.i AS k,SUM(CASE WHEN x.j<48 THEN x.v*y.v END) AS v
+      FROM t x JOIN t y ON x.j=y.j GROUP BY x.i,y.i)
+    SELECT a.i,a.k,a.v+b.v AS full,c.v AS masked FROM a
+      JOIN b ON a.i=b.i AND a.k=b.k JOIN c ON a.i=c.i AND a.k=c.k
+    ORDER BY a.i,a.k"""
+    for offset in (0.0, 0.5):
+        values = rng.normal(size=(96, 96)) + offset
+        table = _Table(
+            (i, j),
+            [
+                (("t", "i"), _column(i.values, (i,), i)),
+                (("t", "j"), _column(j.values, (j,), j)),
+                (("t", "v"), _column(values, (i, j))),
+            ],
+        )
+        schema = pa.schema(
+            [("i", pa.int64()), ("j", pa.int64()), ("v", pa.float64())]
+        )
+        ctx.deregister_table("t")
+        ctx.register_record_batches("t", [table.arrow(schema).to_batches()])
+        frame = ctx.sql(query)
+        token = _CACHE.set(_ComputedCache(cache_bytes))
+        try:
+            actual = (
+                DenseProgram(frame.logical_plan(), frame.schema())
+                .run(lambda _, current=table: current)
+                .arrow(frame.schema())
+            )
+        finally:
+            _CACHE.reset(token)
+        expected = values @ values.T
+        masked = values[:, :48] @ values[:, :48].T
+        np.testing.assert_allclose(actual["full"], (2 * expected).ravel())
+        np.testing.assert_allclose(actual["masked"], masked.ravel())
