@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 _author_: Alex Merose
 _co-authors_: ⚡ Claude (datafusion-accelerated), formerly 🔥 Claude (torch-sql), and 🌀 Claude (xarray-sql), via Claude Code
 _reviewers_: 🪭 Claude (einfold) and ∂ Claude (ddx). Their reviews of v1.1 are in [reviews/](reviews/).
-_status_: Draft v1.7, for approval. Nothing is built. Collapsed sections (▸) hold background and detail.
+_status_: Draft v1.8, for approval. Nothing is built. Collapsed sections (▸) hold background and detail.
 _last updated_: 2026-11-07
 _supplement_: [supplement.md](supplement.md), with the evidence, the alternatives considered and the reasoning behind each rule. Citations such as "(S1.1)" point there. S6 compares the design with JAX, PyTorch and DataFusion, and S7 covers distributed training.
 _origin_: [xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307)
@@ -477,6 +477,22 @@ Rules:
 - **Runtime tables are DataFusion table providers**, read as Arrow batches
   by DataFusion's operators, and as compact arrays by device nodes that
   scan them directly (§5.3).
+- **A table is held compactly only when its domain is known and dense
+  enough.** A compact array stores every cell of its domain, so an absent
+  cell costs its storage and its arithmetic, as a masked value. Only rows
+  make absence free, and rows are the slow path (S1.1). The runtime
+  chooses the compact layout for a table that one of einfold's nodes reads
+  or writes when the fact table gives its domain (each dimension's extent,
+  or a table of the domain), and its density, the share of the domain's
+  cells that have rows, is at least `accelerated.compact.min_density`.
+  Density may be an estimate from statistics, as einfold's facts allow
+  for cost decisions. Other tables stay as rows. Each instance's layout is
+  a schedule entry (§5.6) that a developer can override, and `EXPLAIN`
+  shows it with its density. For Samudra's grid, about 30% land, a
+  compact array stores about 1.4 cells per ocean cell. Spike 13 sets the
+  default threshold, and tests a blocked layout that leaves absent blocks
+  unstored
+  ([#34](https://github.com/xqlsystems/datafusion-accelerated/issues/34)).
 - **Developers may move tables themselves**: `prefetch` to a tier, `evict`
   from one, and `pin` an instance so that it stays. Each tier reports its
   capacity and what it holds.
@@ -567,9 +583,17 @@ Rules:
 - **A training step can be one statement.** With the ddx integration in
   the session (§5.8), `SELECT k, v - $lr * grad(loss, v) AS v FROM w` is a whole step
   of gradient descent. ddx writes the program from it.
+- **A program may have several statements, by name.** `Program(ctx, STEP,
+  ...)` takes one statement, whose result is the next value of the
+  program's one state table. `Program(ctx, {"grads": GRADS_SQL, "w":
+  UPDATE_SQL}, ...)` takes several. Each statement's result is a table
+  that later statements read by its name, the order comes from those
+  reads, and a statement named after a state table computes that table's
+  next value. Outputs name a statement or a label (§5.5). In Rust,
+  `Program::from_steps(&ctx, [("grads", GRADS_SQL), ("w", UPDATE_SQL)])`.
 - **Programs compose.** A program may also be ddx's program followed by
-  update steps that read its gradient tables. The runtime takes both as
-  one program.
+  update steps that read its gradient tables, written as statements by
+  name. The runtime takes both as one program.
 - **ddx's checks, where there are any, run when they must.** Each states a promise: that some key
   columns of one table are unique. The runtime runs a check once per
   compile for a table whose keys don't change, on each run otherwise, and
@@ -936,6 +960,15 @@ between the two gets closed.
 - **B-2, regions across steps**, through einfold's program mode, with
   ddx's step graph (ddx#157) and regions (ddx#251).
 
+B-0 comes first because it is the right first interface, not because it
+is expected to be enough. The contributor's measurements already say it
+will stop short. Their fastest steps compile each whole step as one MLX
+program, fuse pointwise chains of up to 64 nodes, and, on Modded-NanoGPT,
+share values across the forward and backward parts of a step, which alone
+took the step from 417 to 233 ms (S1.1). B-0 runs one node at a time and
+has a place for none of these. So B-1 and B-2 are planned (M5, M6), and
+spike 6 measures how far short B-0 stops.
+
 B pulls einfold's fact table and program mode ahead of its DuckDB and
 sparse-kernel milestones. That is Alex's decision as einfold's maintainer,
 after a sketch in einfold's design doc (§13, question 4).
@@ -1007,6 +1040,17 @@ its own boundaries.
   policy that moves a value to `CUDA_HOST` rather than recomputing it
   (S6.1). The runtime applies a memory-budget policy only when the session
   turns one on, and may always save more than a policy asks.
+- **A value several steps of one run share is held, not recomputed by
+  choice.** When a run's steps compute the same value, such as a forward
+  product its backward steps read again, it is computed once and kept
+  until the run ends. einfold proves two values identical, in its program
+  mode (B-2), and the runtime holds the value as a table instance in the
+  schedule (§5.6). Under memory pressure the runtime spills it to a lower
+  tier, as DataFusion spills, and recomputes it only where a recompute
+  policy names its label. The contributor's cache of these values evicts
+  the least recently used one when it runs out of room, and recomputes it
+  if it is read again. That is recomputing by the engine's own choice,
+  which D1 rules out, so that part changes as it moves (P-X).
 - **Only plans that give the same rows twice are recomputed** (S3.7). ddx
   reads volatility from the engine through its `Backend`.
 - **The runtime's random function is declared deterministic**, so that a
@@ -1549,6 +1593,13 @@ on the cloud or on the Beta cluster, are available half a day a week.
   Hand-written kernels from three libraries, Triton and Pallas from Python
   and cuTile Rust from Rust, each run one node, each bound with no code in
   the runtime specific to its library, and checking mode verifies them.
+  Speed and memory are reported against what exists: demo 2's and
+  torch-sql's nanoGPT warm step against PyTorch on the same GPU, eager and
+  with `torch.compile`, with peak device memory beside PyTorch's, since §7
+  budgets two copies of state. Where the MLX integration runs, the same
+  steps also run against the contributor's MLX path at its pinned
+  commits, and B-0 is no slower there than `DenseExecutor` (#303), the
+  existing design closest to it (§13, question 14).
 
 **M3. Save points and memory policies.**
 - *Builds:* save points and recompute policies passed to ddx by label, and
@@ -1561,10 +1612,18 @@ on the cloud or on the Beta cluster, are available half a day a week.
 - *Done when:* concurrent runs give the same results as sequential ones,
   within R9's statement, and the time saved is reported.
 
-**M5. B-1, regions within a step**, built only if spike 6 and M2 show B-0
-stops short.
+**M5. B-1, regions within a step.** Planned, since the evidence expects
+B-0 to stop short (§6.2). Spike 6 and M2 measure by how much, and so what
+M5 must recover.
+- *Done when:* torch-sql's nanoGPT step runs each of einfold's regions as
+  one compiled program, and its warm step and peak memory are reported
+  against M2's and PyTorch's on the same GPU.
 
-**M6. B-2, regions across steps**, with ddx#157 and ddx#251.
+**M6. B-2, regions across steps**, with ddx#157 and ddx#251, and the
+values a run's steps share (§6.5).
+- *Done when:* on an Apple GPU, Modded-NanoGPT's warm step is no slower
+  than the contributor's MLX path on the same machine (238.95 ms on the
+  M5 Ultra, S1.1), with peak memory reported beside PyTorch's.
 
 **M7. Distribution, through datafusion-distributed**, within one NVL72
 rack (§10.5).
@@ -1603,14 +1662,15 @@ are the first work for the GPU half days, since they wait on no decision.
 | 2 | Do rows between operators cost a GPU SQL engine what they cost GPU kernels? | One of demo 2's steps on Sirius | Whether a GPU engine is an alternative to B |
 | 3 | Can a B200 read Arrow buffers in place from Grace memory fast enough? | Read against copy, on the Beta cluster | Whether Grace memory is a tier worth spilling to (§7) |
 | 4 | What does crossing from Python cost? | datafusion-ffi's overhead for the runtime's nodes (S4.1); launching a Triton kernel from a `KernelExec` through Python, and whether the call holds Python's lock | Which Python kernels are worth binding, and whether some must be compiled ahead of time |
-| 5 | Where does the last 3.76× against PyTorch go? | Trace one warm resident step on the M5 Ultra against PyTorch MPS, by kind of operation, after reading the contributor's own comparison | What M2 and M5 should fix first |
-| 6 | How much of each step does einfold already cover? | `EXPLAIN ANALYZE` with einfold on, for demo 2, demo 4 and torch-sql's nanoGPT: the share of time inside einfold's nodes, and how often a DataFusion operator sits between two of them (S2.5). einfold's agent runs einfold's side | How far B-0 gets, and whether M5 is needed |
+| 5 | Where does the remaining gap to PyTorch go, in time and in memory? | Start from the contributor's own division of the step by kind of work: the ablations in `GPU_NUMERICAL_VALUE_IDENTITIES.md`, `MPS_COMPILER_COMPARISON.md` and `MODDED_NANOGPT_STEP_EXPERIMENTS.md`, on xarray-sql's `codex/numerical-value-identities` branch. Then trace one warm resident step on the M5 Ultra against PyTorch MPS for what they don't cover, including peak memory, which on Nov 2 was 24.67 GB of process memory against PyTorch's 2.44 GB (S1.1) | What M2, M5 and M6 should fix first |
+| 6 | How much of each step does einfold already cover? | `EXPLAIN ANALYZE` with einfold on, for demo 2, demo 4 and torch-sql's nanoGPT: the share of time inside einfold's nodes, and how often a DataFusion operator sits between two of them (S2.5). The contributor's `DenseProgram` corpus and spike 5's ablations are its inputs. einfold's agent runs einfold's side | How far short B-0 stops, and so what M5 must recover (§6.2) |
 | 7 | Can handle batches carry device data between DataFusion nodes? | Two `KernelExec`s in one plan passing handle batches, through repartitioning and the planner's other rewrites, with a `CopyExec` where rows are needed | Whether §5.3's device plans work as written, or device work must stay inside single nodes. **Done:** they work, under three rules now in §5.3 ([report](spikes/s07-handle-batches/README.md)) |
 | 8 | Can relational collectives match NCCL? ([#12](https://github.com/xqlsystems/datafusion-accelerated/issues/12)) | Reduce one demo 2 step's gradients on 8 GPUs, then 2 nodes: NCCL all-reduce, NCCL reduce-scatter and all-gather, and a shuffle by key with a final sum | Whether the runtime needs a collective node that calls NCCL, or plain shuffles suffice |
 | 9 | Which host suits distributed training, datafusion-distributed or Ballista? ([#13](https://github.com/xqlsystems/datafusion-accelerated/issues/13)) | One distributed demo 2 step on each, CPU first: per-run overhead over 100 runs, and deploying stages once | Whether D7 holds for training, or the distributed contract stays neutral between them (S7.5) |
 | 10 | Does AMD's stack slot in with no runtime changes beyond a backend? ([#22](https://github.com/xqlsystems/datafusion-accelerated/issues/22)) | One distributed demo 2 step on an 8-GPU MI300-class node: HIP, RCCL, a Triton kernel, tiles placed per node | Whether the device-family contract holds for ROCm, and whether AMD needs placement from the start |
 | 11 | Do a region's exchanges lower to one XLA program on a TPU? ([#23](https://github.com/xqlsystems/datafusion-accelerated/issues/23)) | One demo 4 block, with its halo exchange and a gradient reduction, through StableHLO and PJRT on a small slice, against the same in JAX's `shard_map` | Whether a TPU backend fits the runtime's contract |
 | 12 | Can libcudf's relational kernels run DataFusion's operators over handle batches? ([#24](https://github.com/xqlsystems/datafusion-accelerated/issues/24)) | Bind DataFusion's hash aggregate and hash join to libcudf, exchanging columns through the C Device Data Interface, on TPC-H queries and one xarray-sql query | Whether relational acceleration fits the kernel contract, and what M8 needs |
+| 13 | Where do compact arrays stop paying for their absent cells, and does a blocked layout keep them unstored? ([#34](https://github.com/xqlsystems/datafusion-accelerated/issues/34)) | Demo 4's U-Net steps over Samudra's grid as rows, as compact arrays, and as dense blocks with absent blocks unstored, at the grid's own density and at lower ones | The default of `accelerated.compact.min_density`, and whether blocks become a third layout (§5.2) |
 
 ---
 
@@ -1662,6 +1722,14 @@ are the first work for the GPU half days, since they wait on no decision.
     whether publication is atomic across all of them (R5), or recovery
     restarts from a checkpoint
     ([#11](https://github.com/xqlsystems/datafusion-accelerated/issues/11)).
+14. **Whether M2 waits for parity with the MLX path.** #32 asks that M2
+    not pass while slower than code that exists today. This draft gives M2
+    a floor against `DenseExecutor`, which keeps compact arrays between
+    operators run one at a time, as B-0 does, and puts parity with the
+    contributor's fastest MLX path at M6, since that path's speed comes
+    from whole compiled steps and values shared across steps (§6.2). The
+    alternative is to hold the GPU milestone until B-1 lands. Alex decides
+    ([#32](https://github.com/xqlsystems/datafusion-accelerated/issues/32)).
 
 ---
 
@@ -1711,7 +1779,7 @@ are the first work for the GPU half days, since they wait on no decision.
 ### Proposed
 
 <details>
-<summary>Proposals P-A to P-W, for approval</summary>
+<summary>Proposals P-A to P-Y, for approval</summary>
 
 P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
 
@@ -1769,5 +1837,12 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
   datafusion-distributed's control plane (§10.5).
 - **P-W.** The topology is a graph taken from each platform's discovery,
   and placement embeds partitions into it (§10.5).
+- **P-X.** A value that several steps of one run share is proved
+  identical by einfold and held by the runtime until the run ends. Under
+  memory pressure it is spilled, and recomputed only where a recompute
+  policy names it (§6.5, D1).
+- **P-Y.** A table is held as a compact array only when its domain is
+  known and its density reaches a session threshold, and stays as rows
+  otherwise (§5.2).
 
 </details>

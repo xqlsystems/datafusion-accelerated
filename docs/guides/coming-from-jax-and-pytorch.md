@@ -55,8 +55,11 @@ Operations on arrays become operations on tables:
 | a mask | rows that aren't there |
 
 The last row is the reason XQL does this. A table can be *partial*: an
-ocean model's grid has no rows for land, so land is never stored, computed
-or sent anywhere. A dense array has to hold it and multiply it by zero.
+ocean model's grid has no rows for land, so in this long format land is
+never stored, computed or sent anywhere. A dense array has to hold it and
+multiply it by zero. Long format is also slow where data is dense, so the
+runtime trades some of this away for speed, as the end of this guide
+explains.
 
 This also means **you don't have to give up your framework.** If you'd
 rather keep writing PyTorch, [torch-sql](https://github.com/xqlsystems/torch-sql)
@@ -460,10 +463,22 @@ def attention(args):
 - **Long format costs memory and time** where the data is dense. The
   runtime holds dense intermediates as *compact arrays* (coordinates once,
   values densely, masks for absent rows), which closed most of the gap in
-  XQL's measurements. It doesn't close all of it yet: the best SQL training
-  step measured so far was 1.3 times slower than PyTorch on an Apple GPU.
-- **Absence is free.** Masked cells, such as land in an ocean model, have
-  no rows, so they cost nothing anywhere.
+  XQL's measurements. It doesn't close all of it yet. On Modded-NanoGPT, a
+  124M-parameter GPT at context 1,024, the best SQL training step measured
+  so far took 238.95 ms on an Apple M5 Ultra, against 185.40 ms for
+  PyTorch on the same GPU: 1.29 times slower. That comparison is narrow.
+  Both ran at batch 1 in float32, and PyTorch ran eagerly, without
+  `torch.compile` and with unfused AdamW. A compiled PyTorch step is
+  likely faster, and hasn't been measured. Memory is further off: an earlier run of the same workload
+  peaked at 24.67 GB of process memory against PyTorch's 2.44 GB, though
+  MLX and PyTorch count GPU memory differently
+  ([supplement S1.1](../supplement.md)).
+- **Absence is free only as rows.** Cells with no row, such as land in an
+  ocean model, cost nothing in long format. A compact array stores every
+  cell of its domain, so there an absent cell costs its storage and its
+  arithmetic as a masked value, as in a dense array. The runtime holds a
+  table compactly only when its domain is known and dense enough
+  ([design §5.2](../design.md)), so a sparse table stays as rows.
 - **Nothing here is built yet,** except DataFusion, ddx, xarray-sql and
   torch-sql, which run today on the CPU. The design's
   [milestones](../design.md) say what comes first.
