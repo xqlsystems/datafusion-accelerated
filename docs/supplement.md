@@ -74,6 +74,14 @@ program. One more change did most of the latest gain: values shared across
 the forward and backward parts of a step took it from 417 to 233 ms. That
 cache holds a fixed number of bytes, evicts the least recently used value
 when it is full, and recomputes a value read again after its eviction.
+That is recomputing by the engine's own choice, which design D1 rules out,
+so the design holds such values for the run and spills them instead
+(design §6.5).
+
+The contributor's ablations divide the step by kind of work, and are
+spike 5's starting point: `GPU_NUMERICAL_VALUE_IDENTITIES.md`,
+`MPS_COMPILER_COMPARISON.md` and `MODDED_NANOGPT_STEP_EXPERIMENTS.md`, on
+the same branch.
 
 The gains came from proofs, and most of them live in einfold's
 `DenseProgram`, in the contributor's fork of einfold. Twelve commits on
@@ -377,9 +385,9 @@ therefore depends on two numbers, which spike 6 measures: how much of each
 step's time is inside einfold's nodes, and how often a DataFusion operator
 sits between two of them.
 
-If handle batches don't survive DataFusion's rewrites (design spike 7),
-device data can stay on the device only inside one node, and residency
-shrinks to what crosses steps as runtime tables.
+Spike 7 found that handle batches survive DataFusion's rewrites under
+three rules (S6.5), so device data can stay on the device across a whole
+segment of device nodes, not only inside one.
 
 ### S2.6 Why B is staged
 
@@ -397,6 +405,40 @@ share values across the forward and backward parts of a step, which alone
 took the step from 417 to 233 ms (S1.1). B-0 runs one node at a time and
 has a place for none of these, so the design plans B-1 and B-2 rather than
 waiting to see whether they are needed.
+
+### S2.7 Layouts: rows, compact arrays and blocks
+
+A table in long format has a row only for each cell that exists, so absent
+cells, such as land in an ocean model, cost nothing. A dense array stores
+every cell of its domain, so absent cells come back as masked values,
+stored and computed. Spike 13 measured where each layout pays, with a 3 by
+3 convolution on each of the 33 depth levels of the World Ocean Atlas's 1°
+ocean mask, from 64% ocean at the surface to 8% at 5,500 m
+([report](spikes/s13-compact-absence/README.md)). All 72 runs matched a
+direct sum within design §6.3's bound.
+
+- **Time.** A dense array ran faster than rows in DataFusion on every
+  level: 15.7 times at the surface and 2.2 times at 8% ocean, with four
+  channels, and 38 and 5 times with sixteen. Rows cost in proportion to
+  the cells present, and an array the same at every level, so arrays win
+  down to a few percent present.
+- **Memory.** A row holds a value with its coordinates, 20 bytes here, and
+  an array 8 bytes for every cell, present or not. So an array holds fewer
+  bytes only above about 40% present, whatever the number of channels.
+  The two crossovers are an order of magnitude apart, so no single density
+  threshold serves both.
+- **Blocks.** Dense blocks of 8 by 8 cells, with the all-land blocks left
+  out, were the fastest layout on every level, and stored 1.28 to 2.78
+  cells per ocean cell, where a dense array stores 1.56 to 12.04. They help
+  only because land is clustered: with the same ocean cells scattered at
+  random, blocks stored as much as the dense array and ran 3 to 14%
+  slower.
+
+So the design makes blocks the compact layout, with a dense array as the
+case of one block, and chooses the block size by stored cells per present
+cell, which measures clustering as density doesn't (design §5.2). The
+spike ran on one CPU core, and tested one convolution rather than a whole
+U-Net, whose coarser levels are denser than the grid it starts from.
 
 ---
 
