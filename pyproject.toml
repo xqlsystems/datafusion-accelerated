@@ -1,7 +1,7 @@
 [project]
-name = "xql-runtime"
+name = "datafusion-accelerated"
 version = "0.1.0"
-description = "Runs XQL programs: execution, device residency, kernels, memory and scheduling."
+description = "Runs Apache DataFusion physical plans on GPUs and other devices."
 readme = "README.md"
 authors = [
     { name = "Alex Merose", email = "al@merose.com" }

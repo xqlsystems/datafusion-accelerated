@@ -1,9 +1,9 @@
-# The XQL runtime: design
+# DataFusion Accelerated: design
 
 _author_: Alex Merose
 _co-authors_: 🔥 Claude (torch-sql) and 🌀 Claude (xarray-sql), via Claude Code
 _reviewers_: 🪭 Claude (einfold) and ∂ Claude (ddx). Their reviews of v1.1 are in [reviews/](reviews/).
-_status_: Draft v1.5, for approval. Nothing is built. Collapsed sections (▸) hold background and detail.
+_status_: Draft v1.6, for approval. Nothing is built. Collapsed sections (▸) hold background and detail.
 _last updated_: 2026-11-07
 _supplement_: [supplement.md](supplement.md), with the evidence, the alternatives considered and the reasoning behind each rule. Citations such as "(S1.1)" point there. S6 compares the design with JAX, PyTorch and DataFusion, and S7 covers distributed training.
 _origin_: [xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307)
@@ -28,8 +28,18 @@ runtime:     execution, device residency, kernels, memory, scheduling, distribut
 engines:     DataFusion · DuckDB · GPU engines (Sirius, GQE) · any ADBC database
 ```
 
-§2 introduces each project. This doc specifies the missing layer,
-**xql-runtime**, which runs XQL's programs on GPUs and other devices.
+§2 introduces each project. This doc specifies the missing layer, which
+turns out to be missing from DataFusion's ecosystem as a whole:
+**DataFusion Accelerated** (`datafusion-accelerated`), which runs
+DataFusion's physical plans on GPUs and other devices. Any physical node,
+whether einfold's array work or one of DataFusion's own relational
+operators, can have a device implementation, checked against DataFusion's
+own. XQL is its first user, and training XQL's models is what shaped it.
+This doc calls it *the runtime* for short.
+
+DataFusion Accelerated is not part of the Apache DataFusion project, as
+datafusion-distributed isn't. "Apache DataFusion" is a trademark of the
+Apache Software Foundation.
 
 **Why.** How data is held and moved between queries, more than planning
 or arithmetic, decides how fast XQL runs a training step (S1). On a
@@ -53,6 +63,11 @@ plan with a few extra nodes that move data between memory tiers and run
 work on a device (§5). Nothing a DataFusion user knows changes, and the
 two extensions compose: a plan can have network nodes and device nodes at
 once (§10.5).
+
+It is the accelerator for DataFusion that Spark RAPIDS is for Spark and
+Sirius is for DuckDB: operators swapped for device ones, with explicit
+transitions between them, and the engine's own operators as the fallback
+and the reference (S4.3).
 
 The runtime adds one thing DataFusion has no layer for: a *program*,
 several queries run as one training step, with state that persists from
@@ -257,8 +272,9 @@ against each.
    steps, so a training loop moves only its batches and the values it
    reads.
 4. **Choose an implementation for each piece of work**: DataFusion's own
-   operators by default, and kernels for work einfold has marked or a
-   developer has bound.
+   operators by default, and kernels for work einfold has marked, for
+   DataFusion's relational operators, or for anything a developer has
+   bound. Array work comes first, since XQL's models need it.
 5. **Hold values across the memory hierarchy**: by default where the
    runtime judges best, and wherever the developer says. Recompute values
    only under a policy the user turns on.
@@ -273,8 +289,10 @@ against each.
 ### 3.2 Non-goals
 
 - **An SQL engine of its own.** The runtime never interprets relational
-  operators: no joins, no `GROUP BY`, no NULL rules. DataFusion runs those
-  (S2.1).
+  operators itself: no joins, no `GROUP BY`, no NULL rules of its own.
+  DataFusion runs those, and where they run on a device, a library such as
+  libcudf (cuDF's C++ core) provides the kernels, bound like any other and
+  checked against DataFusion's (§5.7, S2.1).
 - **Differentiation, plan rewriting, or drawing a program's step
   boundaries.** Those are ddx's and einfold's (§6.4).
 - **A kernel compiler, a memory allocator or a communication library.**
@@ -360,7 +378,7 @@ let state = SessionStateBuilder::new()
     .with_default_features()
     .with_ddx()                              // grad, vjp and jvp in SQL (§10.2)
     .with_einfold()                          // einfold's detection (§10.3)
-    .with_xql_runtime(RuntimeOptions::new().device("cuda:0"))
+    .with_accelerator(RuntimeOptions::new().device("cuda:0"))
     .build();
 let ctx = SessionContext::new_with_state(state);
 ```
@@ -369,13 +387,13 @@ In Python, each project provides an extension object for
 `SessionContext.with_extensions`, as einfold's `EinFold` already is:
 
 ```python
-ctx = SessionContext().with_extensions(Ddx(), EinFold(), XqlRuntime(devices=["cuda:0"]))
+ctx = SessionContext().with_extensions(Ddx(), EinFold(), Accelerator(devices=["cuda:0"]))
 ```
 
 Rules:
-- **Settings live in the `xql_runtime` namespace** of `SessionConfig`, so
-  SQL can set them: `SET xql_runtime.strict = true`,
-  `SET xql_runtime.checking.sample = 0.01`.
+- **Settings live in the `accelerated` namespace** of `SessionConfig`, so
+  SQL can set them: `SET accelerated.strict = true`,
+  `SET accelerated.checking.sample = 0.01`.
 - **The runtime's state lives in DataFusion's.** Its device memory and
   device handles are in the session's `RuntimeEnv` (§5.2), and its nodes
   find them through the `TaskContext` they run with.
@@ -392,7 +410,7 @@ two tiers: host memory, through its `MemoryPool`, and disk, through its
 `DiskManager`. The runtime adds the device tiers. Tiers are named by device family:
 by Arrow's device type where one exists (§2.1), by a name the backend
 defines where none does, and `storage` for files
-([#20](https://github.com/xqlsystems/xql-runtime/issues/20)).
+([#20](https://github.com/xqlsystems/datafusion-accelerated/issues/20)).
 
 | Tier | Device type | Accounting |
 |---|---|---|
@@ -550,15 +568,25 @@ Rules:
 
 ### 5.7 Bindings and kernels
 
-A **binding** says which kernel computes a labelled node. einfold's
-detection makes bindings automatically, to the runtime's array backends
-(§6.2). A developer, or an agent, binds a kernel by hand. Either way, the
-node's SQL is the kernel's specification, and runs if the kernel declines.
+A **binding** says which kernel computes a node. Bindings come from three
+places:
+- einfold's detection, which binds array work to the runtime's array
+  backends automatically (§6.2);
+- **relational operators**: a binding by node type, such as DataFusion's
+  hash join or hash aggregate, to a library of relational kernels such as
+  libcudf, as Spark RAPIDS and Sirius bind theirs
+  ([#24](https://github.com/xqlsystems/datafusion-accelerated/issues/24));
+- a developer, or an agent, by hand, by label.
+
+Whichever it is, the node's SQL, or for a relational operator
+DataFusion's own operator, is the kernel's specification, and runs if the
+kernel declines. A relational kernel's NULLs are Arrow's validity masks,
+so its three cell states are the plan's own.
 
 **The kernel contract.** The runtime depends on no kernel library.
 Instead it gives every kernel what any library needs to run on memory and
 queues it doesn't own, in terms each device family can meet
-([#20](https://github.com/xqlsystems/xql-runtime/issues/20)). Each item below is what a kernel library asks of
+([#20](https://github.com/xqlsystems/datafusion-accelerated/issues/20)). Each item below is what a kernel library asks of
 a foreign host, checked against cuTile Rust, Triton and Pallas (S6.2):
 - **Arrays the kernel can borrow.** Each input, and each output the
   runtime has allocated from the node's schema, is a device array with a
@@ -605,7 +633,7 @@ Python kernel's compile hook is passed as `prepare=`, beside the kernel.
 <summary>A Triton kernel and a Pallas kernel, bound by label</summary>
 
 ```python
-runtime = XqlRuntime(devices=["cuda:0"])
+runtime = Accelerator(devices=["cuda:0"])
 
 @runtime.kernel("predict", assumes=["complete", "no_nulls"])
 def predict(args):                                     # Triton or Gluon
@@ -662,7 +690,7 @@ impl Kernel for Scale {
     }
 }
 
-builder.with_xql_runtime(RuntimeOptions::new().device("cuda:0").kernel("scale", Scale))
+builder.with_accelerator(RuntimeOptions::new().device("cuda:0").kernel("scale", Scale))
 ```
 
 `Borrowed` is a few lines that implement cuTile's trait for foreign
@@ -948,11 +976,11 @@ A training step from Python. The runtime's names are placeholders:
 from datafusion import SessionContext
 from ddxdb.datafusion import Ddx
 from einfold.datafusion import EinFold
-from xql_runtime import XqlRuntime, Program
+from datafusion_accelerated import Accelerator, Program
 
-runtime = XqlRuntime(devices=["cuda:0"])
+runtime = Accelerator(devices=["cuda:0"])
 ctx = SessionContext().with_extensions(Ddx(), EinFold(), runtime)
-ctx.sql("SET xql_runtime.strict = true")            # declines are errors (R8)
+ctx.sql("SET accelerated.strict = true")            # declines are errors (R8)
 ctx.register_table("features", features)
 ctx.register_table("target", target)
 
@@ -985,7 +1013,7 @@ let ctx = SessionContext::new_with_state(
         .with_default_features()
         .with_ddx()
         .with_einfold()
-        .with_xql_runtime(RuntimeOptions::new().device("cuda:0").strict(true))
+        .with_accelerator(RuntimeOptions::new().device("cuda:0").strict(true))
         .build(),
 );
 let lowered = Program::new(&ctx, STEP).state("w", w0).output("loss").lower().await?;
@@ -1061,7 +1089,7 @@ runs after its rules. The runtime needs from einfold:
 
 The runtime distributes a program by composing with datafusion-distributed
 (D7), not by building a distributed planner. The aspiration, as the code a
-user would run, is [#5](https://github.com/xqlsystems/xql-runtime/issues/5).
+user would run, is [#5](https://github.com/xqlsystems/datafusion-accelerated/issues/5).
 S7 has the reasoning, and S8 the database theory it follows.
 
 **Parallelism is partitioning, declared in SQL** (D9). Each table's
@@ -1071,11 +1099,11 @@ as Greenplum and Redshift do (S8.7):
 
 ```sql
 CREATE EXTERNAL TABLE ocean STORED AS ZARR LOCATION 'om4.zarr'
-  OPTIONS ('xql.distribution' 'tiles(lat 6, lon 6)');   -- a grid tile per GPU
-CREATE EXTERNAL TABLE w STORED AS XQL
-  OPTIONS ('xql.distribution' 'blocks(k)');             -- weights and moments sharded
-CREATE EXTERNAL TABLE stats STORED AS XQL
-  OPTIONS ('xql.distribution' 'replicated');            -- a copy on every GPU
+  OPTIONS ('accelerated.distribution' 'tiles(lat 6, lon 6)');   -- a grid tile per GPU
+CREATE EXTERNAL TABLE w STORED AS ACCELERATED
+  OPTIONS ('accelerated.distribution' 'blocks(k)');             -- weights and moments sharded
+CREATE EXTERNAL TABLE stats STORED AS ACCELERATED
+  OPTIONS ('accelerated.distribution' 'replicated');            -- a copy on every GPU
 ```
 
 | Strategy | Declared distribution |
@@ -1084,11 +1112,11 @@ CREATE EXTERNAL TABLE stats STORED AS XQL
 | Sharded weights and optimizer state, as FSDP and ZeRO do | the state tables `blocks(k)`: contiguous ranges of the key, which a reduce-scatter needs |
 | Tensor parallelism, as Megatron does | a weight `hash` by its output axis, or `tiles` over both axes for 2D variants |
 | Domain decomposition | the grid `tiles(lat, lon)` |
-| Pipeline parallelism | labelled parts of the program on groups of devices, with `SET xql_runtime.place.<label>` |
+| Pipeline parallelism | labelled parts of the program on groups of devices, with `SET accelerated.place.<label>` |
 
 The training step's SQL is the same under every strategy. The option
 names here are proposals
-([#15](https://github.com/xqlsystems/xql-runtime/issues/15)).
+([#15](https://github.com/xqlsystems/datafusion-accelerated/issues/15)).
 
 Rules:
 - **Declarations go through DataFusion's own mechanisms.** `STORED AS ...
@@ -1101,7 +1129,7 @@ Rules:
   exchanges where they differ, as Volcano and Cascades optimizers do
   (S8.1). Where several partitionings would do, a cost model of the
   communication each needs chooses
-  ([#16](https://github.com/xqlsystems/xql-runtime/issues/16)).
+  ([#16](https://github.com/xqlsystems/datafusion-accelerated/issues/16)).
   `DISTRIBUTE BY`, which DataFusion already parses, overrides the choice
   for one intermediate.
 - **Partitioning never changes a result** (R7). A model whose meaning
@@ -1112,7 +1140,7 @@ Rules:
 - **Tiles span several axes.** DataFusion's `Range` partitioning splits
   one ordered key, which cuts a grid into bands. Square tiles need a
   partitioning over several axes, upstream in DataFusion
-  ([#17](https://github.com/xqlsystems/xql-runtime/issues/17)), or a tile
+  ([#17](https://github.com/xqlsystems/datafusion-accelerated/issues/17)), or a tile
   key computed from the coordinates.
 - **Exchanges move blocks, not rows.** A shuffle moves each partition's
   data as compact-array blocks, keyed by tile or shard, never as long-format
@@ -1137,7 +1165,7 @@ relational layer decides *what* moves; the runtime decides *how*. Under
 datafusion-distributed's gRPC as the *control plane* (plans, stages, task
 assignment, metrics, and the setup of each collective library), the
 *data plane* is the device's own
-([#6](https://github.com/xqlsystems/xql-runtime/issues/6)):
+([#6](https://github.com/xqlsystems/datafusion-accelerated/issues/6)):
 
 | Exchange in the plan | Eager transport: NCCL, or RCCL on AMD | Exact when |
 |---|---|---|
@@ -1149,7 +1177,7 @@ assignment, metrics, and the setup of each collective library), the
 | host rows | datafusion-distributed's gRPC | always |
 
 Transports come in two kinds, and the device plan is the same under either
-([#21](https://github.com/xqlsystems/xql-runtime/issues/21)):
+([#21](https://github.com/xqlsystems/datafusion-accelerated/issues/21)):
 - **eager**, one call per exchange, on the partition's queue: NCCL, RCCL
   and gRPC;
 - **compiled**, lowered into the program of the region that holds the
@@ -1164,11 +1192,11 @@ Rules for the lowering:
   communicators for exactly the devices the placement uses, bootstrapped
   over the control plane, and their buffers registered once, since state
   is written in place and exchange buffers are allocated once
-  ([#19](https://github.com/xqlsystems/xql-runtime/issues/19)).
+  ([#19](https://github.com/xqlsystems/datafusion-accelerated/issues/19)).
 - **Reductions are bucketed and overlapped.** The reductions of one step
   are fused into grouped calls over flat buffers, and a layer's reduction
   starts while earlier layers' backward steps still compute
-  ([#18](https://github.com/xqlsystems/xql-runtime/issues/18)).
+  ([#18](https://github.com/xqlsystems/datafusion-accelerated/issues/18)).
 - **A host application's communicator can be borrowed.** As a co-processor
   beside PyTorch, the runtime derives its communicator from one the host
   exposes (`ncclCommSplit`), rather than starting a second world.
@@ -1192,21 +1220,21 @@ More rules:
   runs, as a table handle the coordinating session refers to remotely,
   and the tasks that read or update a partition run where it lives, as
   HaLoop schedules iterations (S8.5,
-  [#7](https://github.com/xqlsystems/xql-runtime/issues/7)).
+  [#7](https://github.com/xqlsystems/datafusion-accelerated/issues/7)).
 - **The topology is a graph**, of devices and links with their speeds and
   tiers, taken from each platform's own discovery (NCCL and NVML, RCCL and
   AMD's tools, PJRT's device coordinates), not declared. It covers a
   switched NVLink domain, an AMD node's full mesh, a TPU slice's torus and
   the networks between domains. Placement embeds the partition grid into
   it, and `explain()` shows the link each exchange uses
-  ([#8](https://github.com/xqlsystems/xql-runtime/issues/8)).
+  ([#8](https://github.com/xqlsystems/datafusion-accelerated/issues/8)).
 - **Device data crosses machines without the host** once exchanges are
   lowered. Until then, distribution is correct but slow.
 - **A distributed run is synchronous**, in the bulk-synchronous model. One
   slow GPU stalls a step, and `report()` names it by worker and device.
   Recovery from a failed worker restarts from the last checkpoint, whose
   shards each worker writes to one Zarr store
-  ([#11](https://github.com/xqlsystems/xql-runtime/issues/11)).
+  ([#11](https://github.com/xqlsystems/datafusion-accelerated/issues/11)).
 - **The first distribution stays within one fast domain where it can.** One
   NVL72 rack holds a whole Samudra run on NVLink. On an AMD cluster, 36
   GPUs span five nodes, so placement keeps most halos within a node. On a
@@ -1225,13 +1253,13 @@ join (spike 8, S8.3).
 ```python
 ctx = SessionContext().with_extensions(
     Ddx(), EinFold(),
-    XqlRuntime(devices="local"),               # on each worker: that node's GPUs
+    Accelerator(devices="local"),               # on each worker: that node's GPUs
     Distributed(workers=SlurmWorkers()),       # proposed Python binding (#10)
 )
 ctx.sql("""CREATE EXTERNAL TABLE ocean STORED AS ZARR LOCATION 'om4.zarr'
-           OPTIONS ('xql.distribution' 'tiles(lat 6, lon 6)')""")    # 36 GPUs
-ctx.sql("""CREATE EXTERNAL TABLE w STORED AS XQL
-           OPTIONS ('xql.distribution' 'blocks(k)')""")              # sharded state
+           OPTIONS ('accelerated.distribution' 'tiles(lat 6, lon 6)')""")    # 36 GPUs
+ctx.sql("""CREATE EXTERNAL TABLE w STORED AS ACCELERATED
+           OPTIONS ('accelerated.distribution' 'blocks(k)')""")              # sharded state
 
 compiled = Program(ctx, STEP, state={"w": w0}, outputs=["loss"]).lower().compile()
 print(compiled.explain())                      # the exchanges the planner added, and their links
@@ -1240,7 +1268,7 @@ for i in range(10_000):
 ```
 
 ```bash
-srun --nodes=9 --ntasks-per-node=1 xql-runtime worker --devices all &   # proposed CLI
+srun --nodes=9 --ntasks-per-node=1 datafusion-accelerated worker --devices all &   # proposed CLI
 python train.py
 ```
 
@@ -1289,17 +1317,16 @@ Each piece of the code that exists today has a home.
 
 ### 12.1 Packages
 
-The project is `xql-runtime` (D3, S4.3). It straddles Rust and Python as
-DataFusion, ddx and einfold do (D6):
+The project is `datafusion-accelerated` (D3, S4.3). It straddles Rust and
+Python as DataFusion, ddx and einfold do (D6):
 
 | Channel | Package | Contents |
 |---|---|---|
-| crates.io | `xql-runtime` | programs, table handles, tiers, the schedule, labels, the `Kernel` trait and the counters, with no engine and no GPU library |
-| crates.io | `xql-runtime-datafusion` | the DataFusion extension: the builder method, settings, device memory pools in `RuntimeEnv`, the physical rule, `KernelExec`, `CopyExec`, handle batches, table providers, the codec, and `ddx_ad::Backend`. It pins the DataFusion version xarray-sql, ddx and einfold share. |
-| crates.io | `xql-runtime-cuda` | the CUDA array backend, device memory, streams, kernel launching and NCCL, with no kernel library as a dependency |
-| crates.io | `xql-runtime-rocm` | the same for AMD, through HIP and RCCL; later |
-| crates.io | `xql-runtime-pjrt` | a TPU backend, lowering regions with their exchanges through PJRT; later |
-| PyPI | `xql-runtime` | one package built with maturin: the Python binding of all of the above, the `XqlRuntime` extension object for `with_extensions`, Python kernels, and extras `[cuda]` and `[mlx]` (Apple silicon only) |
+| crates.io | `datafusion-accelerated` | the DataFusion extension: the builder method, settings, device memory pools in `RuntimeEnv`, the physical rules, `KernelExec`, `CopyExec`, handle batches, table providers and the codec; programs, table handles, tiers, the schedule, labels, the `Kernel` trait and the counters; and `ddx_ad::Backend`. It pins the DataFusion version xarray-sql, ddx and einfold share. |
+| crates.io | `datafusion-accelerated-cuda` | the CUDA array backend, device memory, streams, kernel launching and NCCL, with no kernel library as a dependency |
+| crates.io | `datafusion-accelerated-rocm` | the same for AMD, through HIP and RCCL; later |
+| crates.io | `datafusion-accelerated-pjrt` | a TPU backend, lowering regions with their exchanges through PJRT; later |
+| PyPI | `datafusion-accelerated` | one package built with maturin, imported as `datafusion_accelerated`: the Python binding of all of the above, the `Accelerator` extension object for `with_extensions`, Python kernels, and extras `[cuda]` and `[mlx]` (Apple silicon only) |
 
 Rules:
 - **The base install has no GPU library** (R6).
@@ -1307,7 +1334,7 @@ Rules:
 - **Python kernels and array backends are Python code**, behind a Python
   protocol, so that adding one never needs a Rust build.
 - **Dependencies point toward the runtime.** Frontends depend on it only
-  through an extra, such as `xarray-sql[runtime]`.
+  through an extra, such as `xarray-sql[accelerated]`.
 - **Linux on ARM wheels from the first release**, for the Beta cluster's
   Grace CPUs.
 
@@ -1319,8 +1346,8 @@ with the hardware and versions, whichever way the numbers go. NVIDIA GPUs,
 on the cloud or on the Beta cluster, are available half a day a week.
 
 **M0. A CPU runtime, in Rust and Python.**
-- *Builds:* `.with_xql_runtime()` and the `XqlRuntime` extension object,
-  the `xql_runtime` settings, table handles and providers, `Program` with
+- *Builds:* `.with_accelerator()` and the `Accelerator` extension object,
+  the `accelerated` settings, table handles and providers, `Program` with
   `lower`, `compile` and `run`, `ddx_ad::Backend` with compiled plans and
   tables kept in place, the counters of R8 as metrics, and the schedule
   and `explain()` in their first form, even while every step runs on
@@ -1384,6 +1411,14 @@ rack (§10.5).
   gives the same results as on one GPU within §6.3's bound, and its
   gradient reduction runs within a stated factor of NCCL's.
 
+**M8. Relational operators on devices.**
+- *Builds:* bindings by node type for DataFusion's hash join, hash
+  aggregate, filter and sort, to libcudf, over handle batches.
+- *Needs:* spike 12.
+- *Done when:* demo 4's data path and xarray-sql's geospatial queries run
+  their joins and aggregates on a GPU in strict mode, matching DataFusion's
+  results, with the time in device nodes reported.
+
 M2 is the critical path. It waits on spikes 6 and 7, and on Alex's
 decision on einfold's roadmap. Spikes 2 and 3, which need NVIDIA hardware,
 are the first work for the GPU half days, since they wait on no decision.
@@ -1399,10 +1434,11 @@ are the first work for the GPU half days, since they wait on no decision.
 | 5 | Where does the last 3.76× against PyTorch go? | Trace one warm resident step on the M5 Ultra against PyTorch MPS, by kind of operation, after reading the contributor's own comparison | What M2 and M5 should fix first |
 | 6 | How much of each step does einfold already cover? | `EXPLAIN ANALYZE` with einfold on, for demo 2, demo 4 and torch-sql's nanoGPT: the share of time inside einfold's nodes, and how often a DataFusion operator sits between two of them (S2.5). einfold's agent runs einfold's side | How far B-0 gets, and whether M5 is needed |
 | 7 | Can handle batches carry device data between DataFusion nodes? | Two `KernelExec`s in one plan passing handle batches, through repartitioning and the planner's other rewrites, with a `CopyExec` where rows are needed | Whether §5.3's device plans work as written, or device work must stay inside single nodes |
-| 8 | Can relational collectives match NCCL? ([#12](https://github.com/xqlsystems/xql-runtime/issues/12)) | Reduce one demo 2 step's gradients on 8 GPUs, then 2 nodes: NCCL all-reduce, NCCL reduce-scatter and all-gather, and a shuffle by key with a final sum | Whether the runtime needs a collective node that calls NCCL, or plain shuffles suffice |
-| 9 | Which host suits distributed training, datafusion-distributed or Ballista? ([#13](https://github.com/xqlsystems/xql-runtime/issues/13)) | One distributed demo 2 step on each, CPU first: per-run overhead over 100 runs, and deploying stages once | Whether D7 holds for training, or the distributed contract stays neutral between them (S7.5) |
-| 10 | Does AMD's stack slot in with no runtime changes beyond a backend? ([#22](https://github.com/xqlsystems/xql-runtime/issues/22)) | One distributed demo 2 step on an 8-GPU MI300-class node: HIP, RCCL, a Triton kernel, tiles placed per node | Whether the device-family contract holds for ROCm, and whether AMD needs placement from the start |
-| 11 | Do a region's exchanges lower to one XLA program on a TPU? ([#23](https://github.com/xqlsystems/xql-runtime/issues/23)) | One demo 4 block, with its halo exchange and a gradient reduction, through StableHLO and PJRT on a small slice, against the same in JAX's `shard_map` | Whether a TPU backend fits the runtime's contract |
+| 8 | Can relational collectives match NCCL? ([#12](https://github.com/xqlsystems/datafusion-accelerated/issues/12)) | Reduce one demo 2 step's gradients on 8 GPUs, then 2 nodes: NCCL all-reduce, NCCL reduce-scatter and all-gather, and a shuffle by key with a final sum | Whether the runtime needs a collective node that calls NCCL, or plain shuffles suffice |
+| 9 | Which host suits distributed training, datafusion-distributed or Ballista? ([#13](https://github.com/xqlsystems/datafusion-accelerated/issues/13)) | One distributed demo 2 step on each, CPU first: per-run overhead over 100 runs, and deploying stages once | Whether D7 holds for training, or the distributed contract stays neutral between them (S7.5) |
+| 10 | Does AMD's stack slot in with no runtime changes beyond a backend? ([#22](https://github.com/xqlsystems/datafusion-accelerated/issues/22)) | One distributed demo 2 step on an 8-GPU MI300-class node: HIP, RCCL, a Triton kernel, tiles placed per node | Whether the device-family contract holds for ROCm, and whether AMD needs placement from the start |
+| 11 | Do a region's exchanges lower to one XLA program on a TPU? ([#23](https://github.com/xqlsystems/datafusion-accelerated/issues/23)) | One demo 4 block, with its halo exchange and a gradient reduction, through StableHLO and PJRT on a small slice, against the same in JAX's `shard_map` | Whether a TPU backend fits the runtime's contract |
+| 12 | Can libcudf's relational kernels run DataFusion's operators over handle batches? ([#24](https://github.com/xqlsystems/datafusion-accelerated/issues/24)) | Bind DataFusion's hash aggregate and hash join to libcudf, exchanging columns through the C Device Data Interface, on TPC-H queries and one xarray-sql query | Whether relational acceleration fits the kernel contract, and what M8 needs |
 
 ---
 
@@ -1428,7 +1464,7 @@ are the first work for the GPU half days, since they wait on no decision.
    stream-ordered pools (§7). What is open is how each library in a
    process is configured to draw from them, what happens when one can't
    be, and whether NCCL's registered buffers, which NVLS needs, can come
-   from them ([#19](https://github.com/xqlsystems/xql-runtime/issues/19)).
+   from them ([#19](https://github.com/xqlsystems/datafusion-accelerated/issues/19)).
 7. **The schedule's JSON format**, and how it is versioned as the runtime
    grows (§5.6).
 8. **einfold's node types as an MLIR dialect.** Publishing them that way
@@ -1448,13 +1484,13 @@ are the first work for the GPU half days, since they wait on no decision.
     workers are Rust servers. A kernel written in Python needs a worker
     that runs Python, or must be compiled ahead of time, as a Triton kernel
     can be, and launched from Rust
-    ([#9](https://github.com/xqlsystems/xql-runtime/issues/9)).
+    ([#9](https://github.com/xqlsystems/datafusion-accelerated/issues/9)).
 12. **A Rust frontend.** A backend for Burn whose arrays are XQL tables
     would do for Rust what torch-sql does for PyTorch (S6.6).
 13. **Atomic state across workers.** When state is spread across workers,
     whether publication is atomic across all of them (R5), or recovery
     restarts from a checkpoint
-    ([#11](https://github.com/xqlsystems/xql-runtime/issues/11)).
+    ([#11](https://github.com/xqlsystems/datafusion-accelerated/issues/11)).
 
 ---
 
@@ -1466,7 +1502,10 @@ are the first work for the GPU half days, since they wait on no decision.
   policy people opt into, never the engine's own choice (§6.5).
 - **D2** (Alex, 2026-11-07). StableHLO is not XQL's representation of a
   program. SQL is (§6.2, S2.2).
-- **D3** (Alex, 2026-11-07). The project is named `xql-runtime`.
+- **D3** (Alex, 2026-11-07, revised the same day). The project is named
+  DataFusion Accelerated, `datafusion-accelerated`. It was first
+  `xql-runtime`; the revisions made it an extension of DataFusion for every
+  DataFusion user, not only XQL's (S4.3).
 - **D4** (Alex, 2026-11-07). A GPU milestone, with dense intermediates and
   resident state, comes third (M2).
 - **D5** (Alex, 2026-11-07). The runtime is a DataFusion extension, and
@@ -1480,6 +1519,17 @@ are the first work for the GPU half days, since they wait on no decision.
   through DataFusion's builder and `with_extensions` (§5.1).
 - **D9** (Alex, 2026-11-07). Partitioning is declared in SQL, not in the
   schedule (§10.5).
+- **D10** (Alex, 2026-11-07). The goal widens: any DataFusion physical node
+  may have a device implementation, relational operators included, as
+  bindings to libraries such as libcudf. Array work comes first (§3.1,
+  §5.7, M8).
+- **D11** (Alex, 2026-11-07). Executing on devices for DataFusion,
+  relational operators included, lives here rather than in einfold, which
+  keeps recognizing structure, and its paths to other engines' GPU hosts.
+  einfold's design changes to match.
+- **D12** (Alex, 2026-11-07). The project lives under xqlsystems for now.
+  A home beside datafusion-distributed, under datafusion-contrib, is a
+  later conversation.
 
 ### Proposed
 

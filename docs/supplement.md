@@ -1,4 +1,4 @@
-# The XQL runtime: supplement
+# DataFusion Accelerated: supplement
 
 _companion to_: [the design](design.md)
 _last updated_: 2026-11-07
@@ -569,17 +569,46 @@ exist. The candidates:
 
 ### S4.3 The name
 
-`xql-runtime` says what the project is in XQL's vocabulary, follows the
-plain naming of xarray-sql and torch-sql, and avoids the word *tensor* for
-N-dimensional arrays, as the rest of XQL does. The alternatives:
-- **`sql-host`.** einfold's design already uses *host* for whatever runs a
-  plan, usually the engine, so the name would blur the runtime with the
-  engines.
-- **`array-runtime`.** Generic: it could be any array library's runtime,
-  and nothing ties it to XQL.
-- **A coined name, in the spirit of ddx and einfold**, such as `einrun` or
-  `foldhost`. These read as einfold's own executor, which design B
-  rejects.
+The project was first called `xql-runtime`: the runtime layer of XQL. The
+design's revisions changed what it is. It became an extension of
+DataFusion (design D5) that attaches through DataFusion's own mechanisms,
+extends `RuntimeEnv`, adds nodes to ordinary physical plans and composes
+with datafusion-distributed. Most of it would serve any DataFusion user,
+and the parts specific to XQL are integrations with ddx, einfold and XQL's
+frontends, each a DataFusion extension of its own. So it is named for what
+it is: **DataFusion Accelerated**, `datafusion-accelerated`.
+
+The name pairs with datafusion-distributed, the project whose shape it
+copies: one adds machines to a DataFusion session, the other adds devices.
+And it puts the project where its precedents sit. Spark RAPIDS accelerates
+Spark by swapping its operators for GPU ones, DataFusion Comet accelerates
+Spark with DataFusion's operators, and Sirius accelerates DuckDB with
+libcudf's. Each keeps the engine's operators as the fallback.
+
+That precedent is also why the goal widened with the name (design D10). An
+accelerator for DataFusion that sped up only array work would promise
+more than it gives, since a DataFusion user expects joins and aggregates
+to run faster too. The kernel contract already allows any node to be
+bound, so relational operators come in as bindings to libcudf, with
+DataFusion's own operators as their specification. Array work still comes
+first.
+
+Three facts checked when the name was chosen:
+- `datafusion-accelerated` was free on crates.io and PyPI;
+- `datafusion-gpu` on crates.io is a placeholder from 2022, whose
+  repository is DataFusion's own, so DataFusion's community has wanted
+  this before;
+- "Apache DataFusion" is a trademark of the Apache Software Foundation, so
+  the project says plainly that it isn't part of Apache DataFusion, as
+  datafusion-distributed does.
+
+The names considered before:
+- **`xql-runtime`**: right while the project was XQL's runtime, and too
+  narrow once it was DataFusion's accelerator.
+- **`datafusion-gpu`**: taken, and too narrow for TPUs.
+- **`sql-host`**: einfold's design uses *host* for whatever runs a plan,
+  so the name would blur the runtime with the engines.
+- **A coined name**, such as `einrun`: reads as einfold's own executor.
 
 ### S4.4 The reference engine
 
@@ -731,10 +760,10 @@ section maps the design onto each, and records how kernel languages fit.
 
 The last column is what the design proposes, not what exists.
 
-| Concept | JAX | PyTorch | DataFusion today | xql-runtime (proposed) |
+| Concept | JAX | PyTorch | DataFusion today | DataFusion Accelerated (proposed) |
 |---|---|---|---|---|
-| Attaching to a system | PJRT plugins | device backends (PrivateUse1) | builder methods; `with_extensions` in Python | `.with_xql_runtime(...)`; `XqlRuntime(...)` for `with_extensions` |
-| Settings | `jax.config` | `torch.backends`, `torch._dynamo.config` | `SessionConfig`, `SET` | `SET xql_runtime.*` |
+| Attaching to a system | PJRT plugins | device backends (PrivateUse1) | builder methods; `with_extensions` in Python | `.with_accelerator(...)`; `Accelerator(...)` for `with_extensions` |
+| Settings | `jax.config` | `torch.backends`, `torch._dynamo.config` | `SessionConfig`, `SET` | `SET accelerated.*` |
 | Memory kinds | `device`, `pinned_host`, `unpinned_host` | `.to(device)`, `pin_memory()` | `MemoryPool`, `DiskManager` | tiers named by Arrow device types: `CUDA`, `CUDA_HOST`, `CPU`, `storage` |
 | Memory accounting | XLA's allocator | caching allocator | `MemoryReservation` from a `MemoryPool` | device reservations from a device pool in `RuntimeEnv` |
 | Allocator | XLA's own (takes 75% at start) | pluggable; `rmm.allocators.torch` | the system allocator | a shared allocator: CUDA's stream-ordered pools, or RMM |
@@ -750,7 +779,7 @@ The last column is what the design proposes, not what exists.
 | Recompute policies | `save_only_these_names`, `save_and_offload_only_these_names` | selective activation checkpointing | none | the same names, passed to ddx by label |
 | Custom kernels | `pallas_call`, `jax.ffi.ffi_call` | `torch.library.custom_op`, `register_kernel`, `triton_op` | a custom `ExecutionPlan` | `@runtime.kernel("label")`; the `Kernel` trait in Rust |
 | A kernel's gradient | `custom_vjp` | `register_autograd` | none | none needed: ddx writes the backward SQL, and its steps are bound by label and role (ddx#259) |
-| Failing loudly | none | `fullgraph=True` | none (Polars has `GPUEngine(raise_on_fail=True)`) | `SET xql_runtime.strict = true` |
+| Failing loudly | none | `fullgraph=True` | none (Polars has `GPUEngine(raise_on_fail=True)`) | `SET accelerated.strict = true` |
 | Distribution | sharding, IFRT | DTensor, FSDP | datafusion-distributed, Ballista | datafusion-distributed, with device nodes |
 | Serializing a plan | StableHLO | `torch.export` | datafusion-proto | datafusion-proto, with the runtime's codec |
 
@@ -863,7 +892,7 @@ at all.
 
 **How kernels fit the session and distributed models.** A kernel is
 registered on the runtime's extension before the session is built, in
-Python on the `XqlRuntime` object and in Rust on the builder. That follows
+Python on the `Accelerator` object and in Rust on the builder. That follows
 `with_extensions`'s rule that extension objects are configuration only,
 and it is what datafusion-distributed needs: a `KernelExec` crosses the
 network as its kernel's name and tuning parameters, and each worker,
@@ -885,8 +914,8 @@ question 11).
 
 | Runtime concept | DataFusion layer | The runtime's piece |
 |---|---|---|
-| Attaching | `SessionStateBuilder`; `with_extensions` | `.with_xql_runtime`; `XqlRuntime` |
-| Settings | `SessionConfig` namespaces | `xql_runtime.*` |
+| Attaching | `SessionStateBuilder`; `with_extensions` | `.with_accelerator`; `Accelerator` |
+| Settings | `SessionConfig` namespaces | `accelerated.*` |
 | Memory tiers | `RuntimeEnv`: `MemoryPool`, `DiskManager` | device pools, beside DataFusion's |
 | Tables | table providers | runtime tables, readable as rows or compact arrays |
 | Device placement | `PhysicalOptimizerRule`s | the runtime's rule, after einfold's |
@@ -978,7 +1007,7 @@ extension has returned.
 The design distributes a program by partitioning its tables and composing
 with datafusion-distributed (design §10.5). This section records why, and
 what is still unproven. The aspiration, as code, is
-[#5](https://github.com/xqlsystems/xql-runtime/issues/5).
+[#5](https://github.com/xqlsystems/datafusion-accelerated/issues/5).
 
 ### S7.1 Parallelism as partitioning
 
@@ -1038,10 +1067,10 @@ by the network. A GB200 NVL72 rack joins its 72 GPUs with NVLink, so
 within a rack the right transport never touches a host. That is why the
 design lowers exchanges to the device's own transports as part of
 distribution, not an optimization of it (S7.7,
-[#6](https://github.com/xqlsystems/xql-runtime/issues/6)),
+[#6](https://github.com/xqlsystems/datafusion-accelerated/issues/6)),
 and why the schedule records the topology: device copies within a node,
 NVLink within a rack, the network across racks
-([#8](https://github.com/xqlsystems/xql-runtime/issues/8)).
+([#8](https://github.com/xqlsystems/datafusion-accelerated/issues/8)).
 
 ### S7.4 Queries against training programs
 
@@ -1049,7 +1078,7 @@ Distributed query engines are built for queries that run once: plan,
 ship stages, run, discard. A training step runs thousands of times, with
 state that must stay where it was computed. Three things follow, none of
 which distributed query engines provide today
-([#7](https://github.com/xqlsystems/xql-runtime/issues/7)):
+([#7](https://github.com/xqlsystems/datafusion-accelerated/issues/7)):
 - **stages deployed once**, which a run only triggers, as a compiled
   program does on one machine (design §5.4);
 - **state resident on workers**, each partition of `w` on one worker's GPU,
@@ -1071,7 +1100,7 @@ datafusion-distributed (design D7).
 |---|---|---|
 | Shape | a library on `SessionStateBuilder`; any node can coordinate | an engine: scheduler and executor processes |
 | Data between stages | streamed over gRPC | staged mode writes shuffle files; pipelined mode (experimental) streams over Arrow Flight |
-| Python | no binding ([#10](https://github.com/xqlsystems/xql-runtime/issues/10)) | `BallistaSessionContext`, but no custom codecs from Python yet ([ballista#2618](https://github.com/apache/datafusion-ballista/issues/2618)) |
+| Python | no binding ([#10](https://github.com/xqlsystems/datafusion-accelerated/issues/10)) | `BallistaSessionContext`, but no custom codecs from Python yet ([ballista#2618](https://github.com/apache/datafusion-ballista/issues/2618)) |
 | Custom nodes | a codec registered on every session | extension codecs, in Rust |
 | Failure | a failed task fails the query | staged mode re-runs failed tasks; pipelined mode fails the job |
 | Processes | workers are servers, stateless per query | executors are long-lived, under a central scheduler |
@@ -1087,7 +1116,7 @@ are a natural home for stages deployed once and for placement by affinity
 run, and its Python client exists. Neither has a device-aware transport.
 
 So D7 stands, and design spike 9 checks it against a distributed training
-step before M7 ([#13](https://github.com/xqlsystems/xql-runtime/issues/13)).
+step before M7 ([#13](https://github.com/xqlsystems/datafusion-accelerated/issues/13)).
 Either way, the runtime's side of the contract should stay the same:
 device nodes with a codec, and hooks for placement. Then the runtime
 depends on neither engine's internals, and a training job could move from
@@ -1101,7 +1130,7 @@ failed worker fails the run, as with DDP. With state spread across
 workers, R5's atomic publication would need every worker to agree before
 any publishes. The simpler rule, which the design takes, is to restart
 from the last checkpoint, which each worker writes its shards into
-([#11](https://github.com/xqlsystems/xql-runtime/issues/11)). Whether a
+([#11](https://github.com/xqlsystems/datafusion-accelerated/issues/11)). Whether a
 run can survive a lost worker without a restart, as Ballista's staged mode
 allows for queries, is open.
 
@@ -1134,12 +1163,12 @@ a collective.
   allocated once. Registration enables zero-copy transfers, and on NVL72,
   NVLS, the NVLink switches' in-network reductions. NVLS wants buffers from
   CUDA's virtual-memory APIs, which may conflict with stream-ordered pools
-  ([#19](https://github.com/xqlsystems/xql-runtime/issues/19)).
+  ([#19](https://github.com/xqlsystems/datafusion-accelerated/issues/19)).
 - *Bucketing.* A step's many small reductions are fused into grouped calls
   over flat buffers, as DDP's gradient buckets do.
 - *Overlap.* A layer's reduction starts on a communication stream while
   earlier layers' backward steps still compute, ordered by events
-  ([#18](https://github.com/xqlsystems/xql-runtime/issues/18)).
+  ([#18](https://github.com/xqlsystems/datafusion-accelerated/issues/18)).
 - *CUDA graphs.* NCCL calls can be captured, so a compiled step with stable
   buffers could replay whole, collectives included.
 - *One-sided halos.* Within an NVL72 rack, GB200's fabric memory handles let
@@ -1191,27 +1220,27 @@ switch, there are no in-switch reductions; rings and trees do instead.
    otherwise, an execution context and queue rather than a CUDA context and
    stream, and bindings that are either callables or functions the backend
    compiles in
-   ([#20](https://github.com/xqlsystems/xql-runtime/issues/20)).
+   ([#20](https://github.com/xqlsystems/datafusion-accelerated/issues/20)).
 2. **Collectives were assumed callable.** On a TPU they exist only inside a
    compiled program, and speed comes from XLA scheduling them across the
    whole step. So transports are either eager or compiled, and regions may
    contain exchanges, which a compiled transport lowers with the region's
    computation. B-0, one node at a time, is therefore a poor fit for TPUs
-   ([#21](https://github.com/xqlsystems/xql-runtime/issues/21)).
+   ([#21](https://github.com/xqlsystems/datafusion-accelerated/issues/21)).
 3. **Tiers were named by Arrow device types**, and a TPU has none. They are
    now named by device family, and a TPU's tables cross into DataFusion only
    through the host.
 4. **The topology was a list of tiers.** It is now a graph, covering
    switched domains, full meshes and tori, taken from each platform's own
    discovery, with placement as an embedding of the partition grid into it
-   ([#8](https://github.com/xqlsystems/xql-runtime/issues/8)).
+   ([#8](https://github.com/xqlsystems/datafusion-accelerated/issues/8)).
 
 None of these changed the design's shape, which is why it passed: the
 generalizations sit in the backends, in how an exchange is lowered, how a
 kernel binds and how partitions are placed. Spikes 10 and 11 test the
 prediction on real AMD and TPU hardware
-([#22](https://github.com/xqlsystems/xql-runtime/issues/22),
-[#23](https://github.com/xqlsystems/xql-runtime/issues/23)).
+([#22](https://github.com/xqlsystems/datafusion-accelerated/issues/22),
+[#23](https://github.com/xqlsystems/datafusion-accelerated/issues/23)).
 
 ---
 
@@ -1306,7 +1335,7 @@ iterative work keep data where it was computed:
 - Naiad (Murray et al., SOSP 2013) deploys a dataflow with loops once.
 
 The design's distributed programs, with stages deployed once and state
-resident on workers, follow them ([#7](https://github.com/xqlsystems/xql-runtime/issues/7)). Synchronous steps are Valiant's
+resident on workers, follow them ([#7](https://github.com/xqlsystems/datafusion-accelerated/issues/7)). Synchronous steps are Valiant's
 bulk-synchronous parallel model. Its relaxations, such as stale-synchronous
 parallelism, would conflict with R5 and R9, so the design keeps steps
 synchronous.
