@@ -965,8 +965,15 @@ can't hold a GPU buffer. There are three ways around it:
   holds handles to device buffers in the runtime's pool, and only device
   nodes read them. The data stays on the device between nodes, at the cost
   of a rule that no DataFusion operator ever receives one. The design takes
-  this, and spike 7 tests it through DataFusion's own rewrites, such as
-  repartitioning, that move batches between nodes.
+  this. Spike 7 tested it through DataFusion 55.2's planner and default
+  optimizer rules, over 136 queries
+  ([report](spikes/s07-handle-batches/README.md)). No DataFusion operator
+  ever read a handle batch as data, and every result matched. But
+  DataFusion did put round-robin repartitions between device nodes, moving
+  handles to partitions that don't own their buffers, until device nodes
+  reported that they don't benefit from more partitions and the runtime's
+  rule ran after DataFusion's. Those, and the rule that exchanges inside a
+  segment are the runtime's own, are now in design §5.3.
 - **Device support in arrow-rs.** The lasting answer, and an upstream
   change.
 
