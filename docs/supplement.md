@@ -741,7 +741,7 @@ The last column is what the design proposes, not what exists.
 | Asynchronous runs | async dispatch, `block_until_ready()` | streams and events | `execute_stream` | `run()` returns a future |
 | Names in a program | `checkpoint_name(x, "name")` | NVTX ranges, module paths | none | `ddx_name(expr, 'label')` |
 | Recompute policies | `save_only_these_names`, `save_and_offload_only_these_names` | selective activation checkpointing | none | the same names, passed to ddx by label |
-| Custom kernels | `pallas_call`, `jax.ffi.ffi_call` | `torch.library.custom_op`, `register_kernel`, `triton_op` | a custom `ExecutionPlan` | `@runtime.kernel("label")`; the `Kernel` trait in Rust |
+| Custom kernels | `pallas_call`, `jax.ffi.ffi_call` | `torch.library.custom_op`, `register_kernel`, `triton_op` | a custom `ExecutionPlan` | `@runtime.kernel("label")`; the `Kernel` trait in Rust, with cuTile Rust kernels |
 | A kernel's gradient | `custom_vjp` | `register_autograd` | none | none needed: ddx writes the backward SQL, and its steps are bound by label and role (ddx#259) |
 | Failing loudly | none | `fullgraph=True` | none (Polars has `GPUEngine(raise_on_fail=True)`) | `SET xql_runtime.strict = true` |
 | Distribution | sharding, IFRT | DTensor, FSDP | datafusion-distributed, Ballista | datafusion-distributed, with device nodes |
@@ -795,10 +795,51 @@ Pallas kernels are functions that return new arrays, so the runtime adopts
 the result's buffer through DLPack when JAX draws from the shared
 allocator, and copies it otherwise (design §5.7).
 
-**Rust.** cudarc loads and launches compiled kernels from Rust: PTX or
-cubins from CUDA C or CUTLASS, or a Triton kernel compiled ahead of time.
-CubeCL writes the kernel itself in Rust. Either implements the runtime's
-`Kernel` trait, so a Rust program can bind kernels with no Python at all.
+**cuTile Rust.** A kernel is a Rust function in a `#[cutile::module]`,
+marked `#[cutile::entry]`, whose parameters are tiles of tensors:
+`&mut Tensor` for an output, which the host splits into disjoint pieces
+with `.partition([...])`, and `&Tensor` for shared, read-only inputs. The
+output's partition sets the launch grid, as Pallas's grid and `BlockSpec`s
+do. Kernels are JIT-compiled through CUDA Tile IR, and a launch is a
+future: `.await` it, `.sync_on(&stream)`, or capture it in a CUDA graph.
+
+It is the most natural of these to bind, because its host side was built
+to run on memory and streams someone else owns:
+- `unsafe Tensor::from_foreign(owner, shape, strides)` borrows device
+  memory owned by another framework, keeping its owner alive by reference
+  count. The runtime's table handle is that owner.
+- `Context::borrow_with_owner` and `Stream::borrow_with_owner` borrow
+  another framework's CUDA context and stream, so cuTile runs on the
+  runtime's streams rather than its own.
+- `.schedule(&policy)` takes a `SchedulingPolicy`, which the runtime can
+  implement so that cuTile places work as DataFusion's partitions say.
+- Launches are futures on Tokio, the async runtime DataFusion executes on,
+  so a `KernelExec` awaits a kernel without blocking a thread.
+- `.compile()` with `api::meta` placeholder tensors compiles a kernel for a
+  shape without running it, which is what a program's `compile` step
+  needs.
+- Its ownership types, exclusive outputs and shared inputs, keep a kernel
+  from aliasing its output with an input. That is the kernel-level form of
+  the design's rule that tables are values (S5.6).
+- `cutile-kernels` has attention, embeddings, norms and pointwise kernels
+  to start a CUDA backend from.
+
+The frictions are small. cuTile's element types and some shapes are
+static, where Arrow's are known only at run time, so a binding dispatches
+on type. Its shapes are positional, so the runtime orders a node's named
+axes as the node declares them. And it is a research release, requiring
+CUDA 13.2 or later and `sm_80` or newer, with API changes expected.
+
+Its peer-memory operations, which read and write another GPU's memory
+over NVLink, may also matter later: within one NVL72 rack they are a way
+to exchange the edges of grid tiles without going through NCCL.
+
+**Other Rust routes.** NVIDIA's `cuda-rust` crates, which cuTile is built
+on, and cudarc both load and launch compiled kernels: PTX or cubins from
+CUDA C or CUTLASS, or a Triton kernel compiled ahead of time. CubeCL
+writes kernels in Rust for several kinds of GPU. Each implements the
+runtime's `Kernel` trait, so a Rust program can bind kernels with no Python
+at all.
 
 **How kernels fit the session and distributed models.** A kernel is
 registered on the runtime's extension before the session is built, in
@@ -808,17 +849,17 @@ and it is what datafusion-distributed needs: a `KernelExec` crosses the
 network as its kernel's name and tuning parameters, and each worker,
 built with the same extension, finds the kernel by name. The open case is a
 kernel written in Python on a worker that is a Rust server (design §13,
-question 9).
+question 11).
 
 **Which kernels fit which nodes.**
 
 | einfold node | Kernels that implement it |
 |---|---|
 | fold | matrix products: CUTLASS, Triton's matmul, Gluon on Hopper and Blackwell tensor cores |
-| pipeline | fused attention: Triton's and Pallas's flash attention |
+| pipeline | fused attention: Triton's and Pallas's flash attention, `cutile-kernels`' attention |
 | shifted fold | convolutions: CUTLASS, cuDNN, Gluon's im2col convolution |
-| gather on a value index | embedding lookups: Gluon's gathers and scatters, Triton |
-| elementwise | `torch.compile`, Triton |
+| gather on a value index | embedding lookups: Gluon's gathers and scatters, Triton, `cutile-kernels`' embeddings |
+| elementwise | `torch.compile`, Triton, `cutile-kernels`' pointwise kernels |
 
 ### S6.3 Where each concept sits in DataFusion
 
@@ -883,14 +924,15 @@ leave Rust users with DataFusion and no devices. So every capability is in
 Rust first, and the Python package binds it (design R12):
 - **Programs** are Rust types: `Program::new(&ctx, sql)`, `lower`,
   `compile`, `run`.
-- **Kernels** implement the `Kernel` trait, through cudarc or CubeCL.
+- **Kernels** implement the `Kernel` trait, written in cuTile Rust first,
+  or loaded and launched through NVIDIA's CUDA bindings or cudarc.
 - **Arrays** cross to Rust array libraries through DLPack.
 - **Differentiation** is ddx-ad, already Rust.
 
 What Rust lacks is a frontend like torch-sql: a way to write a model as
 array code rather than SQL. Burn, a Rust deep-learning framework built on
 CubeCL, has pluggable backends, and a Burn backend whose arrays are XQL
-tables would be that frontend (design §13, question 10).
+tables would be that frontend (design §13, question 12).
 
 ### S6.7 Why no installer, and no subclasses
 

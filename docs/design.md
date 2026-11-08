@@ -3,7 +3,7 @@
 _author_: Alex Merose
 _co-authors_: 🔥 Claude (torch-sql) and 🌀 Claude (xarray-sql), via Claude Code
 _reviewers_: 🪭 Claude (einfold) and ∂ Claude (ddx). Their reviews of v1.1 are in [reviews/](reviews/).
-_status_: Draft v1.5, for approval. Nothing is built.
+_status_: Draft v1.5, for approval. Nothing is built. Collapsed sections (▸) hold background and detail.
 _last updated_: 2026-11-07
 _supplement_: [supplement.md](supplement.md), with the evidence, the alternatives considered and the reasoning behind each rule. Citations such as "(S1.1)" point there. S6 compares the design with JAX, PyTorch and DataFusion.
 _origin_: [xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307)
@@ -77,152 +77,163 @@ run to run (§5.4).
 
 ## 2. Background
 
-### 2.1 Formats and terms
+Every term the design uses is introduced here. Each group is collapsed;
+open the ones you need.
 
-- **Apache Arrow** is a columnar memory format: a table is a set of
-  columns, each a contiguous buffer. Every XQL engine reads and writes
-  Arrow. Its *PyCapsule interface* hands Arrow data between Python
-  libraries without copying, and its *C Device Data Interface* does the
-  same for buffers in GPU memory, naming each kind of memory with a device
-  type (`CPU`, `CUDA`, `CUDA_HOST` for pinned host memory, `CUDA_MANAGED`,
-  and others). Its canonical *fixed-shape tensor* type is a column whose
-  every value is a dense array of one shape. **ADBC** (Arrow Database
-  Connectivity) is a standard API for databases that return Arrow.
-- **Substrait** is a portable, serialized format for relational query
-  plans, which DataFusion and DuckDB both produce and consume. A plan can
-  share a subplan between readers with a `ReferenceRel`, but neither
-  engine's producer emits one, so a subplan read twice is written out
-  twice.
-- **DLPack** is a standard for sharing a dense array between array
-  libraries, such as Arrow and PyTorch, without copying.
-- **Zarr** is a format for chunked N-dimensional arrays in files or object
-  storage, which Xarray reads and writes.
-- A **CTE** (common table expression) is a named subquery,
-  `WITH x AS (...)`, that the rest of a query can read, possibly several
-  times. A **view** is a named query stored in a session.
+<details>
+<summary><b>2.1 Formats and terms</b>: Arrow, ADBC, Substrait, DLPack, Zarr, CTEs, compact arrays</summary>
+
+- **[Apache Arrow](https://arrow.apache.org/)** is a columnar memory
+  format, which every XQL engine reads and writes. Its *PyCapsule
+  interface* hands Arrow data between Python libraries without copying,
+  and its [*C Device Data Interface*](https://arrow.apache.org/docs/format/CDeviceDataInterface.html)
+  does the same for GPU memory, naming each kind of memory with a device
+  type (`CPU`, `CUDA`, `CUDA_HOST` for pinned host memory, `CUDA_MANAGED`
+  and others). Its *fixed-shape tensor* type is a column whose every value
+  is a dense array of one shape. **ADBC** is Arrow's standard API for
+  databases.
+- **[Substrait](https://substrait.io/)** is a portable format for
+  relational plans. A plan can share a subplan with a `ReferenceRel`, but
+  neither DataFusion's nor DuckDB's producer emits one, so a subplan read
+  twice is written out twice.
+- **DLPack** shares a dense array between array libraries without copying.
+- **Zarr** is a format for chunked N-dimensional arrays, which Xarray reads
+  and writes.
+- A **CTE** is a named subquery, `WITH x AS (...)`, that a query can read
+  several times. A **view** is a named query stored in a session.
 - A **compact array** is how the runtime holds a table densely: each
-  dimension's coordinates stored once, a dense array of values, and
-  separate masks for which rows exist and which values are NULL.
+  dimension's coordinates stored once, a dense array of values, and masks
+  for which rows exist and which values are NULL.
 
-### 2.2 DataFusion and its layers
+</details>
 
-**[DataFusion](https://datafusion.apache.org/)** is a SQL query engine
-written in Rust and designed to be extended. The runtime builds on these of
-its layers (S6.3):
-- **The session.** A `SessionContext` runs queries against a
-  `SessionState`, which a `SessionStateBuilder` assembles from the
-  session's planners, rules, functions and settings. Extensions add
-  methods to the builder. `SessionConfig` holds settings, including
-  namespaces that extensions define, which SQL can set with `SET`.
-- **`RuntimeEnv`**, in the `datafusion-execution` crate, holds what
-  queries share while they run: a `MemoryPool` that operators reserve
-  memory from before they allocate it, a `DiskManager` for the files they
-  spill to when a reservation is refused, caches and object stores.
-- **The physical plan**, a tree of `ExecutionPlan` nodes. Each node runs
-  as one or more *partitions*, streams of Arrow record batches that run in
-  parallel. `PhysicalOptimizerRule`s rewrite the tree before it runs, and
-  each node runs with a `TaskContext` that carries the session's settings
-  and its `RuntimeEnv`. Each node reports *metrics*, which
-  `EXPLAIN ANALYZE` prints beside the plan.
-- **datafusion-proto** serializes plans, and a `PhysicalExtensionCodec`
-  serializes a custom node.
-- **datafusion-python** is DataFusion's Python binding.
-  `SessionContext.with_extensions(...)` installs extensions built in Rust
-  on a Python session, through *datafusion-ffi*, DataFusion's interface for
-  extensions compiled separately from it. einfold attaches to Python
-  sessions this way today.
-- DataFusion's Arrow implementation, **arrow-rs**, keeps its buffers in
-  host memory, so a record batch can't hold GPU memory (S6.5).
+<details>
+<summary><b>2.2 DataFusion</b>: the layers the runtime extends</summary>
+
+**[DataFusion](https://datafusion.apache.org/)** is a SQL query engine in
+Rust, designed to be extended. Its
+[library guide](https://datafusion.apache.org/library-user-guide/index.html)
+covers each layer the runtime uses:
+- the session: [`SessionContext`](https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionContext.html),
+  assembled by a [`SessionStateBuilder`](https://docs.rs/datafusion/latest/datafusion/execution/session_state/struct.SessionStateBuilder.html),
+  with [settings](https://datafusion.apache.org/user-guide/configs.html)
+  that SQL can change with `SET`;
+- [`RuntimeEnv`](https://docs.rs/datafusion/latest/datafusion/execution/runtime_env/struct.RuntimeEnv.html),
+  with its [`MemoryPool`](https://docs.rs/datafusion/latest/datafusion/execution/memory_pool/trait.MemoryPool.html)
+  and `DiskManager`, from which operators reserve memory and to which they
+  spill;
+- the physical plan: [`ExecutionPlan`](https://docs.rs/datafusion/latest/datafusion/physical_plan/trait.ExecutionPlan.html)
+  nodes, each running as parallel *partitions*, rewritten by
+  [`PhysicalOptimizerRule`](https://docs.rs/datafusion/latest/datafusion/physical_optimizer/trait.PhysicalOptimizerRule.html)s,
+  and reporting metrics through
+  [`EXPLAIN ANALYZE`](https://datafusion.apache.org/user-guide/sql/explain.html);
+- [datafusion-proto](https://docs.rs/datafusion-proto/latest/datafusion_proto/),
+  which serializes plans, with a codec for each custom node;
+- [datafusion-python](https://datafusion.apache.org/python/), whose
+  `SessionContext.with_extensions(...)` installs Rust extensions on a
+  Python session through *datafusion-ffi*. einfold attaches this way.
+
+DataFusion's Arrow library, arrow-rs, keeps buffers in host memory, so a
+record batch can't hold GPU memory (S6.5).
 
 **[datafusion-distributed](https://github.com/datafusion-contrib/datafusion-distributed)**
-is a library, outside the Apache project, that adds distributed execution
-to DataFusion. `.with_distributed_planner()` on the session builder
-enables it, and *workers*, each running its own session, execute parts of
-the plan. A custom node is distributed by registering its codec on both
-the coordinating session and the workers.
+adds distributed execution to DataFusion: `.with_distributed_planner()` on
+the builder, and workers that each run their own session. A custom node is
+distributed by registering its codec on every session.
 
-### 2.3 Other engines
+</details>
+
+<details>
+<summary><b>2.3 Other engines</b>: DuckDB, Sirius, GQE</summary>
 
 - **[DuckDB](https://duckdb.org/)** is an embedded analytical database. ddx
   runs on it through DuckDB's community Substrait extension.
 - **[Sirius](https://github.com/sirius-db/sirius)** and NVIDIA's **GQE** are
   SQL engines that run on GPUs.
 
-### 2.4 The frontends and transforms
+</details>
+
+<details>
+<summary><b>2.4 XQL's frontends and transforms</b>: xarray-sql, torch-sql, ddx, einfold</summary>
 
 - **[xarray-sql](https://github.com/xqlsystems/xarray-sql)** registers
-  [Xarray](https://xarray.dev/) Datasets as tables, and turns query results
-  back into Datasets. Its numbered demos are each checked against PyTorch
-  or JAX: demo 1 is attention, demo 2 a GPT trained in plain SQL, demo 3
-  nanoGPT's Shakespeare recipe, and demo 4 Samudra's U-Net.
+  [Xarray](https://xarray.dev/) Datasets as tables, and turns results back
+  into Datasets. Its demos are each checked against PyTorch or JAX: demo 1
+  is attention, demo 2 a GPT trained in SQL, demo 3 nanoGPT's Shakespeare
+  recipe, and demo 4 Samudra's U-Net.
 - **[torch-sql](https://github.com/xqlsystems/torch-sql)** runs
-  [PyTorch](https://pytorch.org/) programs as SQL. A tensor on its
-  `device="sql"` is a table, and each operation on it becomes part of a
-  query. It trains [nanoGPT](https://github.com/karpathy/nanoGPT), a small
-  GPT-2 implementation. Its design doc records spikes S1 to S9, cited here
-  as "torch-sql's spike S4" and so on.
-- **[ddx](https://github.com/xqlsystems/ddx)** differentiates SQL. Given a
-  query that computes a loss, it writes a *program*: a sequence of *steps*,
-  each a plan that saves its result as a table, which together compute the
-  loss and its gradients. A program also carries *checks*, plans that must
-  return no rows for the result to be valid. In SQL, ddx's `grad`, `vjp`
-  and `jvp` functions ask for a gradient inside a query. `ddx-ad` is its
-  Rust crate, `ddxdb` its Python package, and `Backend` the interface any
-  engine implements to run ddx's programs.
+  [PyTorch](https://pytorch.org/) programs as SQL: a tensor on
+  `device="sql"` is a table. It trains
+  [nanoGPT](https://github.com/karpathy/nanoGPT). Its design doc's spikes
+  are cited here as "torch-sql's spike S4" and so on.
+- **[ddx](https://github.com/xqlsystems/ddx)** differentiates SQL. From a
+  query that computes a loss, it writes a *program* of *steps*, each a plan
+  that saves its result as a table, together with *checks* that must return
+  no rows. In SQL, its `grad`, `vjp` and `jvp` functions ask for gradients
+  inside a query. `ddx-ad` is its Rust crate, `ddxdb` its Python package,
+  and `Backend` the interface an engine implements to run its programs.
 - **[einfold](https://github.com/xqlsystems/einfold)** is a query optimizer
-  for DataFusion. It finds array computations in a plan, such as a matrix
+  for DataFusion that finds array computations in a plan, such as a matrix
   product written as a join and a `GROUP BY`, and runs array algorithms for
-  them in its own CPU operator, `EinFoldExec`. Its design calls whatever
-  runs its plans the *host*, and says einfold never touches a device.
+  them in its CPU operator, `EinFoldExec`. Its design calls whatever runs
+  its plans the *host*, and says einfold never touches a device.
 
-### 2.5 Kernels, compilers and GPU libraries
+</details>
 
-The runtime calls these rather than replacing them (R11):
-- **Triton** is a language and compiler for GPU kernels, written in
-  Python. A kernel is a function decorated with `@triton.jit`, run as a
-  grid of *programs*, each of which loads, computes and stores one tile,
-  with masks for tiles that run past an array's edge. **Gluon** is
-  Triton's lower-level language: kernels are launched the same way, but
-  the author chooses the layouts, shared-memory buffers, barriers and
-  warp roles that Triton's compiler would otherwise choose.
-- **Pallas** is JAX's language for kernels. `pallas_call` runs a kernel
-  over a grid, and a `BlockSpec` for each input says which block of it
-  each grid point reads. On NVIDIA GPUs, Pallas compiles through Triton or
-  through *Mosaic GPU*, which exposes the GPU's global, shared and tensor
-  memory.
+<details>
+<summary><b>2.5 Kernels, compilers and GPU libraries</b>: Triton, Gluon, Pallas, cuTile Rust, CUTLASS, XLA, RMM, NCCL</summary>
+
+The runtime calls these rather than replacing them (R11). S6.2 has how
+each fits.
+- **[Triton](https://triton-lang.org/)** is a Python language for GPU
+  kernels, run as a grid of programs that each load, compute and store a
+  tile, with masks at the array's edges. **Gluon** is Triton's lower-level
+  language, launched the same way, in which the author chooses layouts,
+  shared memory, barriers and warp roles.
+- **[Pallas](https://docs.jax.dev/en/latest/pallas/index.html)** is JAX's
+  kernel language: `pallas_call` runs a kernel over a grid, and a
+  `BlockSpec` says which block of each input a grid point reads. On NVIDIA
+  GPUs it compiles through Triton or *Mosaic GPU*.
+- **[cuTile Rust](https://github.com/NVIDIA/cuda-rust/tree/main/cutile-rs)**
+  is NVIDIA's tile-based kernel language for Rust. Kernels are Rust
+  functions, JIT-compiled through CUDA Tile IR, whose launches are Rust
+  futures, and whose types keep outputs exclusive and inputs shared. It
+  lives in NVIDIA's `cuda-rust` repository, beside NVIDIA's own CUDA
+  driver bindings. **cudarc** is a widely used alternative binding of the
+  CUDA driver, and **CubeCL** another Rust kernel language, used by the
+  **Burn** framework.
 - **CUTLASS** is NVIDIA's library of templates for fast matrix kernels, and
-  its *CuTe* layer describes how data is laid out across a GPU's threads
-  and memory.
-- **XLA** is the compiler behind JAX. It compiles **StableHLO**, a
-  portable set of array operations. Both are built on **MLIR**, a
-  framework for writing compilers as layers of intermediate
-  representations. **PJRT** is XLA's plugin interface between frameworks
-  and hardware.
+  its *CuTe* layer describes data layouts across a GPU's threads.
+- **XLA** is JAX's compiler. It compiles **StableHLO**, a portable set of
+  array operations, built on **MLIR**, a framework for layered compiler
+  representations. **PJRT** is XLA's plugin interface to hardware.
 - **`torch.compile`** is PyTorch's compiler, which generates Triton
   kernels among others.
-- In Rust, **cudarc** binds the CUDA driver, and loads and launches
-  compiled kernels. **CubeCL** is a language for GPU kernels written in
-  Rust, which compiles to CUDA and other targets and underlies the **Burn**
-  framework.
-- **RMM**, the RAPIDS Memory Manager, is a shared GPU memory allocator
-  that several libraries can draw from at once.
+- **RMM** is a GPU memory allocator that several libraries can share.
+  CUDA's own *stream-ordered allocator* (`cudaMallocAsync`) keeps memory
+  pools that libraries can also share, and RMM can draw from it.
 - **NCCL** is NVIDIA's library for moving data between GPUs.
 
-### 2.6 Models and hardware
+</details>
+
+<details>
+<summary><b>2.6 Models and hardware</b>: Samudra, MLX, the Beta cluster</summary>
 
 - **[Samudra](https://github.com/m2lines/Samudra)** is an ocean emulator and
-  XQL's first production model. It is a *U-Net*, a convolutional network
-  that shrinks a grid level by level and grows it back, built from
-  *ConvNeXt* blocks: two dilated convolutions, each with a batch norm and a
-  GELU activation. It trains on a half-degree grid of 360 × 720 cells.
-- **MLX** is Apple's array library for its GPUs. PyTorch runs on the same
-  GPUs through its *MPS* backend.
+  XQL's first production model: a *U-Net*, a convolutional network that
+  shrinks a grid level by level and grows it back, built from *ConvNeXt*
+  blocks of dilated convolutions, batch norms and GELUs, on a half-degree
+  grid of 360 × 720 cells.
+- **MLX** is Apple's array library for its GPUs. PyTorch runs on them
+  through its *MPS* backend.
 - **The Beta cluster** of
   [Empire AI](https://empireai.freshdesk.com/support/solutions/articles/157000363466-alpha-beta-hardware-2026-)
-  is where Samudra trains: 288 NVIDIA B200 GPUs in GB200 NVL72 racks. In a
-  GB200 system, each Grace CPU (an ARM CPU) is joined to two B200 GPUs by
-  NVLink-C2C, a link that lets a GPU read the CPU's memory directly. An
-  NVL72 rack joins 72 GPUs with NVLink.
+  is where Samudra trains: 288 NVIDIA B200 GPUs (compute capability
+  `sm_100`) in GB200 NVL72 racks. Each Grace CPU, an ARM CPU, is joined to
+  two B200s by NVLink-C2C, which lets a GPU read the CPU's memory directly,
+  and NVLink joins the 72 GPUs of a rack.
+
+</details>
 
 ---
 
@@ -385,8 +396,8 @@ Rules:
   node reserves bytes from the device pool before it allocates, and a
   refused reservation means spilling to a lower tier, as a refused host
   reservation means spilling to disk.
-- **The bytes come from a shared allocator**, RMM or the array library's
-  own, never from an allocator of the runtime's (§7).
+- **The bytes come from a shared allocator**, never from an allocator of
+  the runtime's own (§7).
 - **A table handle** refers to a table the runtime owns, as a buffer handle
   refers to an allocation. It carries the table's schema, its lifetime (one
   run, or until the caller releases it), and one or more *instances*. Each
@@ -544,7 +555,10 @@ block sizes and warp counts, are recorded in the schedule, so that a
 compiled program keeps them and a developer can set them.
 
 **From Python**, kernels are registered on the runtime's extension object
-before the session is built, so the session has them from the start:
+before the session is built, so the session has them from the start.
+
+<details>
+<summary>A Triton kernel and a Pallas kernel, bound by label</summary>
 
 ```python
 runtime = XqlRuntime(devices=["cuda:0"])
@@ -559,17 +573,57 @@ def attention(args):                                   # Pallas, through JAX
     return flash_attention(jax.dlpack.from_dlpack(args["q"]), ...)
 ```
 
-**From Rust**, a kernel implements a trait, and is registered on the
-session builder:
+</details>
+
+**From Rust**, a kernel implements the `Kernel` trait, and is registered
+on the session builder. cuTile Rust is the first-class way to write one.
+
+<details>
+<summary>A cuTile Rust kernel, bound by label</summary>
 
 ```rust
-impl Kernel for Gemv {
-    fn launch(&self, args: &mut KernelArgs, stream: &DeviceStream) -> Result<()> {
-        // cudarc: launch a compiled kernel, such as a Triton kernel compiled ahead of time
+#[cutile::module]
+mod kernels {
+    use cutile::core::*;
+    #[cutile::entry()]
+    fn scale<const B: i32>(out: &mut Tensor<f32, { [B] }>, x: &Tensor<f32, { [-1] }>, a: f32) {
+        let tx = x.load_like(out);
+        out.store(tx * a);
     }
 }
-builder.with_xql_runtime(RuntimeOptions::new().device("cuda:0").kernel("predict", Gemv::load()?))
+
+struct Scale;
+#[async_trait]
+impl Kernel for Scale {
+    async fn launch(&self, args: &mut KernelArgs) -> Result<()> {
+        let x = args.cutile_input::<f32>("x")?;                // the runtime's buffer, not a copy
+        let out = args.cutile_output::<f32>()?.partition([128]);
+        kernels::scale(out, x, 2.0).await?;                    // a future, on the runtime's stream
+        Ok(())
+    }
+}
+
+builder.with_xql_runtime(RuntimeOptions::new().device("cuda:0").kernel("scale", Scale))
 ```
+
+</details>
+
+cuTile needs no adapter of its own beyond `KernelArgs` (S6.2):
+- **Memory and streams are the runtime's.** Inputs are lent as cuTile
+  tensors over the runtime's buffers (`Tensor::from_foreign`), outputs as
+  borrowed partitions, and the runtime lends its CUDA context and the
+  partition's stream. The runtime implements cuTile's `SchedulingPolicy`.
+- **Launches are awaited**, inside a `KernelExec`, on the Tokio runtime
+  DataFusion already executes on.
+- **JIT compilation happens at `compile`**, through cuTile's `.compile()`
+  on placeholder tensors, never during a run.
+- **Types are dispatched at run time.** cuTile's element types are static
+  and Arrow's are not, so a binding matches on the column's type.
+- **cuTile is pinned exactly, behind a feature.** It is a research release
+  that requires CUDA 13.2 or later on `sm_80` or newer.
+
+A kernel compiled elsewhere, from CUDA C, CUTLASS or Triton ahead of time,
+is loaded as PTX or a cubin and launched through the same CUDA bindings.
 
 Rules:
 - **`assumes` lists the facts a kernel relies on** (§6.2). The runtime
@@ -639,13 +693,19 @@ torch-sql's programs (S2.4).
 
 **Facts and hints.** For a node to skip a check, einfold needs a fact
 about its inputs from einfold's *fact table*, which is designed (einfold's
-design §8.1) but not built:
+design §8.1) but not built.
+
+<details>
+<summary>The facts einfold's nodes need</summary>
+
 - each dimension's extent, with integer keys `0 .. n - 1`;
 - completeness, or a table of the domain;
 - unique tuples;
 - no NULL values;
 - for gathers, that each index lies in range;
 - for sums einfold reorders, that values are finite and bounded.
+
+</details>
 
 torch-sql states the structural facts for every table it writes (S1.3), as
 [einfold#39](https://github.com/xqlsystems/einfold/issues/39) does for
@@ -766,8 +826,11 @@ tensor columns, stays open through spike 1 (S2.3).
   DataFusion's limits, each tier's capacity and the session's policies.
   The schedule records the choice, and a developer can override it (§5.6).
 - **The runtime allocates no GPU memory of its own.** It draws from a
-  shared allocator, RMM or the array library's own, so that it shares a
-  GPU with PyTorch or JAX instead of competing with them for it (S4.2).
+  shared allocator, so that it shares a GPU with PyTorch, JAX and cuTile
+  instead of competing with them for it (S4.2). This draft leans toward
+  CUDA's stream-ordered pools as the shared one: cuTile's driver layer
+  allocates stream-ordered, and RMM and PyTorch can each be configured to
+  draw from the same pools (§13, question 6).
 - **State has room for two copies** while a step runs, unless the program
   donates: once the validation flag has been read, each state update writes
   into the old table's memory, as JAX's buffer donation does (S3.9).
@@ -857,7 +920,8 @@ print(future.result()["loss"])                      # the only read
 print(compiled.report())                            # cost, declines and near misses (§6.6)
 ```
 
-The same from Rust:
+<details>
+<summary>The same from Rust</summary>
 
 ```rust
 let ctx = SessionContext::new_with_state(
@@ -875,6 +939,8 @@ for i in 0..1_000 {
     compiled.run(params! { "lr" => 1e-2 * 0.999f64.powi(i) }).await?;
 }
 ```
+
+</details>
 
 - **torch-sql** gives ddx the runtime as its `Backend` at M0, with no other
   change. From M1, a synced `device="sql"` tensor holds a table handle, and
@@ -949,6 +1015,9 @@ building a distributed planner:
   session.
 - **GPU-to-GPU transfer** would use NCCL inside datafusion-distributed's
   network nodes, as a contribution there rather than a fork of them.
+  Within one NVL72 rack, cuTile's peer-memory operations, which read and
+  write another GPU's memory over NVLink, are a lower-level alternative
+  for exchanging the cells along a tile's edges.
 
 Partitioning a training step by batch index is data parallelism, by a
 weight's index weight sharding, and by grid tile *domain decomposition*,
@@ -972,6 +1041,11 @@ so the first distribution stays within a rack.
 
 ## 11. Where today's code goes
 
+Each piece of the code that exists today has a home.
+
+<details>
+<summary>The table, piece by piece</summary>
+
 | Code | Today | Goes to |
 |---|---|---|
 | `prepare()` for gradients, `Context(threads=)`, faster registration (#301) | xarray-sql | stays in xarray-sql |
@@ -987,6 +1061,8 @@ so the first distribution stays within a rack.
 | `ddxdb.Context`, a `SessionContext` subclass | ddx | ddx's DataFusion extension (§10.2) |
 | Cut points and their chain rule (`torch_sql.program`) | torch-sql | nowhere: ddx's SQL path replaces them (§6.4) |
 
+</details>
+
 ---
 
 ## 12. Building it
@@ -1000,7 +1076,7 @@ DataFusion, ddx and einfold do (D6):
 |---|---|---|
 | crates.io | `xql-runtime` | programs, table handles, tiers, the schedule, labels, the `Kernel` trait and the counters, with no engine and no GPU library |
 | crates.io | `xql-runtime-datafusion` | the DataFusion extension: the builder method, settings, device memory pools in `RuntimeEnv`, the physical rule, `KernelExec`, `CopyExec`, handle batches, table providers, the codec, and `ddx_ad::Backend`. It pins the DataFusion version xarray-sql, ddx and einfold share. |
-| crates.io | `xql-runtime-cuda` | the CUDA array backend and kernel launching, through cudarc |
+| crates.io | `xql-runtime-cuda` | the CUDA array backend and kernel launching, on NVIDIA's `cuda-rust` crates, with cuTile kernels behind a `cutile` feature |
 | PyPI | `xql-runtime` | one package built with maturin: the Python binding of all of the above, the `XqlRuntime` extension object for `with_extensions`, Python kernels, and extras `[cuda]` and `[mlx]` (Apple silicon only) |
 
 Rules:
@@ -1096,9 +1172,9 @@ are the first work for the GPU half days, since they wait on no decision.
 
 ## 13. Open questions
 
-1. **Which array library runs einfold's nodes on NVIDIA GPUs**: JAX,
-   PyTorch, CuPy, or PJRT directly (S4.2). More than one backend can
-   exist.
+1. **Which libraries run einfold's nodes on NVIDIA GPUs.** From Rust,
+   cuTile and `cutile-kernels`; from Python, JAX, PyTorch, CuPy, or PJRT
+   directly (S4.2). More than one backend can exist.
 2. **Substrait as the plan format between layers.** Engines without a
    Substrait producer need SQL text in their dialect
    ([ddx#159](https://github.com/xqlsystems/ddx/issues/159)), and einfold
@@ -1111,20 +1187,30 @@ are the first work for the GPU half days, since they wait on no decision.
    decision as einfold's maintainer.
 5. **How often checking mode samples** in production, for einfold's nodes
    and for hand-written kernels.
-6. **The shared allocator.** RMM, or whichever allocator the array library
-   in use provides, and what happens when two libraries in one process
-   each bring their own (§7).
+6. **The shared allocator.** This draft leans toward CUDA's
+   stream-ordered pools (§7). What is open is how each library in a
+   process is configured to draw from them, and what happens when one
+   can't be.
 7. **The schedule's JSON format**, and how it is versioned as the runtime
    grows (§5.6).
 8. **einfold's node types as an MLIR dialect.** Publishing them that way
    would let MLIR-based compilers consume einfold's nodes directly. That is
    a seam to the compiler ecosystem, not a change of XQL's representation
    (D2), and it is einfold's to decide.
-9. **Python kernels on distributed workers.** datafusion-distributed's
+9. **NVIDIA's CUDA bindings or cudarc**, for the runtime's own CUDA
+   layer. NVIDIA's `cuda-rust` crates are what cuTile is built on, so the
+   runtime would share contexts, streams and pools with cuTile directly.
+   cudarc is older and more widely used, by Candle among others, and cuTile
+   can borrow its handles. This draft leans toward NVIDIA's.
+10. **CUDA graphs.** A compiled step could be captured as a CUDA graph, as
+    cuTile can, replaying all its launches at once. A graph bakes in its
+    buffers, which suits state written in place (§7) and inputs copied into
+    buffers allocated once. Worth measuring after M2.
+11. **Python kernels on distributed workers.** datafusion-distributed's
    workers are Rust servers. A kernel written in Python needs a worker that
    runs Python, or must be compiled ahead of time, as a Triton kernel can
    be, and launched from Rust.
-10. **A Rust frontend.** A backend for Burn whose arrays are XQL tables
+12. **A Rust frontend.** A backend for Burn whose arrays are XQL tables
     would do for Rust what torch-sql does for PyTorch (S6.6).
 
 ---
@@ -1151,6 +1237,9 @@ are the first work for the GPU half days, since they wait on no decision.
   through DataFusion's builder and `with_extensions` (§5.1).
 
 ### Proposed
+
+<details>
+<summary>Proposals P-A to P-R, for approval</summary>
 
 - **P-A.** The runtime is a separate project. einfold stays free of device
   execution, and keeps its CPU operator (xarray-sql#307).
@@ -1191,3 +1280,5 @@ are the first work for the GPU half days, since they wait on no decision.
 - **P-R.** Every XQL project attaches to DataFusion the same way: a builder
   method in Rust, and an extension object for `with_extensions` in Python
   (§5.1, §10.2, §10.3).
+
+</details>
