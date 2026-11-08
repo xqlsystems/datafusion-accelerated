@@ -918,7 +918,10 @@ sparse-kernel milestones. That is Alex's decision as einfold's maintainer,
 after a sketch in einfold's design doc (§13, question 4).
 
 Design C, in which DataFusion carries dense values itself as fixed-shape
-tensor columns, stays open through spike 1 (S2.3).
+tensor columns, is closed for the milestones (spike 1, S2.3). DataFusion
+keeps the tensor type through its operators, but copies tiles wherever it
+selects or reorders rows, can't compute on them, and arrow-rs has no device
+memory to hold them in.
 
 ### 6.3 Checks, declines and fallbacks
 
@@ -1239,8 +1242,10 @@ Rules:
   (S8.1). Where several partitionings would do, a cost model of the
   communication each needs chooses
   ([#16](https://github.com/xqlsystems/datafusion-accelerated/issues/16)).
-  `DISTRIBUTE BY`, which DataFusion already parses, overrides the choice
-  for one intermediate.
+  The schedule overrides the choice for one intermediate (§5.6).
+  DataFusion parses SQL's `DISTRIBUTE BY`, but its physical planner
+  refuses it in DataFusion 55.2 (spike 1), so a SQL form of the override
+  waits on that upstream.
 - **Partitioning never changes a result** (R7). A model whose meaning
   depends on its partitioning, such as batch norm with statistics per
   device, writes that as logic: a `GROUP BY` on a tile column computed
@@ -1570,7 +1575,7 @@ are the first work for the GPU half days, since they wait on no decision.
 
 | # | Question | How | Decides |
 |---|---|---|---|
-| 1 | How far does a fixed-shape tensor column pass through DataFusion's joins and aggregates without being copied or expanded to rows? | Run demo 2's steps with such columns, on host and device buffers | Whether design C is worth pursuing (S2.3) |
+| 1 | How far does a fixed-shape tensor column pass through DataFusion's joins and aggregates without being copied or expanded to rows? | Run demo 2's steps with such columns, on host and device buffers | Whether design C is worth pursuing (S2.3). **Done:** not for the milestones; DataFusion keeps the type, copies tiles at filters, sorts and joins, and can't compute on them ([report](spikes/s01-fixed-shape-tensors/README.md)) |
 | 2 | Do rows between operators cost a GPU SQL engine what they cost GPU kernels? | One of demo 2's steps on Sirius | Whether a GPU engine is an alternative to B |
 | 3 | Can a B200 read Arrow buffers in place from Grace memory fast enough? | Read against copy, on the Beta cluster | Whether Grace memory is a tier worth spilling to (§7) |
 | 4 | What does crossing from Python cost? | datafusion-ffi's overhead for the runtime's nodes (S4.1); launching a Triton kernel from a `KernelExec` through Python, and whether the call holds Python's lock | Which Python kernels are worth binding, and whether some must be compiled ahead of time |
@@ -1691,7 +1696,8 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
 - **P-B.** The unit of work is a program with explicit state, lowered and
   compiled as a JAX function is (R3, R5, §5.4).
 - **P-C.** Design B, staged from B-0 (§6.2). It needs an einfold design
-  change approved by its maintainer. Design C stays open through spike 1.
+  change approved by its maintainer. Spike 1 closed design C for the
+  milestones.
 - **P-D.** ddx and einfold come in through integrations, which implement
   their public interfaces and depend on their published types. Neither
   depends on the runtime, and the core depends on neither (§5.8).

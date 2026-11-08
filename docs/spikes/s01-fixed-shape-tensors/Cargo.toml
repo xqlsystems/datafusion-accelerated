@@ -1,0 +1,12 @@
+[package]
+name = "s01-fixed-shape-tensors"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# A spike, not part of any workspace: run it with `cargo run --release` here.
+[workspace]
+
+[dependencies]
+datafusion = "=55.2.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
