@@ -24,6 +24,10 @@ own framework well, and introduces everything else.
   and so on.
 - **[ddx](https://github.com/xqlsystems/ddx)** differentiates SQL. Its
   `grad` function, written inside a query, computes a gradient.
+- **[einfold](https://github.com/xqlsystems/einfold)** is a query
+  optimizer for DataFusion. It finds array computations in a query's plan,
+  such as a sum of products over a join, which is a matrix product, and
+  runs them with array algorithms instead of a join.
 
 ---
 
@@ -175,6 +179,55 @@ grads = ctx.sql(GRAD).to_arrow_table()       # columns k and v_grad
 There is no tape to clear, so there's no `zero_grad()`: each query computes
 its gradient from scratch. ddx writes the backward pass as SQL too, so it
 runs wherever the forward pass runs.
+
+[xarray-sql](https://github.com/xqlsystems/xarray-sql) does the same over
+Xarray Datasets, with einfold planning the array work. Its `ml` extra
+installs ddxdb, so its `Context.sql` understands `grad`. einfold is a
+separate package that attaches as an extension. The released xarray-sql,
+0.6.0, is built on DataFusion 54, and einfold needs DataFusion 55, so
+until xarray-sql releases on 55
+([xarray-sql#310](https://github.com/xqlsystems/xarray-sql/issues/310)),
+install it from `main`:
+
+```sh
+pip install "xarray-sql[ml] @ git+https://github.com/xqlsystems/xarray-sql" "einfold[datafusion]"
+```
+
+Then the whole PyTorch loop above is a query and a loop:
+
+```python
+# xarray-sql, today, with the ml extra and einfold
+import numpy as np
+import xarray as xr
+import xarray_sql as xql
+from einfold.datafusion import EinFold
+
+X = np.random.randn(1024, 16)
+Y = np.random.randn(1024)
+
+ctx = xql.Context()               # with the ml extra, .sql() understands grad
+ctx.with_extensions(EinFold())    # einfold plans the matrix products
+ctx.from_dataset("x", xr.Dataset({"v": (("i", "k"), X)}))   # columns i, k, v
+ctx.from_dataset("y", xr.Dataset({"v": ("i", Y)}))
+ctx.from_dataset("w", xr.Dataset({"v": ("k", np.zeros(16))}))
+
+STEP = """
+WITH pred AS (SELECT x.i, SUM(x.v * w.v) AS v FROM x JOIN w ON x.k = w.k GROUP BY x.i),
+     loss AS (SELECT AVG((pred.v - y.v) * (pred.v - y.v)) AS l FROM pred JOIN y ON pred.i = y.i)
+SELECT k, v - 1e-2 * grad(loss, v) AS v FROM w
+"""
+for step in range(100):
+    w = ctx.sql(STEP).to_dataset()    # an xarray.Dataset with dimension k
+    ctx.deregister_table("w")
+    ctx.from_dataset("w", w)
+```
+
+`EXPLAIN` on the forward query shows einfold's node where DataFusion's
+join and grouped sum were, `EinFoldExec: a,b * a -> b`, a matrix-vector
+product. Each step runs twelve plans, since ddx writes the backward pass
+as SQL queries of its own, and einfold took two of them in our run, with
+DataFusion running the rest. Each step also reads `w` back into Python and
+registers it again, which is the cost §1.4's program removes.
 
 ### 1.4 `opt.step()` becomes a program with state
 
