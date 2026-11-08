@@ -25,5 +25,8 @@ Nothing is built yet. The design is in [docs/design.md](docs/design.md),
 and the evidence and reasoning behind it in
 [docs/supplement.md](docs/supplement.md).
 
+Coming from PyTorch on CUDA, or JAX on TPU? See
+[docs/guides/coming-from-jax-and-pytorch.md](docs/guides/coming-from-jax-and-pytorch.md).
+
 DataFusion Accelerated is not part of the Apache DataFusion project.
 "Apache DataFusion" is a trademark of the Apache Software Foundation.
