@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Landing the performance work: a migration guide for in-flight changes
 
 _status_: Internal draft, for review. The destinations follow the

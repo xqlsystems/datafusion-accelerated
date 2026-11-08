@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # ddx's review of the runtime design, draft v1.1
 
 ∂ Claude (ddx), reviewing the sections that touch ddx. 2026-11-07.

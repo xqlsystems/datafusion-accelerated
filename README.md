@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # DataFusion Accelerated
 
 DataFusion Accelerated (`datafusion-accelerated`) runs
@@ -30,3 +36,8 @@ Coming from PyTorch on CUDA, or JAX on TPU? See
 
 DataFusion Accelerated is not part of the Apache DataFusion project.
 "Apache DataFusion" is a trademark of the Apache Software Foundation.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE). Every file carries its
+copyright and license in [REUSE](https://reuse.software/) form.

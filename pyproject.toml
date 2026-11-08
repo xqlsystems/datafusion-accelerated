@@ -1,10 +1,16 @@
+# SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 [project]
 name = "datafusion-accelerated"
 version = "0.1.0"
 description = "Runs Apache DataFusion physical plans on GPUs and other devices."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSES/Apache-2.0.txt"]
 authors = [
-    { name = "Alex Merose", email = "al@merose.com" }
+    { name = "Alexander Sky Merose", email = "al@merose.com" }
 ]
 requires-python = ">=3.12"
 dependencies = []

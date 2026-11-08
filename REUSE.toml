@@ -1,0 +1,14 @@
+version = 1
+
+# Files that can't carry a header of their own.
+[[annotations]]
+path = [
+  ".python-version",
+  "uv.lock",
+  "**/Cargo.lock",
+  "src/datafusion_accelerated/py.typed",
+  "docs/spikes/*/results.md",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors"
+SPDX-License-Identifier = "Apache-2.0"

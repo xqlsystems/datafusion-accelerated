@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # DataFusion Accelerated: supplement
 
 _companion to_: [the design](design.md)
