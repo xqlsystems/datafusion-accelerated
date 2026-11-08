@@ -996,9 +996,11 @@ of which table to partition, and by what:
   cells have no rows, so they are never stored or moved at all.
 
 In PyTorch these are different wrappers around a model, each with its own
-code path. Here they are entries in one schedule, which a developer, an
-agent or the planner can change without touching the model, and a planner
-can choose per join, from the whole step's plan. That is torch-sql's
+code path. Here they are declarations in SQL: each table's distribution,
+stated where the table is created, which a developer or an agent can change
+without touching the training step, while the planner chooses the
+partitioning of everything in between, per join, from the whole step's
+plan. That is torch-sql's
 hypothesis H1: that choosing the partitioning this way distributes a model
 like Samudra better than FSDP does.
 
@@ -1101,3 +1103,149 @@ from the last checkpoint, which each worker writes its shards into
 ([#11](https://github.com/xqlsystems/xql-runtime/issues/11)). Whether a
 run can survive a lost worker without a restart, as Ballista's staged mode
 allows for queries, is open.
+
+---
+
+## S8. Database theory for parallelism
+
+The design's parallelism follows four decades of work on parallel
+databases. This section maps that work onto it. Most of it confirms the
+design. Five points changed it (design §10.5): placement through
+DataFusion's physical properties, blocks rather than rows in exchanges,
+tensor and pipeline parallelism, a cost model for the partitioning of
+intermediates, and a stated rule for halos.
+
+### S8.1 Exchange operators and physical properties
+
+Graefe's *exchange* operator, in the Volcano system (SIGMOD 1990), put all
+of a plan's parallelism into one operator, so that every other operator
+runs unchanged on its partition. datafusion-distributed's network nodes
+and the runtime's `CopyExec` are exchanges.
+
+The Volcano optimizer generator and its successor Cascades then treated
+partitioning as a *physical property*. Each operator requires a property of
+its inputs and delivers one on its output, and the optimizer inserts an
+*enforcer*, here an exchange, wherever the two differ. SCOPE, Microsoft's
+distributed SQL system (Zhou, Bruno and Lin, ICDE 2010), and Greenplum's
+Orca optimizer (Soliman et al., SIGMOD 2014) reason about distribution
+this way, and Orca's *Motion* operators (redistribute, broadcast, gather)
+are what the design calls shuffles.
+
+DataFusion has the same framework: `Distribution` requirements,
+`Partitioning`s that nodes deliver (hash, round robin, and, since
+DataFusion 55, ranges), and the `ensure_requirements` rule that inserts
+repartitions. That is why the design places tiles and shards through it,
+rather than through a rule of the runtime's own.
+
+### S8.2 Aggregates that can be summed in parts
+
+Gray et al.'s data cube paper classifies aggregates as *distributive*,
+such as `SUM`, *algebraic*, such as `AVG`, kept as a sum and a count, or
+*holistic*, such as a median. Only the first two can be computed in parts
+and combined, which is what makes "a partial sum per GPU, a shuffle, a
+final sum" a correct all-reduce. Yan and Larson's *eager aggregation*
+(VLDB 1995) is the general rule for moving an aggregate below a join. A
+float `SUM` computed in parts adds in a different order, which the design's
+floating-point bound covers (design §6.3).
+
+Training as an aggregate has its own prior art. Bismarck (Feng, Kumar,
+Recht and Ré, SIGMOD 2012) and MADlib (VLDB 2012) ran stochastic gradient
+descent inside databases as user-defined aggregates. The parameter server
+(Li et al., OSDI 2014) is weight state partitioned by key, pushed to and
+pulled from: the design's `hash(k)` state.
+
+### S8.3 Communication cost, and its lower bounds
+
+The *massively parallel communication* model (Beame, Koutris and Suciu,
+PODS 2013) measures a parallel join by the data each server receives. In
+it, the *HyperCube* or *Shares* algorithm (Afrati and Ullman, EDBT 2010) is
+optimal for joins done in one round, and the bounds depend on the join's
+structure.
+
+A matrix product is a join and a `SUM`. HyperCube applied to it is the
+3D distributed matrix multiply, whose communication lower bounds are known
+(Irony, Toledo and Tiskin, 2004), and which Solomonik and Demmel's 2.5D
+algorithm (2011) trades against memory. Tensor parallelism, as Megatron
+does it, and its 2D, 2.5D and 3D variants are therefore partitionings of a
+join too, which the design's table of strategies now lists.
+
+Two things follow:
+- the cost model that chooses intermediates' partitionings (design §10.5)
+  can use this communication load as its measure, as Alpa (Zheng et al.,
+  OSDI 2022) and EinDecomp do with their own;
+- spike 8 has a second target: the lower bound for each join, beside NCCL.
+
+### S8.4 Band joins, and halos
+
+A halo exchange is a *band join* on grid coordinates: each output cell
+joins input cells within a fixed distance (DeWitt, Naughton and Schneider,
+1991). Spatial joins handle it by replicating boundary tuples into
+neighbouring partitions, as PBSM does (Patel and DeWitt, SIGMOD 1996), and
+avoid duplicate results with the *reference point method* (Dittrich and
+Seeger, 2000): each result is produced only by the partition that owns it.
+The design's halo rule is that method: replicate to the band's width, and
+let the owner compute.
+
+### S8.5 Iterative computation
+
+Training repeats one step thousands of times, and distributed systems for
+iterative work keep data where it was computed:
+- HaLoop (Bu et al., VLDB 2010) schedules each iteration's tasks where the
+  previous iteration left its data, and caches what doesn't change;
+- Spark (Zaharia et al., NSDI 2012) persists data across iterations, and
+  recovers a lost partition from its lineage;
+- Naiad (Murray et al., SOSP 2013) deploys a dataflow with loops once.
+
+The design's distributed programs, with stages deployed once and state
+resident on workers, follow them ([#7](https://github.com/xqlsystems/xql-runtime/issues/7)). Synchronous steps are Valiant's
+bulk-synchronous parallel model. Its relaxations, such as stale-synchronous
+parallelism, would conflict with R5 and R9, so the design keeps steps
+synchronous.
+
+### S8.6 Tensor-relational systems, and ML's own sharding
+
+The closest prior art to the whole design is Chris Jermaine's group:
+SimSQL, which trained neural networks as relational computations; the
+[tensor relational algebra](https://par.nsf.gov/biblio/10320005-tensor-relational-algebra-distributed-machine-learning-system-design)
+(TRA, VLDB 2021), in which relations hold tiles of tensors rather than
+single values, and an implementation algebra chooses how each is
+partitioned; [relational auto-differentiation](https://arxiv.org/abs/2306.00088)
+(ICML 2023), which is ddx's territory; and
+[EinDecomp](https://arxiv.org/html/2410.02682v1), which chooses how to split
+einsums for parallel execution automatically.
+
+Their central lesson matches S1: at the grain of distribution, a tuple
+should be a block, not a scalar. Long-format rows are the right model of an
+array's meaning, and the wrong unit to send across a network. The design's
+compact arrays are its blocks, so its exchanges move them whole.
+
+On the ML side, Mesh-TensorFlow (Shazeer et al., 2018) maps named tensor
+dimensions onto a mesh of devices, and GSPMD (Xu et al., 2021) propagates
+sharding annotations through a program. Partitioning a table by named
+columns is the same idea in relational terms.
+
+### S8.7 Declaring distribution in SQL
+
+MPP databases declare a table's distribution in its DDL, and plan every
+query from it:
+- Greenplum: `DISTRIBUTED BY (k)`, `DISTRIBUTED REPLICATED`;
+- Amazon Redshift: `DISTKEY (k)`, `DISTSTYLE ALL`;
+- Citus: `create_distributed_table` and `create_reference_table`;
+- Hive and Spark: `CLUSTERED BY (k) INTO n BUCKETS`, and `DISTRIBUTE BY`
+  on a query, which DataFusion also parses.
+
+Declaring a base table's distribution, and letting the optimizer derive
+the rest, is the design's rule (design D9).
+
+### S8.8 Logical and physical
+
+In Codd's terms, partitioning is *physical*: it doesn't change what a query
+means, which is the guarantee data independence gives (design R7). It is
+still declared in SQL, as indexes and `DISTRIBUTED BY` are, because SQL is
+where a program's author states what they intend. One case looks like an
+exception, and isn't. When partitioning would change a result, as batch
+norm with statistics per device does, the dependence is part of the model,
+and the model says it: a `GROUP BY` on a tile column. The two never mix:
+declared distributions change nothing but speed, and anything that changes
+a result is written as logic, where ddx differentiates it and checking mode
+compares it.

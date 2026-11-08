@@ -519,8 +519,9 @@ how the runtime computes it, and it has two levels:
 - **Per step, the schedule is the device plan** (§5.3): which nodes run on
   which device, with which kernel, at what precision, and where data is
   copied.
-- **Per program, it adds** what no single plan holds: where each table's
-  instances live between steps, save points and recompute policies passed
+- **Per program, it adds** what no single plan holds: which device holds
+  each instance, and each partition, of each table between steps (the
+  partitioning itself is declared in SQL, §10.5), save points and recompute policies passed
   to ddx (§6.4, §6.5), and donation of state buffers (§7).
 
 Rules:
@@ -1037,31 +1038,81 @@ runs after its rules. The runtime needs from einfold:
 The runtime distributes a program by composing with datafusion-distributed
 (D7), not by building a distributed planner. The aspiration, as the code a
 user would run, is [#5](https://github.com/xqlsystems/xql-runtime/issues/5).
-The reasoning is in S7.
+S7 has the reasoning, and S8 the database theory it follows.
 
-**Parallelism is partitioning.** Every strategy is a choice, in the
-schedule (§5.6), of how to partition a table:
+**Parallelism is partitioning, declared in SQL** (D9). Each table's
+distribution is declared where the table is created, and the planner
+derives the distribution of everything in between, as MPP databases such
+as Greenplum and Redshift do (S8.7):
 
-| Strategy | Schedule entry |
+```sql
+CREATE EXTERNAL TABLE ocean STORED AS ZARR LOCATION 'om4.zarr'
+  OPTIONS ('xql.distribution' 'tiles(lat 6, lon 6)');   -- a grid tile per GPU
+CREATE EXTERNAL TABLE w STORED AS XQL
+  OPTIONS ('xql.distribution' 'hash(k)');               -- weights and moments sharded
+CREATE EXTERNAL TABLE stats STORED AS XQL
+  OPTIONS ('xql.distribution' 'replicated');            -- a copy on every GPU
+```
+
+| Strategy | Declared distribution |
 |---|---|
-| Data parallelism | `partition("batch", by=["sample"])` |
-| DDP-style weights, a copy on every GPU | `replicate("w")` |
-| Sharded weights and optimizer state, as FSDP and ZeRO do | `partition("w", by=["k"])` |
-| Domain decomposition, a grid tile per GPU | `partition("ocean", by=["lat", "lon"], tiles=(6, 6))` |
+| Data parallelism | the batch `hash(sample)`, the weights `replicated` |
+| Sharded weights and optimizer state, as FSDP and ZeRO do | the state tables `hash(k)` |
+| Tensor parallelism, as Megatron does | a weight `hash` by its output axis, or `tiles` over both axes for 2D variants |
+| Domain decomposition | the grid `tiles(lat, lon)` |
+| Pipeline parallelism | labelled parts of the program on groups of devices, with `SET xql_runtime.place.<label>` |
 
-The model's SQL is the same under every strategy. A strategy that fits no
-table's partitioning is an error when the program compiles (R10).
+The training step's SQL is the same under every strategy. The option
+names here are proposals
+([#15](https://github.com/xqlsystems/xql-runtime/issues/15)).
+
+Rules:
+- **Declarations go through DataFusion's own mechanisms.** `STORED AS ...
+  OPTIONS (...)` reaches the runtime through DataFusion's table provider
+  factories, so it needs no new SQL syntax. A `DISTRIBUTED BY` clause, as
+  Greenplum has, could be proposed to DataFusion's parser later.
+- **The planner derives intermediates**, through DataFusion's physical
+  properties: each node states the distribution it requires of its inputs
+  and the partitioning it delivers, and `ensure_requirements` inserts the
+  exchanges where they differ, as Volcano and Cascades optimizers do
+  (S8.1). Where several partitionings would do, a cost model of the
+  communication each needs chooses
+  ([#16](https://github.com/xqlsystems/xql-runtime/issues/16)).
+  `DISTRIBUTE BY`, which DataFusion already parses, overrides the choice
+  for one intermediate.
+- **Partitioning never changes a result** (R7). A model whose meaning
+  depends on its partitioning, such as batch norm with statistics per
+  device, writes that as logic: a `GROUP BY` on a tile column computed
+  from the coordinates. Then the dependence is in the SQL, where ddx
+  differentiates it and checking mode sees it (S8.8).
+- **Tiles span several axes.** DataFusion's `Range` partitioning splits
+  one ordered key, which cuts a grid into bands. Square tiles need a
+  partitioning over several axes, upstream in DataFusion
+  ([#17](https://github.com/xqlsystems/xql-runtime/issues/17)), or a tile
+  key computed from the coordinates.
+- **Exchanges move blocks, not rows.** A shuffle moves each partition's
+  data as compact-array blocks, keyed by tile or shard, never as long-format
+  rows hashed one at a time (S8.6).
+- **Halos are derived.** For a convolution's join, the planner replicates
+  each tile's boundary rows to the width of the join's band (the kernel's
+  radius times its dilation), and each output cell is computed by the
+  partition that owns it, so none is computed twice (S8.4).
 
 **Collectives are relational operators** (S7.2). The planner writes them,
 and `explain()` shows them:
 - an all-reduce of gradients is a partial `SUM` per GPU, a shuffle of the
   partials by weight key, and a final `SUM` where each key lives: a
   reduce-scatter, after which each shard updates where it lives and the
-  next run gathers what it reads;
+  next run gathers what it reads. That is correct because `SUM` is
+  distributive (S8.2);
 - a halo exchange is the rows of a convolution's join that cross a tile's
   edge.
 
-Rules:
+**What the schedule holds.** Not the partitioning, which is in SQL. The
+schedule records how partitions map to devices, and which link each
+exchange uses, and a developer may override either (§5.6).
+
+More rules:
 - **Workers are sessions too**, built with the same extensions, devices
   and kernels as the coordinating session (§5.1). The runtime's codec
   ships a `KernelExec` as its kernel's name and tuning parameters, and the
@@ -1072,11 +1123,12 @@ Rules:
   deployed to their workers once, and each run only triggers them. Each
   partition of a state table is resident on one worker's device across
   runs, as a table handle the coordinating session refers to remotely,
-  and the tasks that read or update a partition run where it lives
-  ([#7](https://github.com/xqlsystems/xql-runtime/issues/7)).
-- **Exchanges follow the topology** recorded in the schedule: a device
-  copy between GPUs in a node, NVLink within a GB200 NVL72 rack, and the
-  network only across racks. `explain()` shows the link each exchange uses
+  and the tasks that read or update a partition run where it lives, as
+  HaLoop schedules iterations (S8.5,
+  [#7](https://github.com/xqlsystems/xql-runtime/issues/7)).
+- **Exchanges follow the topology**: a device copy between GPUs in a node,
+  NVLink within a GB200 NVL72 rack, and the network only across racks.
+  `explain()` shows the link each exchange uses
   ([#8](https://github.com/xqlsystems/xql-runtime/issues/8)).
 - **Device data crosses machines without the host**, through a
   device-aware transport for datafusion-distributed's network nodes, built
@@ -1084,17 +1136,19 @@ Rules:
   rather than forked from it
   ([#6](https://github.com/xqlsystems/xql-runtime/issues/6)). Until then,
   distribution is correct but slow.
-- **A distributed run is synchronous.** One slow GPU stalls a step, and
-  `report()` names it by worker and device. Recovery from a failed worker
-  restarts from the last checkpoint, whose shards each worker writes to one
-  Zarr store ([#11](https://github.com/xqlsystems/xql-runtime/issues/11)).
+- **A distributed run is synchronous**, in the bulk-synchronous model. One
+  slow GPU stalls a step, and `report()` names it by worker and device.
+  Recovery from a failed worker restarts from the last checkpoint, whose
+  shards each worker writes to one Zarr store
+  ([#11](https://github.com/xqlsystems/xql-runtime/issues/11)).
 - **The first distribution stays within one rack.** One NVL72 rack holds a
   whole Samudra run, so every exchange can stay on NVLink.
 
 torch-sql's hypothesis H1 is that a planner choosing the partitioning per
 join distributes Samudra better than PyTorch's FSDP (Fully Sharded Data
-Parallel). Whether relational shuffles can match NCCL's tuned collectives
-is the open half of it (spike 8).
+Parallel). Two measurements test it: against NCCL's tuned collectives, and
+against the communication lower bounds that database theory gives for each
+join (spike 8, S8.3).
 
 <details>
 <summary>The aspiration, in Python: Samudra across a rack (#5)</summary>
@@ -1105,13 +1159,13 @@ ctx = SessionContext().with_extensions(
     XqlRuntime(devices="local"),               # on each worker: that node's GPUs
     Distributed(workers=SlurmWorkers()),       # proposed Python binding (#10)
 )
-xs.register(ctx, "ocean", xr.open_zarr("om4.zarr"))
+ctx.sql("""CREATE EXTERNAL TABLE ocean STORED AS ZARR LOCATION 'om4.zarr'
+           OPTIONS ('xql.distribution' 'tiles(lat 6, lon 6)')""")    # 36 GPUs
+ctx.sql("""CREATE EXTERNAL TABLE w STORED AS XQL
+           OPTIONS ('xql.distribution' 'hash(k)')""")                # sharded state
 
-lowered = Program(ctx, STEP, state={"w": w0}, outputs=["loss"]).lower()
-schedule = lowered.schedule()
-schedule.partition("ocean", by=["lat", "lon"], tiles=(6, 6))   # domain decomposition: 36 GPUs
-schedule.partition("w", by=["k"])                              # sharded weights and moments
-compiled = lowered.compile(schedule=schedule)
+compiled = Program(ctx, STEP, state={"w": w0}, outputs=["loss"]).lower().compile()
+print(compiled.explain())                      # the exchanges the planner added, and their links
 for i in range(10_000):
     compiled.run(lr=1e-3 * 0.999**i)
 ```
@@ -1246,8 +1300,10 @@ stops short.
 
 **M7. Distribution, through datafusion-distributed**, within one NVL72
 rack (§10.5).
-- *Builds:* `partition` and `replicate` in the schedule, workers built with
-  the runtime's extension, programs whose stages and state persist on
+- *Builds:* distribution declared in SQL (#15), partitioning of
+  intermediates derived through DataFusion's properties by cost (#16),
+  tiles over several axes (#17), workers built with the runtime's
+  extension, programs whose stages and state persist on
   workers (#7), topology-aware exchange (#8), and the device-aware
   transport (#6).
 - *Needs:* spikes 8 and 9.
@@ -1347,6 +1403,8 @@ are the first work for the GPU half days, since they wait on no decision.
   datafusion-distributed (§10.5).
 - **D8** (Alex, 2026-11-07). No installer of the runtime's own: it attaches
   through DataFusion's builder and `with_extensions` (§5.1).
+- **D9** (Alex, 2026-11-07). Partitioning is declared in SQL, not in the
+  schedule (§10.5).
 
 ### Proposed
 
@@ -1394,8 +1452,10 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
 - **P-R.** Every XQL project attaches to DataFusion the same way: a builder
   method in Rust, and an extension object for `with_extensions` in Python
   (§5.1, §10.2, §10.3).
-- **P-S.** Parallelism is partitioning, chosen in the schedule, and
-  collectives are relational operators the planner writes (§10.5).
+- **P-S.** Parallelism is partitioning. Base and state tables declare their
+  distribution in SQL (D9), the planner derives intermediates through
+  DataFusion's physical properties and a cost model, and collectives are
+  relational operators it writes (§10.5).
 - **P-T.** Distributed programs persist: stages deployed once, state
   resident on workers, and tasks placed where their partitions live
   (§10.5).
