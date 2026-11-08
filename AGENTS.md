@@ -2,11 +2,12 @@
 
 ## Status
 
-This project is a proposed layer of XQL that runs programs: it owns the
-memory that holds their tables, keeps data on devices between steps,
-chooses kernels, schedules steps and, later, distributes them. Its design
-is in [docs/design.md](docs/design.md). Nothing is built. Its proposed name is
-`xql-runtime` (design §12.1).
+This project, `xql-runtime`, is a proposed layer of XQL that runs
+programs on devices, as an extension of DataFusion in Rust and Python: it
+owns the memory that holds their tables, keeps data on devices between
+steps, runs kernels, schedules steps, and distributes them through
+datafusion-distributed. Its design is in [docs/design.md](docs/design.md).
+Nothing is built.
 
 Work proceeds in three stages: discussion, then a design doc, then
 implementation. The project is in the design stage.
@@ -93,6 +94,20 @@ docs, docstrings, issues, PR descriptions).
   an array program, a GPU path) against it, on more than one engine where
   it can run. torch-sql found silent disagreements between DataFusion and
   DuckDB this way.
+- **One job** (principle R11). The runtime owns tables' lifetimes,
+  placement, the schedule and bindings, and builds no compiler, allocator
+  or communication library. If a feature could be a library of its own,
+  used without the runtime, make it one, or use one that exists.
+- **Vanilla DataFusion, plus nodes** (principle R11). Extend DataFusion
+  only through its own extension points: builder methods, settings,
+  `RuntimeEnv`, physical rules, `ExecutionPlan` nodes, metrics and codecs.
+  Attach through the builder in Rust and `with_extensions` in Python, never
+  through an installer or a subclass of `SessionContext`.
+- **Rust and Python** (principle R12). Build every capability in Rust and
+  bind it to Python. A Rust program must never need Python.
+- **No hidden decisions** (principle R10). Every physical choice the
+  runtime makes goes in the schedule, with who made it. An override is
+  binding, and one the runtime can't obey is an error, never ignored.
 - **Cap memory in tests.** DataFusion can exhaust memory planning a deep
   query, which has crashed sessions on this machine. Run tests under a
   memory cap, for example

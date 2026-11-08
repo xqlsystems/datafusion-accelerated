@@ -318,16 +318,20 @@ Three kinds of step in torch-sql's nanoGPT need care:
   output position to an input position. Reshapes and slices become gathers
   on those tables, and convolutions shifted folds.
 
-### S2.5 Why B-0 keeps values resident only between steps
+### S2.5 Where B-0 keeps values resident
 
-In B-0, a node's neighbours inside a step are engine operators, which read
-rows. So a node's output stays a compact array only when it is the step's
-result, and a node reads a compact array only when its input is a scan of
-a runtime table. Between those, values become rows. B-0's gain therefore
-depends on how many steps are one node from their scans to their result,
-as well as on how much time is spent inside nodes. That is why the
-design's runtime tables can be read two ways, and why spike 6 measures
-both numbers.
+In B-0, values stay on the device for as long as they pass from one device
+node to another, as handle batches (design §5.3), and become rows wherever
+one of DataFusion's operators sits between two device nodes. A node reads
+a compact array without a copy when its input is a scan of a runtime
+table, which is why runtime tables can be read two ways. B-0's gain
+therefore depends on two numbers, which spike 6 measures: how much of each
+step's time is inside einfold's nodes, and how often a DataFusion operator
+sits between two of them.
+
+If handle batches don't survive DataFusion's rewrites (design spike 7),
+device data can stay on the device only inside one node, and residency
+shrinks to what crosses steps as runtime tables.
 
 ### S2.6 Why B is staged
 
@@ -389,10 +393,12 @@ ddx's two paths handle new data differently:
   the caller: a table changes only by writes into the memory it already
   holds, and is never registered again (ddx#214).
 
-The design publishes new state by swapping in a second copy (R5). In
-Python, that breaks the promise and forces every plan that reads the state
-to be planned again. Hence the design's rule that an engine table holding
-state reads the handle's current buffer when its plan runs.
+The design publishes new state by swapping in a second copy (R5). The
+runtime runs ddx's programs through Rust (design D6), whose compiled plans
+take fresh scans, but a Python caller of ddxdb's `in_place` mode would see
+the promise broken, and every plan that reads the state planned again.
+Hence the design's rule that a table holding state reads the handle's
+current buffer when its plan runs, whichever path runs it.
 
 ### S3.4 Step boundaries and shared subplans
 
@@ -512,6 +518,10 @@ providing its own function.
 
 ### S4.1 Rust or Python first
 
+*Settled (design D6): the runtime straddles both, as DataFusion does. The
+arguments below shaped that answer, and the costs of crossing between the
+two remain (design spike 4).*
+
 The first draft leaned to Rust first: DataFusion, ddx's `Backend` trait
 and einfold's dense backend are Rust, and concurrent steps need to run
 outside Python's lock. The second leaned to Python first: the interfaces
@@ -519,7 +529,7 @@ are still moving and are cheaper to change in Python, the costly work
 (engine planning, kernels, array libraries) is native already, and
 `ddxdb.Backend`, xarray-sql and torch-sql are Python.
 
-torch-sql's prototype settled the co-authors on Python first. It is all
+Before D6, torch-sql's prototype led the co-authors to Python first. It is all
 Python, and Python was never its bottleneck: its slow parts are the number
 of queries and planning, both native. Its internals changed in every round
 of review, which Python made cheap. Its one bug of the kind Rust prevents,
@@ -579,3 +589,384 @@ tests, as torch-sql's suite does by running every op on both engines. The
 alternative, a single reference engine for all programs, would make every
 run on the other engine a comparison, and the reference would still have
 bugs of its own, such as DataFusion's `MAX` skipping NaN.
+
+---
+
+## S5. Control and composition
+
+The design has three aims beyond running programs fast:
+- the model should match how systems programmers already think about
+  memory;
+- developers and agents should be able to reach every low-level choice,
+  rather than fight a compiler that makes the choices for them;
+- the runtime should be one component of a composable data system.
+
+This section records why the design takes the form it does for each.
+
+### S5.1 Algorithm and schedule
+
+Halide, a language for image-processing pipelines, separates a program's
+*algorithm*, what it computes, from its *schedule*, how it is computed:
+the order of loops, what is stored and where, and what runs in parallel.
+A developer can change the schedule freely, because no schedule changes the
+result. The design takes the same split. The SQL is the algorithm, and the
+schedule (design §5.6) holds every physical choice.
+
+The split matters because both of the traditions XQL draws on hid the
+schedule:
+- **Databases.** PostgreSQL has no query hints in its core, only through
+  an extension, and systems that do have hints often ignore an invalid one
+  without saying so. A developer who knows a better plan has to coax the
+  optimizer into finding it.
+- **GPU compilers.** Triton chooses layouts, pipelining and other
+  low-level details by heuristics, which made the last part of the
+  performance hard to reach. Newer tools hand those choices back: Triton's
+  own Gluon dialect exposes layouts the compiler used to choose, and
+  CUTLASS's CuTe DSL lets Python code state them directly.
+
+Agents change the trade-off further. An agent improves a program by a
+loop: change something, run, read the cost, repeat. That needs three
+things, which design R10, §5.6 and §6.6 provide: a schedule the agent can
+edit, a report it can parse, and a check that its change is still correct.
+XQL has an unusually strong version of the third, since the SQL computes
+the right answer on any engine, and checking mode compares against it.
+
+### S5.2 Why control is safe here
+
+Codd's relational model rests on *data independence*: how data is stored
+can change without changing what a query means. Design R7 is that
+principle applied to the runtime. Where a value lives, how it is laid out,
+which kernel computes it and what is recomputed never change a result
+beyond the stated bound. So handing those choices to a developer can make
+a program slower, but never wrong, and checking mode catches the
+exceptions. The relational model is what makes low-level control safe to
+give, not what stands in its way.
+
+### S5.3 Proof against test, for bindings
+
+einfold's nodes are exact by proof: einfold shows from the plan's
+structure that the array algorithm computes the SQL, and checks at run
+time the facts the proof needs. A developer's kernel has no such proof. It
+is tested against its SQL, on the runs that checking mode samples, which
+finds most errors but can miss one that appears only on rare inputs. The
+design therefore treats hand-written bindings as a separate class: counted
+apart, sampled more often, and refusable in strict mode (design §5.7). The
+two classes share one mechanism, so a binding can move from hand-written
+to detected when einfold learns its pattern.
+
+### S5.4 A deconstructed tensor runtime
+
+Wes McKinney's idea of the *deconstructed database* is that a database can
+be assembled from independent parts, joined by standard formats: Arrow for
+data in memory, Substrait for plans, and engines such as DataFusion and
+Velox as libraries rather than products. The *Composable Data Management
+System Manifesto* (Pedreira et al., VLDB 2023) states the case at length.
+XQL is built that way, and the runtime is meant to be the same thing for
+array programs: a *deconstructed tensor runtime*.
+
+That means the runtime builds only what no other component does:
+
+| Concern | Who provides it |
+|---|---|
+| Planning and running SQL | DataFusion, DuckDB, GPU engines |
+| Differentiation | ddx |
+| Recognizing array work in SQL | einfold |
+| Kernels | Triton, Gluon, Pallas, cuTile Rust, CUTLASS, XLA, `torch.compile`, MLX, or a developer's code |
+| GPU memory | a shared allocator, such as CUDA's stream-ordered pools or RMM |
+| Moving data between GPUs | NCCL |
+| Distribution | datafusion-distributed |
+| Tables, arrays and plans across each seam | Arrow, DLPack, Substrait |
+| Lifetimes, placement across tiers, the schedule, bindings, checks and reports | the runtime |
+
+The risk of a bridge layer is that it grows into everything it connects.
+Design R11 is the test against that: if a feature could be a library of
+its own, used without the runtime, it should be one. Borrowing the
+allocator has a direct payoff too. JAX takes most of a GPU's memory when
+it starts (S4.2), and two libraries that each own their allocator compete
+for one GPU. A runtime that draws from a shared allocator doesn't.
+
+### S5.5 StableHLO and MLIR
+
+StableHLO and MLIR are the compiler ecosystem's standard formats, and a
+composable runtime should meet them. It does so at two seams, without
+making either XQL's representation of a program (design D2):
+- **Inside a backend.** A JAX backend lowers einfold's nodes to StableHLO
+  for XLA to compile. That stays private to the backend.
+- **At einfold's node types**, possibly. If einfold published its nodes as
+  an MLIR dialect, MLIR-based compilers could consume them directly. That
+  is einfold's decision (design §13, question 8).
+
+Building the runtime itself on MLIR would make it a compiler, which is a
+non-goal, and would tie the runtime to a large C++ framework that
+DataFusion doesn't use.
+
+### S5.6 Values and buffers
+
+The memory hierarchy and the relational model disagree on one point. In
+SQL, a table is a value: it has no identity, nothing aliases it, and
+nothing changes it in place. In systems programming, a buffer is mutable
+and can be shared. The design keeps the two apart by allowing in-place
+writes in one place only, the publication of state (design R5 and §7),
+where buffer donation and ddxdb's `in_place` mode both live. Everywhere
+else, a new value is a new table.
+
+### S5.7 Who the memory model is for
+
+A memory hierarchy with tiers, moves and pins is the right model for
+someone tuning a training step, and the wrong one for a scientist querying
+a Dataset through xarray-sql. So every control has a default, and a
+program that names no tier, binding or save point runs well without them.
+The controls are there to be reached for, not required.
+
+---
+
+## S6. JAX, PyTorch and DataFusion
+
+The design borrows its interfaces from three communities, so that each
+finds the runtime familiar: JAX and PyTorch for programs, memory and
+kernels, and DataFusion for everything about sessions and plans. This
+section maps the design onto each, and records how kernel languages fit.
+
+### S6.1 Concepts across the three
+
+The last column is what the design proposes, not what exists.
+
+| Concept | JAX | PyTorch | DataFusion today | xql-runtime (proposed) |
+|---|---|---|---|---|
+| Attaching to a system | PJRT plugins | device backends (PrivateUse1) | builder methods; `with_extensions` in Python | `.with_xql_runtime(...)`; `XqlRuntime(...)` for `with_extensions` |
+| Settings | `jax.config` | `torch.backends`, `torch._dynamo.config` | `SessionConfig`, `SET` | `SET xql_runtime.*` |
+| Memory kinds | `device`, `pinned_host`, `unpinned_host` | `.to(device)`, `pin_memory()` | `MemoryPool`, `DiskManager` | tiers named by Arrow device types: `CUDA`, `CUDA_HOST`, `CPU`, `storage` |
+| Memory accounting | XLA's allocator | caching allocator | `MemoryReservation` from a `MemoryPool` | device reservations from a device pool in `RuntimeEnv` |
+| Allocator | XLA's own (takes 75% at start) | pluggable; `rmm.allocators.torch` | the system allocator | a shared allocator: CUDA's stream-ordered pools, or RMM |
+| Copies between tiers | `jax.device_put` | `.to()`, non-blocking copies | none | `CopyExec` nodes; `prefetch`, `evict`, `pin` |
+| Where work runs | XLA's compiler | the tensor's device | the physical plan | the device plan: `KernelExec` nodes |
+| A program | `jax.jit(f)` | `torch.compile(f)` | none (one query at a time) | `Program(ctx, sql, state=..., outputs=...)` |
+| Lower and compile | `.lower(...)`, `.compile()` | Dynamo, then Inductor | `create_physical_plan` | `.lower()`, `.compile()` |
+| Inspecting it | `Lowered.as_text()`, `Compiled.cost_analysis()`, `.memory_analysis()` | `torch._dynamo.explain`, profiler | `EXPLAIN`, `EXPLAIN ANALYZE` | `explain()`; `EXPLAIN ANALYZE` per step; `report()` per program |
+| Editing it | none | Inductor's config | optimizer rules | `compile(schedule=...)` |
+| Donating buffers | `donate_argnums` | in-place ops | none | state buffers written in place after the flag (design §7) |
+| Asynchronous runs | async dispatch, `block_until_ready()` | streams and events | `execute_stream` | `run()` returns a future |
+| Names in a program | `checkpoint_name(x, "name")` | NVTX ranges, module paths | none | `ddx_name(expr, 'label')` |
+| Recompute policies | `save_only_these_names`, `save_and_offload_only_these_names` | selective activation checkpointing | none | the same names, passed to ddx by label |
+| Custom kernels | `pallas_call`, `jax.ffi.ffi_call` | `torch.library.custom_op`, `register_kernel`, `triton_op` | a custom `ExecutionPlan` | `@runtime.kernel("label")`; the `Kernel` trait in Rust |
+| A kernel's gradient | `custom_vjp` | `register_autograd` | none | none needed: ddx writes the backward SQL, and its steps are bound by label and role (ddx#259) |
+| Failing loudly | none | `fullgraph=True` | none (Polars has `GPUEngine(raise_on_fail=True)`) | `SET xql_runtime.strict = true` |
+| Distribution | sharding, IFRT | DTensor, FSDP | datafusion-distributed, Ballista | datafusion-distributed, with device nodes |
+| Serializing a plan | StableHLO | `torch.export` | datafusion-proto | datafusion-proto, with the runtime's codec |
+
+Two rows have no counterpart elsewhere, and are why XQL is worth building
+this way. A kernel needs no gradient of its own, because ddx writes the
+backward pass as SQL, whose steps can be bound to kernels in turn. And a
+kernel's specification is executable: its SQL runs on any engine, which is
+what checking mode compares against.
+
+### S6.2 Kernel languages
+
+The design's kernel contract (design §5.7) comes from how kernels are
+written today. All of them work on tiles of dense arrays, and none of them
+knows about rows, so the runtime's job is to hand them dense arrays with
+named axes and masks, and to stay out of the kernel.
+
+**Triton.** A kernel is a function decorated with `@triton.jit`, launched
+as `kernel[grid](args...)`, where each of the grid's programs loads a tile
+with `tl.load(ptr + offsets, mask=...)`, computes, and stores. The mask is
+how Triton handles a tile that runs past an array's edge, and it is the
+same idea as the runtime's presence mask, so a kernel that accepts masks
+can take absent cells the same way. Kernels take pointers, which Triton
+reads from any object with a `data_ptr()`, so the runtime's device arrays
+provide one beside DLPack. `@triton.autotune` chooses block sizes and warp
+counts per shape. A compiled program's shapes are fixed, so tuning runs
+once, at compile, and its choice is recorded in the schedule.
+
+**Gluon.** Gluon kernels are launched exactly as Triton's are, which is
+what makes them easy to bind. What changes is inside the kernel: the
+author chooses each tile's layout across threads (`gl.BlockedLayout`),
+allocates shared memory, synchronizes with barriers (`mbarrier`), and
+splits warps into specialized roles. Triton's own tutorial says why it
+exists: when Triton's compiler is beaten by hand-tuned code, "there is
+little the user can do", and Gluon exposes the details. This is the level
+the runtime must never reach into. The runtime's tiers stop at device
+memory; shared memory, tensor memory and registers are the kernel's.
+Gluon's tutorials include a convolution through im2col and gathers and
+scatters through the tensor memory accelerator, which are the shapes of
+einfold's shifted folds and gathers.
+
+**Pallas.** `pl.pallas_call(kernel, grid=..., in_specs=[pl.BlockSpec(block_shape, index_map)], out_shape=...)`
+runs a kernel over a grid, and each `BlockSpec`'s `index_map` says which
+block of an input each grid point reads. That is the closest of the three
+to einfold's nodes, which state their named axes and extents: a binding can
+build its `BlockSpec`s from the node's axes. Pallas on NVIDIA GPUs compiles
+through Triton or through Mosaic GPU, whose memory spaces (global, shared,
+and on Blackwell tensor memory) are, again, below the runtime's tiers.
+Pallas kernels are functions that return new arrays, so the runtime adopts
+the result's buffer through DLPack when JAX draws from the shared
+allocator, and copies it otherwise (design §5.7).
+
+**cuTile Rust.** A kernel is a Rust function in a `#[cutile::module]`,
+marked `#[cutile::entry]`, whose parameters are tiles of tensors:
+`&mut Tensor` for an output, which the host splits into disjoint pieces
+with `.partition([...])`, and `&Tensor` for shared, read-only inputs. The
+output's partition sets the launch grid, as Pallas's grid and `BlockSpec`s
+do. Kernels are JIT-compiled through CUDA Tile IR, and a launch is a
+future: `.await` it, `.sync_on(&stream)`, or capture it in a CUDA graph.
+
+The runtime doesn't depend on cuTile. It is a test of the design's kernel
+contract (design §5.7): if a cuTile user can bind a kernel with a few lines
+of their own code, the contract is right. cuTile passes easily, because
+its host side was built to run on memory and streams someone else owns,
+and each of the contract's requirements meets one of its interfaces:
+- `unsafe Tensor::from_foreign(owner, shape, strides)` borrows device
+  memory owned by another framework, keeping its owner alive by reference
+  count. The runtime's table handle is that owner.
+- `Context::borrow_with_owner` and `Stream::borrow_with_owner` borrow
+  another framework's CUDA context and stream, so cuTile runs on the
+  runtime's streams rather than its own.
+- `.schedule(&policy)` takes a `SchedulingPolicy`, which a user can
+  implement from the partition's placement in `KernelArgs`, so that cuTile
+  places work as DataFusion's partitions say.
+- Launches are futures on Tokio, the async runtime DataFusion executes on,
+  so a `KernelExec` awaits a kernel without blocking a thread.
+- `.compile()` with `api::meta` placeholder tensors compiles a kernel for a
+  shape without running it, which is what the `Kernel` trait's `prepare`
+  hook is for.
+- Its ownership types, exclusive outputs and shared inputs, keep a kernel
+  from aliasing its output with an input. That is the kernel-level form of
+  the design's rule that tables are values (S5.6).
+- `cutile-kernels` has attention, embeddings, norms and pointwise kernels
+  that a user could bind to einfold's nodes.
+
+The frictions are small, and they sit in the user's glue, not in the
+runtime:
+- cuTile has its own trait for memory someone else owns, so the user
+  writes a few lines implementing it over the runtime's device array. No
+  Rust standard spans such traits, as DLPack does in Python.
+- cuTile's element types and some shapes are static, where Arrow's are
+  known only at run time, so a binding dispatches on type.
+- Its shapes are positional, so `KernelArgs` orders a node's named axes as
+  the node declares them.
+
+The same check applied to Triton passes through `data_ptr()` and the
+stream, and to Pallas through DLPack and the shared allocator. A library
+that fails it would show the contract is missing something.
+
+Its peer-memory operations, which read and write another GPU's memory
+over NVLink, may also matter later: within one NVL72 rack, a user's
+kernel built on them could exchange the edges of grid tiles without going
+through NCCL.
+
+**Other Rust routes.** NVIDIA's `cuda-rust` crates, which cuTile is built
+on, and cudarc both load and launch compiled kernels: PTX or cubins from
+CUDA C or CUTLASS, or a Triton kernel compiled ahead of time. CubeCL
+writes kernels in Rust for several kinds of GPU. Each implements the
+runtime's `Kernel` trait, so a Rust program can bind kernels with no Python
+at all.
+
+**How kernels fit the session and distributed models.** A kernel is
+registered on the runtime's extension before the session is built, in
+Python on the `XqlRuntime` object and in Rust on the builder. That follows
+`with_extensions`'s rule that extension objects are configuration only,
+and it is what datafusion-distributed needs: a `KernelExec` crosses the
+network as its kernel's name and tuning parameters, and each worker,
+built with the same extension, finds the kernel by name. The open case is a
+kernel written in Python on a worker that is a Rust server (design §13,
+question 11).
+
+**Which kernels fit which nodes.**
+
+| einfold node | Kernels that implement it |
+|---|---|
+| fold | matrix products: CUTLASS, Triton's matmul, Gluon on Hopper and Blackwell tensor cores |
+| pipeline | fused attention: Triton's and Pallas's flash attention, `cutile-kernels`' attention |
+| shifted fold | convolutions: CUTLASS, cuDNN, Gluon's im2col convolution |
+| gather on a value index | embedding lookups: Gluon's gathers and scatters, Triton, `cutile-kernels`' embeddings |
+| elementwise | `torch.compile`, Triton, `cutile-kernels`' pointwise kernels |
+
+### S6.3 Where each concept sits in DataFusion
+
+| Runtime concept | DataFusion layer | The runtime's piece |
+|---|---|---|
+| Attaching | `SessionStateBuilder`; `with_extensions` | `.with_xql_runtime`; `XqlRuntime` |
+| Settings | `SessionConfig` namespaces | `xql_runtime.*` |
+| Memory tiers | `RuntimeEnv`: `MemoryPool`, `DiskManager` | device pools, beside DataFusion's |
+| Tables | table providers | runtime tables, readable as rows or compact arrays |
+| Device placement | `PhysicalOptimizerRule`s | the runtime's rule, after einfold's |
+| Kernels | `ExecutionPlan` | `KernelExec` |
+| Copies | `ExecutionPlan` | `CopyExec` |
+| Parallelism | partitions | streams, and devices |
+| Costs and declines | metrics, `EXPLAIN ANALYZE` | the runtime's metrics |
+| Serialization | datafusion-proto, `PhysicalExtensionCodec` | the runtime's codec |
+| Distribution | datafusion-distributed | composition, not a planner |
+| Programs and state | none | `Program`, `lower`, `compile`, `run` |
+
+The last row is the runtime's own layer, and the only one.
+
+### S6.4 datafusion-distributed as the precedent
+
+datafusion-distributed states its tenets plainly: be "as close as possible
+to vanilla DataFusion", be "a library, not an engine", and stay
+unopinionated about networking. A distributed plan "is a normal DataFusion
+physical plan, with a few extra nodes that stream Arrow data between
+machines". A custom node is distributed by giving it a codec and
+registering the codec on both the coordinating session and the workers.
+
+Each of those carries over. The runtime is close to vanilla DataFusion
+(R11), a library rather than an engine (non-goals), unopinionated about
+kernels the way datafusion-distributed is about networking (R10, §5.7), and
+its device plans are physical plans with a few extra nodes (§5.3). Because
+both are built the same way, they compose: one plan can hold network nodes
+and device nodes, and the runtime never needs a distributed planner.
+
+### S6.5 Device memory in a host-memory engine
+
+arrow-rs keeps its buffers in host memory, so a DataFusion record batch
+can't hold a GPU buffer. There are three ways around it:
+- **Keep device work inside single nodes.** Each `KernelExec` copies in,
+  computes and copies out. Simple, but every node boundary is a round trip
+  to the host, which is the cost S1.1 measured.
+- **Handle batches.** Device nodes pass record batches whose one column
+  holds handles to device buffers in the runtime's pool, and only device
+  nodes read them. The data stays on the device between nodes, at the cost
+  of a rule that no DataFusion operator ever receives one. The design takes
+  this, and spike 7 tests it through DataFusion's own rewrites, such as
+  repartitioning, that move batches between nodes.
+- **Device support in arrow-rs.** The lasting answer, and an upstream
+  change.
+
+On GB200 the line blurs, since Grace and its GPUs share coherent memory,
+and a host buffer can live where a GPU reads it directly. Spike 3 measures
+whether that is fast enough to matter.
+
+### S6.6 Accelerated ML in Rust
+
+DataFusion is a Rust project with a Python binding, and ddx and einfold are
+built the same way. A runtime whose features only Python could reach would
+leave Rust users with DataFusion and no devices. So every capability is in
+Rust first, and the Python package binds it (design R12):
+- **Programs** are Rust types: `Program::new(&ctx, sql)`, `lower`,
+  `compile`, `run`.
+- **Kernels** implement the `Kernel` trait, written in any Rust kernel
+  library, such as cuTile Rust or CubeCL, or loaded and launched through
+  NVIDIA's CUDA bindings or cudarc.
+- **Arrays** cross to Rust array libraries through DLPack.
+- **Differentiation** is ddx-ad, already Rust.
+
+What Rust lacks is a frontend like torch-sql: a way to write a model as
+array code rather than SQL. Burn, a Rust deep-learning framework built on
+CubeCL, has pluggable backends, and a Burn backend whose arrays are XQL
+tables would be that frontend (design §13, question 12).
+
+### S6.7 Why no installer, and no subclasses
+
+DataFusion already has two ways to add to a session: builder methods in
+Rust, and `with_extensions` in Python. A runtime `install()` function on
+top would be sugar over them, and every XQL project would grow its own.
+
+Subclassing the session is worse. `ddxdb.Context` subclasses
+`SessionContext` and overrides `.sql()` to understand `grad`. xarray-sql's
+context is a session too, and so would the runtime's be, and a class can
+inherit only one override of `.sql()`. Extensions compose where subclasses
+collide, which is why the design asks ddx for an extension that plans
+`grad` inside DataFusion (design §10.2). `with_extensions` also brings an
+order and a transaction: each extension contributes codecs and planners
+in two phases, and nothing is written to the session until every
+extension has returned.
