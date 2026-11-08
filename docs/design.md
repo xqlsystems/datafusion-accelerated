@@ -9,10 +9,11 @@ SPDX-License-Identifier: Apache-2.0
 _author_: Alex Merose
 _co-authors_: ⚡ Claude (datafusion-accelerated), formerly 🔥 Claude (torch-sql), and 🌀 Claude (xarray-sql), via Claude Code
 _reviewers_: 🪭 Claude (einfold) and ∂ Claude (ddx). Their reviews of v1.1 are in [reviews/](reviews/).
-_status_: Draft v1.8, for approval. Nothing is built. Collapsed sections (▸) hold background and detail.
+_status_: Draft v1.9, for approval. Nothing is built. Collapsed sections (▸) hold background and detail.
 _last updated_: 2026-11-07
 _supplement_: [supplement.md](supplement.md), with the evidence, the alternatives considered and the reasoning behind each rule. Citations such as "(S1.1)" point there. S6 compares the design with JAX, PyTorch and DataFusion, and S7 covers distributed training.
 _origin_: [xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307)
+_references_: R1 to R13 are the principles (§4), D1 to D13 decisions and P-A to P-Y proposals (the decision log), M0 to M8 milestones (§12.2), and spikes 1 to 13 are experiments run to settle a design question, each with a report (§12.3). A bare "#n" is an issue in this repository; issues elsewhere carry their repository's name, such as ddx#251.
 
 ---
 
@@ -29,13 +30,14 @@ runtime* for short.
 
 It is an interstitial layer. Hardware, and the libraries built on it, come
 in through *integrations*, each a separate crate or package mixed in as
-an extension of its own: CUDA, ROCm, Metal and TPUs; NCCL; libcudf; and
-whatever replaces them (§5.8). The runtime integrates none of them itself,
-so its job outlives every one.
+an extension of its own (§5.8). They cover GPU platforms such as NVIDIA's
+CUDA, AMD's ROCm and Apple's Metal, and Google's TPUs; libraries that move
+data between devices, such as NVIDIA's NCCL; libraries of GPU operators,
+such as libcudf; and whatever replaces them. The runtime integrates none
+of them itself, so its job outlives every one.
 
-DataFusion Accelerated is not part of the Apache DataFusion project, as
-datafusion-distributed isn't. "Apache DataFusion" is a trademark of the
-Apache Software Foundation.
+DataFusion Accelerated is not part of the Apache DataFusion project.
+"Apache DataFusion" is a trademark of the Apache Software Foundation.
 
 ### 1.1 Its shape
 
@@ -43,16 +45,21 @@ The runtime extends DataFusion the way
 [datafusion-distributed](https://github.com/datafusion-contrib/datafusion-distributed)
 does. datafusion-distributed adds distributed execution to an ordinary
 DataFusion session with one call on its builder, and a distributed plan is
-an ordinary physical plan with a few extra nodes that move Arrow data
-between machines. The runtime adds devices the same way: one call on the
-builder, and a device plan is an ordinary physical plan with a few extra
-nodes that move data between memory tiers and run work on a device (§5).
+an ordinary physical plan with a few extra nodes that move data between
+machines, in Apache Arrow, the columnar format DataFusion uses (§2.1).
+The runtime adds devices the same way: one call on the builder, and a
+device plan is an ordinary physical plan with a few extra nodes that move
+data between memory tiers, such as host memory and a GPU's, and run work
+on a device (§5).
 Nothing a DataFusion user knows changes, and the two extensions compose: a
 plan can have network nodes and device nodes at once (§10.5).
 
-It is to DataFusion what Spark RAPIDS is to Spark and Sirius to DuckDB:
-operators swapped for device ones, with explicit transitions between them,
-and the engine's own operators as the fallback and the reference (S4.3).
+It does for DataFusion what two existing projects do for other engines.
+Spark RAPIDS is NVIDIA's plugin that runs Apache Spark's operators on GPUs,
+and Sirius runs DuckDB's queries on GPUs (§2.3). Each swaps an engine's
+operators for device ones, with explicit transitions between them, and
+keeps the engine's own operators as the fallback and the reference
+(S4.3).
 
 It adds one thing DataFusion has no layer for: a *program*, several
 queries run as one unit, many times, with state that persists from run to
@@ -69,10 +76,8 @@ between queries, more than planning or arithmetic (S1). On a
 changed nothing, while holding intermediates as dense arrays made the step
 67 times faster. Keeping weights and optimizer state on the GPU then took a
 smaller model's step from 2.02 s to 101 ms, against PyTorch's 27 ms
-(S1.1). Without a shared layer, each project builds this for itself:
-xarray-sql's experiments built three executors and a training session
-inside xarray-sql, and torch-sql's optimizer step runs a query per tensor
-(S1.3).
+(S1.1). Without a shared layer, each project builds this for itself, as
+XQL's projects already have (S1.1, S1.3).
 
 ### 1.3 Its values
 
@@ -80,8 +85,10 @@ inside xarray-sql, and torch-sql's optimizer step runs a query per tensor
   DataFusion's plans and accelerator primitives. It builds no compiler,
   allocator, communication library or kernel library of its own, and
   makes the ones that exist trivially easy to integrate. It is one
-  component of a composable data system, a *deconstructed tensor runtime*
-  in the sense of Wes McKinney's deconstructed database (R11, R13, S5.4).
+  component of a composable data system, a *deconstructed tensor runtime*.
+  The phrase follows Wes McKinney's *deconstructed database*, a database
+  assembled from separate components that share open standards, such as
+  Arrow (R11, R13, S5.4).
 - **Every control within reach.** The SQL says what a program computes.
   Every physical choice the runtime makes, such as where a table lives and
   which kernel computes it, is visible and can be overridden, so the
@@ -99,7 +106,12 @@ scientific arrays with databases. An N-dimensional array becomes a table in
 the element's position and one column holding its value. Array programs
 then become SQL queries, and a database's query optimizer plans them.
 XQL is organized as layers, each a separate, optional project, and
-DataFusion Accelerated is its runtime layer:
+DataFusion Accelerated is its runtime layer. *Frontends* turn programs
+into SQL: xarray-sql from Xarray datasets, and torch-sql from PyTorch
+programs. *Transforms* rewrite the SQL: ddx differentiates it, and einfold
+finds array computations in it. *Engines* run it: DataFusion, DuckDB, GPU
+SQL engines such as Sirius and NVIDIA's GQE, and any database reached
+through ADBC, Arrow's database API. §2 introduces each.
 
 ```
 frontends:   SQL text · xarray (xarray-sql) · PyTorch (torch-sql)
@@ -142,13 +154,14 @@ ones you need.
 - A **CTE** is a named subquery, `WITH x AS (...)`, that a query can read
   several times. A **view** is a named query stored in a session.
 - A **compact array** is how the runtime holds a table densely: each
-  dimension's coordinates stored once, a dense array of values, and masks
-  for which rows exist and which values are NULL.
+  dimension's coordinates stored once, dense arrays of values, and masks
+  for which rows exist and which values are NULL. The runtime stores one
+  as dense *blocks*, and leaves out the blocks with no rows (§5.2).
 
 </details>
 
 <details>
-<summary><b>2.2 DataFusion</b>: the layers the runtime extends</summary>
+<summary><b>2.2 DataFusion</b>: the layers the runtime extends, datafusion-distributed, Ballista</summary>
 
 **[DataFusion](https://datafusion.apache.org/)** is a SQL query engine in
 Rust, designed to be extended. Its
@@ -179,7 +192,8 @@ record batch can't hold GPU memory (S6.5).
 **[datafusion-distributed](https://github.com/datafusion-contrib/datafusion-distributed)**
 adds distributed execution to DataFusion: `.with_distributed_planner()` on
 the builder, and workers that each run their own session. A custom node is
-distributed by registering its codec on every session.
+distributed by registering its codec on every session. **Ballista** is an
+older distributed scheduler for DataFusion, within the Apache project.
 
 </details>
 
@@ -194,18 +208,18 @@ distributed by registering its codec on every session.
 </details>
 
 <details>
-<summary><b>2.4 XQL's frontends and transforms</b>: xarray-sql, torch-sql, ddx, einfold</summary>
+<summary><b>2.4 XQL's frontends and transforms</b>: xarray-sql, torch-sql, ddx, einfold, the performance work</summary>
 
 - **[xarray-sql](https://github.com/xqlsystems/xarray-sql)** registers
   [Xarray](https://xarray.dev/) Datasets as tables, and turns results back
   into Datasets. Its demos are each checked against PyTorch or JAX: demo 1
   is attention, demo 2 a GPT trained in SQL, demo 3 nanoGPT's Shakespeare
-  recipe, and demo 4 Samudra's U-Net.
+  recipe, and demo 4 Samudra's U-Net (both models are in §2.6).
 - **[torch-sql](https://github.com/xqlsystems/torch-sql)** runs
   [PyTorch](https://pytorch.org/) programs as SQL: a tensor on
-  `device="sql"` is a table. It trains
-  [nanoGPT](https://github.com/karpathy/nanoGPT). Its design doc's spikes
-  are cited here as "torch-sql's spike S4" and so on.
+  `device="sql"` is a table. It trains nanoGPT (§2.6). Its design doc's
+  spikes are cited here as "torch-sql's spike S4" and so on, and its
+  hypotheses as "torch-sql's H1".
 - **[ddx](https://github.com/xqlsystems/ddx)** differentiates SQL. From a
   query that computes a loss, it writes a *program* of *steps*, each a plan
   that saves its result as a table, together with *checks* that must return
@@ -217,11 +231,20 @@ distributed by registering its codec on every session.
   product written as a join and a `GROUP BY`, and runs array algorithms for
   them in its CPU operator, `EinFoldExec`. Its design calls whatever runs
   its plans the *host*, and says einfold never touches a device.
+- **The performance work** is one contributor's experiments in xarray-sql
+  and in a fork of einfold, on an Apple GPU, which this doc calls *the
+  contributor's* (S1.1). They built `SharedExecutor`, which computes each
+  CTE once per run (xarray-sql#302); `DenseExecutor`, which keeps
+  intermediates as compact arrays between operators (xarray-sql#303); and
+  `TrainingSession`, which keeps a training step's state on the GPU and
+  compiles the whole step (xarray-sql#305). `DenseExecutor` runs on einfold's
+  `DenseProgram`, an interpreter of DataFusion's plans on compact arrays
+  (einfold#157). Together they are *the contributor's MLX path*.
 
 </details>
 
 <details>
-<summary><b>2.5 Kernels, compilers and GPU libraries</b>: Triton, Gluon, Pallas, cuTile Rust, CUTLASS, XLA, RMM, NCCL</summary>
+<summary><b>2.5 Kernels, compilers and GPU libraries</b>: Triton, Gluon, Pallas, cuTile Rust, CUTLASS, XLA, RMM, NCCL, CuPy</summary>
 
 The runtime builds none of these, and depends on no kernel library.
 Developers bring their kernels, and the kernel contract (§5.7) is designed
@@ -254,20 +277,29 @@ against each.
 - **RMM** is a GPU memory allocator that several libraries can share.
   CUDA's own *stream-ordered allocator* (`cudaMallocAsync`) keeps memory
   pools that libraries can also share, and RMM can draw from it.
-- **NCCL** is NVIDIA's library for moving data between GPUs.
+- **NCCL** is NVIDIA's library for moving data between GPUs, and **NVML**
+  its library that reports a machine's GPUs and their links.
+- **CuPy** is NumPy's API on NVIDIA GPUs, and **Candle** Hugging Face's
+  machine-learning framework in Rust.
 
 </details>
 
 <details>
-<summary><b>2.6 Models and hardware</b>: Samudra, MLX, the Beta cluster</summary>
+<summary><b>2.6 Models and hardware</b>: Samudra, nanoGPT, MLX, the Beta cluster, AMD and TPU clusters</summary>
 
 - **[Samudra](https://github.com/m2lines/Samudra)** is an ocean emulator and
   XQL's first production model: a *U-Net*, a convolutional network that
   shrinks a grid level by level and grows it back, built from *ConvNeXt*
   blocks of dilated convolutions, batch norms and GELUs, on a half-degree
   grid of 360 × 720 cells.
+- **[nanoGPT](https://github.com/karpathy/nanoGPT)** is Andrej Karpathy's
+  small GPT training code, whose Shakespeare recipe trains a 10.7M-parameter
+  model. **Modded-NanoGPT** is a community speedrun built on it: a
+  124M-parameter GPT trained on web text at context 1,024, with Muon, an
+  optimizer that orthogonalizes each update.
 - **MLX** is Apple's array library for its GPUs. PyTorch runs on them
-  through its *MPS* backend.
+  through its *MPS* backend. The contributor's measurements ran on an
+  Apple M5 Ultra.
 - **The Beta cluster** of
   [Empire AI](https://empireai.freshdesk.com/support/solutions/articles/157000363466-alpha-beta-hardware-2026-)
   is where Samudra trains: 288 NVIDIA B200 GPUs (compute capability
@@ -320,8 +352,9 @@ against each.
 - **An SQL engine of its own.** The runtime never interprets relational
   operators itself: no joins, no `GROUP BY`, no NULL rules of its own.
   DataFusion runs those, and where they run on a device, a library such as
-  libcudf (cuDF's C++ core) provides the kernels, bound like any other and
-  checked against DataFusion's (§5.7, S2.1).
+  libcudf, the C++ core of NVIDIA's GPU dataframe library cuDF, provides
+  the kernels, bound like any other and checked against DataFusion's
+  (§5.7, S2.1).
 - **Differentiation, plan rewriting, or drawing a program's step
   boundaries.** Those are ddx's and einfold's (§6.4).
 - **Any particular hardware, in the core.** Integrations with CUDA, ROCm,
@@ -435,7 +468,7 @@ Rules:
   `SET accelerated.checking.sample = 0.01`.
 - **The runtime's state lives in DataFusion's.** Its device memory and
   device handles are in the session's `RuntimeEnv` (§5.2), and its nodes
-  find them through the `TaskContext` they run with.
+  find them through the `TaskContext` DataFusion gives each running node.
 - **Frontends may assemble the session.** xarray-sql's context adds
   whichever XQL extensions are installed, so that, with ddxdb installed,
   its SQL understands `grad` with no other step.
@@ -447,13 +480,13 @@ Rules:
 The runtime extends `RuntimeEnv`'s memory hierarchy. DataFusion already has
 two tiers: host memory, through its `MemoryPool`, and disk, through its
 `DiskManager`. The runtime adds the device tiers. Tiers are named by device family:
-by Arrow's device type where one exists (§2.1), by a name the backend
-defines where none does, and `storage` for files
+by Arrow's device type where one exists (§2.1), by a name the device
+integration defines where none does, and `storage` for files
 ([#20](https://github.com/xqlsystems/datafusion-accelerated/issues/20)).
 
 | Tier | Device type | Accounting |
 |---|---|---|
-| device memory | `CUDA`, `ROCM`, `METAL`; a backend's name for a TPU | a device memory pool per device, added by the runtime |
+| device memory | `CUDA`, `ROCM`, `METAL`; the TPU integration's name for a TPU | a device memory pool per device, added by the runtime |
 | pinned host memory | `CUDA_HOST`, `ROCM_HOST` | the device pool of the device it is pinned for |
 | host memory | `CPU` | DataFusion's `MemoryPool` |
 | storage | none | DataFusion's `DiskManager`, plus Zarr and Arrow IPC files |
@@ -477,30 +510,23 @@ Rules:
 - **Runtime tables are DataFusion table providers**, read as Arrow batches
   by DataFusion's operators, and as compact arrays by device nodes that
   scan them directly (§5.3).
-- **A table's layout is chosen by what it would store.** A compact array
-  stores every cell of its domain, so an absent cell costs its storage and
-  its arithmetic, as a masked value. Only rows make absence free, and rows
-  are the slow path. Spike 13 measured both on a real ocean mask: compact
-  arrays ran a convolution faster than rows down to about 4% ocean, but
-  stored more bytes below about 40%, and dense blocks of 8 by 8 cells, with
-  the all-land blocks left out, beat both where land is clustered
-  ([report](spikes/s13-compact-absence/README.md)). So:
+- **A table's layout is chosen by what it would store** (S2.7). A
+  compact array stores every cell of its block, so an absent cell costs
+  its storage and its arithmetic, as a masked value. Only rows make
+  absence free, and rows are the slow path. So:
   - **blocks are the compact layout**, and a dense array is the case of
-    one block. The block size is a schedule entry (§5.6);
-  - **the choice is by stored cells per present cell**, for each candidate
-    block size, which captures how clustered absence is, as density
-    doesn't. It is a measured fact about the domain, computed from its
-    mask when the table is registered;
+    one block. Blocks with no rows aren't stored;
   - **a table one of einfold's nodes reads or writes is held as blocks**
-    when the fact table gives its domain. Other tables stay as rows. Under
-    a memory budget the runtime prefers smaller blocks, then rows, before
-    it spills;
-  - `EXPLAIN` shows each instance's layout, block size and ratio, and a
-    developer can override them.
-
-  On the 1° mask, 36% of surface cells are land, more at depth. A dense
-  array stores 1.56 cells per ocean cell at the surface and 12.04 at
-  5,500 m, and 8 by 8 blocks 1.28 and 2.78.
+    when einfold's fact table (§6.2) gives its domain. Other tables stay
+    as rows;
+  - **the block size is chosen by stored cells per present cell**, which
+    measures how clustered absence is, as density alone doesn't. It is a
+    measured fact about the domain, computed from its mask when the table
+    is registered;
+  - **under a memory budget** the runtime prefers smaller blocks, then
+    rows, before it spills;
+  - **each instance's layout and block size are schedule entries** (§5.6),
+    shown by `EXPLAIN` with the ratio, and a developer can override them.
 - **Developers may move tables themselves**: `prefetch` to a tier, `evict`
   from one, and `pin` an instance so that it stays. Each tier reports its
   capacity and what it holds.
@@ -535,15 +561,13 @@ Rules:
   runtime's pool. Only device nodes read them. The physical rule places a
   `CopyExec` wherever a handle batch would reach one of DataFusion's
   operators (S6.5).
-- **Device segments are opaque to DataFusion's optimizer** (spike 7). A
-  handle batch's schema hides the logical columns, so DataFusion can't
-  reason about the data inside a segment, and three rules keep its
-  operators out:
+- **Device segments are opaque to DataFusion's optimizer.** A run of
+  device nodes is a *segment*. A handle batch's schema hides the logical
+  columns, so DataFusion can't reason about the data inside a segment,
+  and three rules keep its operators out (spike 7, S6.5):
   - device nodes report that they don't benefit from more input
-    partitions (`benefits_from_input_partitioning` is `false`). With
-    DataFusion's default, its optimizer put a round-robin repartition
-    between device nodes, which moved handles to partitions that don't own
-    their buffers;
+    partitions (`benefits_from_input_partitioning` is `false`), so
+    DataFusion's optimizer puts no repartition between them;
   - the runtime's placement rule runs after DataFusion's rules, as a rule
     added to the session builder does, so nothing rewrites a segment once
     it is placed. The rule then checks the plan's invariants itself, since
@@ -565,7 +589,9 @@ Rules:
 ### 5.4 Programs
 
 A **program** is a directed acyclic graph of **steps**. Each step is a
-query, planned by DataFusion as a device plan. A program names:
+query, planned by DataFusion as a device plan. One *run* of a program is
+usually one training step, so this doc says "training step" for a run and
+"step" for one of its queries. A program names:
 
 - its **inputs**: tables supplied on each run, such as a batch;
 - its **state**: tables that persist across runs, each with the step that
@@ -584,8 +610,10 @@ A program is *lowered*, then *compiled*, as a JAX function is (S6.1):
   `run` returns at once with a future for its outputs. Runs of one
   compiled program execute in order.
 
-A compiled program is reused only while the backend's session key is
-unchanged, as ddx's `prepare` does.
+A compiled program is reused only while the session's *session key* is
+unchanged. ddx's `Backend` reports that key, which changes whenever the
+session's tables or settings change, and ddx's `prepare`, which plans a
+derivative once for many runs, follows the same rule.
 
 Rules:
 - **A training step can be one statement.** With the ddx integration in
@@ -616,7 +644,9 @@ Rules:
 
 One marker names a part of a program for every layer: a function call,
 `ddx_name(expr, 'label')`, as proposed on ddx#251, since CTE and view names
-don't survive the engines' Substrait producers (torch-sql's spike S3). The
+don't survive the engines' Substrait producers (torch-sql's spike S3).
+ddx#251 also proposes *regions*, labelled parts of a program that a policy
+applies to as a whole. The
 core registers the marker itself when ddx isn't in the session, so labels
 work without ddx, and ddx reads the same marker when it is. In ddx's SQL
 path, CTE names serve too. Labels carry:
@@ -642,8 +672,9 @@ how the runtime computes it, and it has two levels:
   copied.
 - **Per program, it adds** what no single plan holds: which device holds
   each instance, and each partition, of each table between steps (the
-  partitioning itself is declared in SQL, §10.5), save points and recompute policies passed
-  to ddx (§6.4, §6.5), and donation of state buffers (§7).
+  partitioning itself is declared in SQL, §10.5), save points and
+  recompute policies passed to ddx (§6.4, §6.5), and *donation*, writing a
+  state table's new value into its old memory (§7).
 
 Rules:
 - **Every entry records who chose it**: a default, einfold or the
@@ -688,7 +719,7 @@ a foreign host, checked against cuTile Rust, Triton and Pallas (S6.2):
   are PJRT buffers.
 - **Masks.** Each input's presence and NULL masks, unless the kernel
   assumes there are none.
-- **The execution context and queue, borrowable.** The backend's raw
+- **The execution context and queue, borrowable.** The device's raw
   context and the partition's queue, each with an owner, so a library
   launches on the runtime's queue rather than its own: a CUDA or HIP
   context and stream, or on a TPU, a PJRT client and device.
@@ -703,9 +734,9 @@ a foreign host, checked against cuTile Rust, Triton and Pallas (S6.2):
 
 A binding is one of two kinds, by device family:
 - **a callable**, launched on the queue: CUDA and ROCm;
-- **a function the backend compiles in**, to the program of the region
-  that contains the node: a Pallas kernel on a TPU, which runs only inside
-  an XLA program.
+- **a function the array backend compiles in**, to the program of the
+  region that contains the node (§6.2): a Pallas kernel on a TPU, which
+  runs only inside an XLA program.
 
 Binding a library's kernel then takes a few lines of the user's own code,
 and none in the runtime.
@@ -804,7 +835,7 @@ Rules:
   does, has its buffer adopted through DLPack when it came from the shared
   allocator, and copied otherwise.
 - **Hand-written kernels are tested, not proved.** einfold's nodes are
-  proved exact from the plan's structure. A developer's kernel is only
+  proved exact from the plan's structure (§6.2). A developer's kernel is only
   tested against its SQL, which is weaker (S5.3). So checking mode samples
   hand-written kernels more often, their runs are counted separately, and
   a session may refuse them in strict mode.
@@ -819,11 +850,11 @@ the accelerator as a DataFusion extension of its own, mixed in beside it.
 | Interface | What it provides | Integrations, for example |
 |---|---|---|
 | `Device` | memory tiers and their shared allocator, queues and events, and the execution context of §5.7 | CUDA, ROCm, Metal, PJRT for TPUs |
-| `ArrayBackend` | runs einfold's nodes on arrays | NumPy (the reference), MLX, CuPy, JAX, PyTorch |
+| `ArrayBackend` | runs einfold's nodes (§6.2) on arrays | NumPy (the reference), MLX, CuPy, JAX, PyTorch |
 | `KernelLibrary` | kernels bound by node type, such as DataFusion's relational operators | libcudf, and whatever succeeds it |
 | `Kernel` | one kernel bound by label (§5.7) | Triton, Gluon, Pallas, cuTile Rust, a developer's own |
-| `Transport` | the collective capabilities it implements, eager or compiled (§10.5) | NCCL, RCCL, XLA's collectives, gRPC |
-| `Topology` | devices and links, as discovered | NVML and NCCL, AMD's tools, PJRT |
+| `Transport` | the collective capabilities it implements, eager or compiled (§10.5) | NCCL, RCCL, XLA's collectives, and the gRPC network calls datafusion-distributed uses |
+| `Topology` | devices and links, as discovered (§10.5) | NVML and NCCL, AMD's tools, PJRT |
 
 Other DataFusion extensions integrate the same way, and XQL's are the
 first:
@@ -880,11 +911,11 @@ chooses:
 2. **With bound nodes.** Each node einfold marked, a kernel library bound
    by its type, or a developer bound by label, runs as a `KernelExec` on
    data kept on the device, or declines, and then its subplan runs on
-   DataFusion. With einfold's nodes, this is stage
-   B-0 (§6.2).
+   DataFusion. With einfold's nodes, this is the stage of dense execution
+   that §6.2 calls B-0.
 3. **As a region**: several nodes, and the elementwise expressions between
    them, run as one array program, with their intermediates kept compact.
-   These are stages B-1 and B-2.
+   These are stages B-1 and B-2 (§6.2).
 
 A GPU SQL engine such as Sirius would be a fourth way, outside DataFusion.
 Spike 2 tests whether it meets the same wall as GPU kernels on long-format
@@ -892,10 +923,19 @@ rows (S1.1).
 
 ### 6.2 Dense execution
 
-**einfold marks the SQL, and the runtime runs what it marks.** The program
-stays SQL: it is what every engine runs, what ddx differentiates, and what
-R1 calls the meaning. There is no separate array language (D2, S2.2).
-einfold annotates a step's plan with nodes of five kinds:
+*Dense execution* runs the array work in a step's SQL on compact arrays.
+The supplement weighs three designs for it (S2):
+- **A**: the runtime interprets relational plans on compact arrays, a
+  second implementation of SQL (S2.1);
+- **B**: einfold marks the array work in the plan, and the runtime runs
+  what einfold marks;
+- **C**: DataFusion carries dense tiles itself, as tensor columns (S2.3).
+
+**The design is B: einfold marks the SQL, and the runtime runs what it
+marks.** The program stays SQL: it is what every engine runs, what ddx
+differentiates, and what R1 calls the meaning. There is no separate array
+language (D2, S2.2). einfold annotates a step's plan with nodes of five
+kinds:
 - *folds*: sums of products over a join, with their domains, NULL rules
   and fallbacks;
 - *pipelines*: a fold that reads another fold's result through an
@@ -963,10 +1003,12 @@ between the two gets closed.
 - **B-1, regions within one step**: einfold nodes connected through
   elementwise projections run as one array program, in one `KernelExec`.
   A region may contain exchanges, which a compiled transport lowers into
-  the region's program (§10.5). A TPU backend needs regions to be fast,
+  the region's program (§10.5). A TPU's array backend needs regions to be fast,
   since its collectives exist only inside compiled programs.
-- **B-2, regions across steps**, through einfold's program mode, with
-  ddx's step graph (ddx#157) and regions (ddx#251).
+- **B-2, regions across steps**, through einfold's *program mode*, in
+  which einfold sees a whole program rather than one query at a time, with
+  ddx's step graph, which says which steps read which (ddx#157), and its
+  regions (ddx#251).
 
 B-0 comes first as the first interface, not as enough on its own. The
 evidence expects it to stop short (S2.6), so B-1 and B-2 are planned (M5,
@@ -976,11 +1018,9 @@ B pulls einfold's fact table and program mode ahead of its DuckDB and
 sparse-kernel milestones. That is Alex's decision as einfold's maintainer,
 after a sketch in einfold's design doc (§13, question 4).
 
-Design C, in which DataFusion carries dense values itself as fixed-shape
-tensor columns, is closed for the milestones (spike 1, S2.3). DataFusion
-keeps the tensor type through its operators, but copies tiles wherever it
-selects or reorders rows, can't compute on them, and arrow-rs has no device
-memory to hold them in.
+Design C is closed for the milestones: spike 1 found that DataFusion
+copies tensor columns wherever it selects or reorders rows, and can't
+compute on them (S2.3).
 
 ### 6.3 Checks, declines and fallbacks
 
@@ -1024,15 +1064,17 @@ its own boundaries.
   stays a function of its plan and its options (S3.4).
 - **Shared subplans come from SQL or from the frontend's program**, never
   from a Substrait plan. For plain queries, the runtime calls ddx's public
-  form of ddx#168's split, and has no implementation of its own.
+  form of ddx#168, which splits a query into steps at each CTE it reads
+  more than once, and has no implementation of its own.
 - **Save points are schedule entries** (§5.6), so a developer can add,
   remove or move one, and the runtime passes the result to ddx.
 - **The runtime chooses default save points with einfold.** einfold
   reports whether a candidate save point would split a node it can fuse,
   and the runtime prefers save points that don't. A split taken anyway is
   a counted decline (S3.5).
-- **Frontends don't run their own chain rules.** torch-sql retires its cut
-  points by handing ddx SQL with a CTE at each shared node (S3.6), and
+- **Frontends don't run their own chain rules.** torch-sql today splits a
+  program at *cut points* and chains the pieces' derivatives itself. It
+  retires them by handing ddx SQL with a CTE at each shared node (S3.6), and
   stops gradients with `ddx_stop_gradient`, never by saving a table
   ([ddx#260](https://github.com/xqlsystems/ddx/issues/260)).
 
@@ -1050,10 +1092,8 @@ its own boundaries.
   mode (B-2), and the runtime holds the value as a table instance in the
   schedule (§5.6). Under memory pressure the runtime spills it to a lower
   tier, as DataFusion spills, and recomputes it only where a recompute
-  policy names its label. The contributor's cache of these values evicts
-  the least recently used one when it runs out of room, and recomputes it
-  if it is read again. That is recomputing by the engine's own choice,
-  which D1 rules out, so that part changes as it moves (P-X).
+  policy names its label (P-X). The contributor's cache of these values
+  recomputes after evicting them, which D1 rules out (S1.1).
 - **Only plans that give the same rows twice are recomputed** (S3.7). ddx
   reads volatility from the engine through its `Backend`.
 - **The runtime's random function is declared deterministic**, so that a
@@ -1103,7 +1143,8 @@ its own boundaries.
   them to streams and devices (§5.3).
 - **Within a run**, each step runs once the steps it reads are done. That
   needs ddx's step graph on `Program` (ddx#157) and a `Backend` whose
-  `materialize` may run concurrently. Measure the gain again on compiled
+  `materialize`, the call that runs one step and saves its table, may run
+  concurrently. Measure the gain again on compiled
   runs before building it (S1.4).
 - **Across runs**, the runtime loads the next batch while a step runs. For
   Samudra, batches come from xarray-sql's data path over a Zarr archive.
@@ -1239,7 +1280,7 @@ runtime needs, each as an ordinary ddx PR:
    `erf` ([ddx#256](https://github.com/xqlsystems/ddx/pull/256)), both in
    review;
 10. ddx#265, a wrong value with no error for one-row tables on DuckDB,
-    first among ddx#261 to #265.
+    first among ddx#261 to ddx#265.
 
 ### 10.3 To einfold
 
@@ -1276,8 +1317,8 @@ S7 has the reasoning, and S8 the database theory it follows.
 
 **Parallelism is partitioning, declared in SQL** (D9). Each table's
 distribution is declared where the table is created, and the planner
-derives the distribution of everything in between, as MPP databases such
-as Greenplum and Redshift do (S8.7):
+derives the distribution of everything in between, as massively parallel
+(MPP) databases such as Greenplum and Amazon Redshift do (S8.7):
 
 ```sql
 CREATE EXTERNAL TABLE ocean STORED AS ZARR LOCATION 'om4.zarr'
@@ -1291,8 +1332,8 @@ CREATE EXTERNAL TABLE stats STORED AS ACCELERATED
 | Strategy | Declared distribution |
 |---|---|
 | Data parallelism | the batch `hash(sample)`, the weights `replicated` |
-| Sharded weights and optimizer state, as FSDP and ZeRO do | the state tables `blocks(k)`: contiguous ranges of the key, which a reduce-scatter needs |
-| Tensor parallelism, as Megatron does | a weight `hash` by its output axis, or `tiles` over both axes for 2D variants |
+| Sharded weights and optimizer state, as PyTorch's FSDP (Fully Sharded Data Parallel) and DeepSpeed's ZeRO do | the state tables `blocks(k)`: contiguous ranges of the key, which a reduce-scatter needs |
+| Tensor parallelism, as NVIDIA's Megatron does, splitting each weight matrix across GPUs | a weight `hash` by its output axis, or `tiles` over both axes for 2D variants |
 | Domain decomposition | the grid `tiles(lat, lon)` |
 | Pipeline parallelism | labelled parts of the program on groups of devices, with `SET accelerated.place.<label>` |
 
@@ -1307,9 +1348,9 @@ Rules:
   Greenplum has, could be proposed to DataFusion's parser later.
 - **The planner derives intermediates**, through DataFusion's physical
   properties: each node states the distribution it requires of its inputs
-  and the partitioning it delivers, and `ensure_requirements` inserts the
-  exchanges where they differ, as Volcano and Cascades optimizers do
-  (S8.1). Where several partitionings would do, a cost model of the
+  and the partitioning it delivers, and DataFusion's `EnforceDistribution`
+  rule inserts the exchanges where they differ, as the Volcano and
+  Cascades optimizer frameworks do (S8.1). Where several partitionings would do, a cost model of the
   communication each needs chooses
   ([#16](https://github.com/xqlsystems/datafusion-accelerated/issues/16)).
   The schedule overrides the choice for one intermediate (§5.6).
@@ -1368,8 +1409,8 @@ Transports come in two kinds, and the device plan is the same under either
   and gRPC;
 - **compiled**, lowered into the program of the region that holds the
   exchange: XLA's collectives on a TPU, through StableHLO with sharding
-  annotations, inside the backend (D2); and on CUDA, perhaps NCCL captured
-  in a CUDA graph.
+  annotations, inside the array backend (D2); and on CUDA, perhaps NCCL
+  captured in a CUDA graph (§13, question 10).
 
 Rules for the lowering:
 - **A collective reduces a count beside each sum**, so a group no
@@ -1406,7 +1447,7 @@ More rules:
   partition of a state table is resident on one worker's device across
   runs, as a table handle the coordinating session refers to remotely,
   and the tasks that read or update a partition run where it lives, as
-  HaLoop schedules iterations (S8.5,
+  HaLoop, an iterative MapReduce system, schedules iterations (S8.5,
   [#7](https://github.com/xqlsystems/datafusion-accelerated/issues/7)).
 - **The topology is a graph**, of devices and links with their speeds and
   tiers, taken from each platform's own discovery (NCCL and NVML, RCCL and
@@ -1417,7 +1458,8 @@ More rules:
   ([#8](https://github.com/xqlsystems/datafusion-accelerated/issues/8)).
 - **Device data crosses machines without the host** once exchanges are
   lowered. Until then, distribution is correct but slow.
-- **A distributed run is synchronous**, in the bulk-synchronous model. One
+- **A distributed run is synchronous**: every device finishes a training
+  step before any starts the next, as in the bulk-synchronous model. One
   slow GPU stalls a step, and `report()` names it by worker and device.
   Recovery from a failed worker restarts from the last checkpoint, whose
   shards each worker writes to one Zarr store
@@ -1428,11 +1470,8 @@ More rules:
   TPU slice, the grid's tiles map onto the torus's axes, and Samudra's
   periodic longitude onto its wraparound.
 
-torch-sql's hypothesis H1 is that a planner choosing the partitioning per
-join distributes Samudra better than PyTorch's FSDP (Fully Sharded Data
-Parallel). Two measurements test it: against NCCL's tuned collectives, and
-against the communication lower bounds that database theory gives for each
-join (spike 8, S8.3).
+Whether a planner that chooses the partitioning per join distributes
+Samudra better than FSDP is torch-sql's H1. Spike 8 tests it (S7.1, S8.3).
 
 <details>
 <summary>The aspiration, in Python: Samudra across a rack (#5)</summary>
@@ -1466,9 +1505,9 @@ python train.py
 - **Kernels arrive through bindings** (§5.7), from any compiler. The
   runtime has no kernel language, and no compiler of its own.
 - **Array backends** are integrations that wrap an array library and lower
-  einfold's nodes through it: NumPy in the core, as the reference, then a
-  CUDA backend at M2, and MLX beside it (§5.8, §13, question 1).
-- **StableHLO and MLIR** appear only inside a backend, as the route to XLA
+  einfold's nodes through it: NumPy in the core, as the reference, then one
+  for CUDA at M2, and MLX beside it (§5.8, §13, question 1).
+- **StableHLO and MLIR** appear only inside an array backend, as the route to XLA
   through JAX or PJRT, never as XQL's representation of a program (D2).
 - **Memory** comes from the shared allocator (§7).
 
@@ -1476,40 +1515,24 @@ python train.py
 
 ## 11. Where today's code goes
 
-Each piece of the code that exists today has a home.
+Each piece of today's code goes to the project whose job it does: the
+runtime runs things on devices, einfold recognizes and proves array
+structure, ddx differentiates, and frontends hold training loops and
+demos. The [landing guide](internal/landing-the-performance-work.md) gives
+each in-flight PR and branch its destination, with code before and after.
+In short:
 
-<details>
-<summary>The table, piece by piece</summary>
-
-| Code | Today | Goes to |
-|---|---|---|
-| `prepare()` for gradients, `Context(threads=)`, faster registration (#301) | xarray-sql | stays in xarray-sql |
-| `SharedExecutor`'s stage caching | xarray-sql (#302) | ddx's SQL path (ddx#168) and the runtime's save points (§6.4) |
-| `SharedExecutor`'s SQL parsing of CTEs (`src/shared.rs`) | xarray-sql (#302) | nowhere: ddx#168 does this |
-| Arrow tables that declare their sort order (`_SortedArrowTable`) | xarray-sql (#302) | xarray-sql's registration |
-| MLX kernels (`xarray_sql/mlx.py`) | xarray-sql (#302) | runtime, as an array backend for einfold's nodes |
-| `DenseProgram` | einfold (#157) | a corpus for spike 6, and an oracle for einfold's new detection, which goes in Rust beside its existing detection |
-| `DenseExecutor` and its MLX operators | xarray-sql (#303) | runtime, as array backends for B-0 |
-| `TrainingSession` | xarray-sql (#305) | split as below |
-| `erf` as a DataFusion function (`xarray_sql/math.py`) | xarray-sql (#305) | xarray-sql for now; DataFusion upstream eventually |
-| The Shakespeare recipe (`03_shakespeare.py`) | xarray-sql (#305) | xarray-sql, as demo 3, on public APIs |
-| `ddxdb.Context`, a `SessionContext` subclass | ddx | ddx's DataFusion extension (§10.2) |
-| Cut points and their chain rule (`torch_sql.program`) | torch-sql | nowhere: ddx's SQL path replaces them (§6.4) |
-
-`TrainingSession` (S1.1) splits along the line between execution and
-training:
-
-| Part of `TrainingSession` | Goes to |
+| Code | Goes to |
 |---|---|
-| State tables kept as arrays between runs, with their device buffers | runtime (§5.2) |
-| Publishing new state only after validation | runtime (R5) |
-| Compiling the whole step once, guarded by the session key | runtime (§5.4) |
-| Reusing the loss ddx already computed ([ddx#257](https://github.com/xqlsystems/ddx/pull/257)) | runtime, through ddx's public API |
-| Checkpoints of state, with the step counter and random state | runtime |
-| Dropout with explicit seed and step keys | the runtime's random function; the frontend decides where dropout goes |
-| AdamW, gradient clipping, the learning-rate schedule and evaluation | frontend |
-
-</details>
+| `SharedExecutor`'s caching of CTEs (xarray-sql#302) | ddx's SQL path (ddx#168) for gradients, and DataFusion's planned-once CTEs for forward queries; the executor retires |
+| `DenseExecutor` (xarray-sql#303) | the runtime's device plans over compact arrays (§5.3); the executor retires |
+| MLX kernels and `DenseExecutor`'s MLX operators | the Metal integration's MLX array backend (§5.8), never the core |
+| `TrainingSession` (xarray-sql#305) | the runtime's programs (§5.4), with state kept on the device and published after validation (R5); the session retires |
+| AdamW, gradient clipping, learning-rate schedules, evaluation | frontends |
+| `DenseProgram` and its proofs (einfold#157 and the contributor's fork) | einfold, rewritten on its Rust IR, with `DenseProgram` as a corpus and an oracle |
+| `ddxdb.Context`, a `SessionContext` subclass | ddx's DataFusion extension (§10.2) |
+| torch-sql's cut points and their chain rule | nowhere: ddx's SQL path replaces them (§6.4) |
+| The Shakespeare recipe, and `erf` as a DataFusion function | xarray-sql, as demo 3 on public APIs; `erf` upstream eventually |
 
 ---
 
@@ -1535,7 +1558,7 @@ one Python package. Every integration is a crate or package of its own
 | `datafusion-accelerated-pjrt` | a `Device`, and a compiled `Transport`, for TPUs; later | PJRT |
 
 Each is published to crates.io, and to PyPI where it has a Python side,
-built with maturin, as `datafusion_accelerated` and
+built with maturin, the tool that packages Rust extensions for Python, as `datafusion_accelerated` and
 `datafusion_accelerated_cuda` and so on. The core package offers extras
 that only install integrations, such as `datafusion-accelerated[cuda]`.
 
@@ -1555,17 +1578,20 @@ Rules:
 ### 12.2 Milestones
 
 Each milestone is measured on XQL's programs (demo 2, demo 4 and
-torch-sql's nanoGPT), and from M8 on TPC-H's queries too, and reported on [xarray-sql#285](https://github.com/xqlsystems/xarray-sql/issues/285)
-with the hardware and versions, whichever way the numbers go. NVIDIA GPUs,
+torch-sql's nanoGPT), and from M8 on the queries of TPC-H, the standard
+decision-support benchmark, too. Results are reported on
+[xarray-sql#285](https://github.com/xqlsystems/xarray-sql/issues/285) with
+the hardware and versions, whichever way the numbers go. NVIDIA GPUs,
 on the cloud or on the Beta cluster, are available half a day a week.
 
 **M0. A CPU runtime, in Rust and Python.**
 - *Builds:* `.with_accelerator()` and the `Accelerator` extension object,
   the `accelerated` settings, table handles and providers, `Program` with
   `lower`, `compile` and `run`, the ddx integration, implementing
-  `ddx_ad::Backend` with compiled plans and tables kept in place, the counters of R8 as metrics, and the schedule
-  and `explain()` in their first form, even while every step runs on
-  DataFusion. They are cheap to build first and expensive to add later.
+  `ddx_ad::Backend` with compiled plans and tables kept in place, the
+  counters of R8 as metrics, and the schedule and `explain()` in their
+  first form, even while every step runs on DataFusion. They are cheap to
+  build first and expensive to add later.
 - *Done when:* torch-sql's test suite passes on both engines with the
   runtime as its `Backend`, demos 2 and 4 give the same results through
   it, from Python and from Rust, and an override the runtime can't obey
@@ -1597,12 +1623,12 @@ on the cloud or on the Beta cluster, are available half a day a week.
   and cuTile Rust from Rust, each run one node, each bound with no code in
   the runtime specific to its library, and checking mode verifies them.
   Speed and memory are reported against what exists: demo 2's and
-  torch-sql's nanoGPT warm step against PyTorch on the same GPU, eager and
-  with `torch.compile`, with peak device memory beside PyTorch's, since §7
-  budgets two copies of state. Where the MLX integration runs, the same
-  steps also run against the contributor's MLX path at its pinned
-  commits, and B-0 is no slower there than `DenseExecutor` (#303), the
-  existing design closest to it (§13, question 14).
+  torch-sql's nanoGPT warm training step against PyTorch on the same GPU,
+  eager and with `torch.compile`, with peak device memory beside
+  PyTorch's, since §7 budgets two copies of state. Where the MLX
+  integration runs, the same steps also run against the contributor's MLX
+  path (§2.4), and B-0 is no slower there than `DenseExecutor`, the
+  existing code closest to it (§13, question 14).
 
 **M3. Save points and memory policies.**
 - *Builds:* save points and recompute policies passed to ddx by label, and
@@ -1624,9 +1650,9 @@ M5 must recover.
 
 **M6. B-2, regions across steps**, with ddx#157 and ddx#251, and the
 values a run's steps share (§6.5).
-- *Done when:* on an Apple GPU, Modded-NanoGPT's warm step is no slower
-  than the contributor's MLX path on the same machine (238.95 ms on the
-  M5 Ultra, S1.1), with peak memory reported beside PyTorch's.
+- *Done when:* on an Apple GPU, Modded-NanoGPT's warm training step is no
+  slower than the contributor's MLX path on the same machine (238.95 ms on
+  the M5 Ultra, S1.1), with peak memory reported beside PyTorch's.
 
 **M7. Distribution, through datafusion-distributed**, within one NVL72
 rack (§10.5).
@@ -1637,7 +1663,7 @@ rack (§10.5).
   programs whose stages and state persist on workers (#7), and placement
   over the topology graph (#8).
 - *Needs:* spikes 8 and 9. Spikes 10 and 11 test the same design on AMD
-  and TPU before any backend for them is built.
+  and TPU before any integration for them is built.
 - *Done when:* demo 4 trains with its grid split by tile across the GPUs
   of one rack, in one physical plan with network nodes and device nodes,
   gives the same results as on one GPU within §6.3's bound, and its
@@ -1665,15 +1691,15 @@ are the first work for the GPU half days, since they wait on no decision.
 | 2 | Do rows between operators cost a GPU SQL engine what they cost GPU kernels? | One of demo 2's steps on Sirius | Whether a GPU engine is an alternative to B |
 | 3 | Can a B200 read Arrow buffers in place from Grace memory fast enough? | Read against copy, on the Beta cluster | Whether Grace memory is a tier worth spilling to (§7) |
 | 4 | What does crossing from Python cost? | datafusion-ffi's overhead for the runtime's nodes (S4.1); launching a Triton kernel from a `KernelExec` through Python, and whether the call holds Python's lock | Which Python kernels are worth binding, and whether some must be compiled ahead of time |
-| 5 | Where does the remaining gap to PyTorch go, in time and in memory? | Start from the contributor's own division of the step by kind of work: the ablations in `GPU_NUMERICAL_VALUE_IDENTITIES.md`, `MPS_COMPILER_COMPARISON.md` and `MODDED_NANOGPT_STEP_EXPERIMENTS.md`, on xarray-sql's `codex/numerical-value-identities` branch. Then trace one warm resident step on the M5 Ultra against PyTorch MPS for what they don't cover, including peak memory, which on Nov 2 was 24.67 GB of process memory against PyTorch's 2.44 GB (S1.1) | What M2, M5 and M6 should fix first |
+| 5 | Where does the remaining gap to PyTorch go, in time and in memory? | Start from the contributor's own ablations, which divide the step by kind of work (S1.1). Then trace one warm resident step on the M5 Ultra against PyTorch on MPS, for what they don't cover, peak memory included | What M2, M5 and M6 should fix first |
 | 6 | How much of each step does einfold already cover? | `EXPLAIN ANALYZE` with einfold on, for demo 2, demo 4 and torch-sql's nanoGPT: the share of time inside einfold's nodes, and how often a DataFusion operator sits between two of them (S2.5). The contributor's `DenseProgram` corpus and spike 5's ablations are its inputs. einfold's agent runs einfold's side | How far short B-0 stops, and so what M5 must recover (§6.2) |
 | 7 | Can handle batches carry device data between DataFusion nodes? | Two `KernelExec`s in one plan passing handle batches, through repartitioning and the planner's other rewrites, with a `CopyExec` where rows are needed | Whether §5.3's device plans work as written, or device work must stay inside single nodes. **Done:** they work, under three rules now in §5.3 ([report](spikes/s07-handle-batches/README.md)) |
 | 8 | Can relational collectives match NCCL? ([#12](https://github.com/xqlsystems/datafusion-accelerated/issues/12)) | Reduce one demo 2 step's gradients on 8 GPUs, then 2 nodes: NCCL all-reduce, NCCL reduce-scatter and all-gather, and a shuffle by key with a final sum | Whether the runtime needs a collective node that calls NCCL, or plain shuffles suffice |
 | 9 | Which host suits distributed training, datafusion-distributed or Ballista? ([#13](https://github.com/xqlsystems/datafusion-accelerated/issues/13)) | One distributed demo 2 step on each, CPU first: per-run overhead over 100 runs, and deploying stages once | Whether D7 holds for training, or the distributed contract stays neutral between them (S7.5) |
-| 10 | Does AMD's stack slot in with no runtime changes beyond a backend? ([#22](https://github.com/xqlsystems/datafusion-accelerated/issues/22)) | One distributed demo 2 step on an 8-GPU MI300-class node: HIP, RCCL, a Triton kernel, tiles placed per node | Whether the device-family contract holds for ROCm, and whether AMD needs placement from the start |
-| 11 | Do a region's exchanges lower to one XLA program on a TPU? ([#23](https://github.com/xqlsystems/datafusion-accelerated/issues/23)) | One demo 4 block, with its halo exchange and a gradient reduction, through StableHLO and PJRT on a small slice, against the same in JAX's `shard_map` | Whether a TPU backend fits the runtime's contract |
+| 10 | Does AMD's stack slot in with no runtime changes beyond its integrations? ([#22](https://github.com/xqlsystems/datafusion-accelerated/issues/22)) | One distributed demo 2 step on an 8-GPU MI300-class node: HIP, RCCL, a Triton kernel, tiles placed per node | Whether the device-family contract holds for ROCm, and whether AMD needs placement from the start |
+| 11 | Do a region's exchanges lower to one XLA program on a TPU? ([#23](https://github.com/xqlsystems/datafusion-accelerated/issues/23)) | One demo 4 block, with its halo exchange and a gradient reduction, through StableHLO and PJRT on a small slice, against the same in JAX's `shard_map`, which maps a function over a mesh of devices | Whether a TPU integration fits the runtime's contract |
 | 12 | Can libcudf's relational kernels run DataFusion's operators over handle batches? ([#24](https://github.com/xqlsystems/datafusion-accelerated/issues/24)) | Bind DataFusion's hash aggregate and hash join to libcudf, exchanging columns through the C Device Data Interface, on TPC-H queries and one xarray-sql query | Whether relational acceleration fits the kernel contract, and what M8 needs |
-| 13 | Where do compact arrays stop paying for their absent cells, and does a blocked layout keep them unstored? ([#34](https://github.com/xqlsystems/datafusion-accelerated/issues/34)) | A 3 by 3 convolution on each of a real ocean mask's 33 depth levels as rows, as compact arrays, and as dense blocks with absent blocks unstored, against the same density scattered at random | How §5.2 chooses a layout. **Done:** compact wins on time down to about 4% present and on memory only above about 40%; 8 by 8 blocks beat both on a real coastline, but not on scattered absence, so layouts are chosen by stored cells per present cell, and blocks are the compact layout ([report](spikes/s13-compact-absence/README.md)) |
+| 13 | Where do compact arrays stop paying for their absent cells, and does a blocked layout keep them unstored? ([#34](https://github.com/xqlsystems/datafusion-accelerated/issues/34)) | A 3 by 3 convolution on each depth level of a real ocean mask, as rows, as compact arrays and as blocks, against the same density scattered at random | How §5.2 chooses a layout. **Done:** blocks are the compact layout, chosen by stored cells per present cell (S2.7, [report](spikes/s13-compact-absence/README.md)) |
 
 ---
 
@@ -1681,7 +1707,7 @@ are the first work for the GPU half days, since they wait on no decision.
 
 1. **Which libraries the first CUDA array backend uses** for einfold's
    nodes: from Python, JAX, PyTorch, CuPy, or PJRT directly (S4.2); from
-   Rust, kernels launched through CUDA bindings. More than one backend
+   Rust, kernels launched through CUDA bindings. More than one array backend
    can exist, and developers can bind any library's kernels besides.
 2. **Substrait as the plan format between layers.** Engines without a
    Substrait producer need SQL text in their dialect
@@ -1698,16 +1724,17 @@ are the first work for the GPU half days, since they wait on no decision.
 6. **The shared allocator.** This draft leans toward CUDA's
    stream-ordered pools (§7). What is open is how each library in a
    process is configured to draw from them, what happens when one can't
-   be, and whether NCCL's registered buffers, which NVLS needs, can come
-   from them ([#19](https://github.com/xqlsystems/datafusion-accelerated/issues/19)).
+   be, and whether NCCL's registered buffers, which its NVLink SHARP
+   collectives (NVLS) need, can come from them ([#19](https://github.com/xqlsystems/datafusion-accelerated/issues/19)).
 7. **The schedule's JSON format**, and how it is versioned as the runtime
    grows (§5.6).
 8. **einfold's node types as an MLIR dialect.** Publishing them that way
    would let MLIR-based compilers consume einfold's nodes directly. That is
    a seam to the compiler ecosystem, not a change of XQL's representation
    (D2), and it is einfold's to decide.
-9. **NVIDIA's CUDA bindings or cudarc**, for the CUDA integration: NVIDIA's `cuda-rust` crates, or cudarc, which is older and more
-   widely used, by Candle among others. Either way, `KernelArgs` hands out
+9. **NVIDIA's CUDA bindings or cudarc**, for the CUDA integration:
+   NVIDIA's `cuda-rust` crates, or cudarc, which is older and more widely
+   used, by Candle among others (§2.5). Either way, `KernelArgs` hands out
    raw handles with owners (§5.7), so kernels from libraries built on the
    other still bind.
 10. **CUDA graphs.** A compiled step could be captured as a CUDA graph,
@@ -1719,7 +1746,7 @@ are the first work for the GPU half days, since they wait on no decision.
     that runs Python, or must be compiled ahead of time, as a Triton kernel
     can be, and launched from Rust
     ([#9](https://github.com/xqlsystems/datafusion-accelerated/issues/9)).
-12. **A Rust frontend.** A backend for Burn whose arrays are XQL tables
+12. **A Rust frontend.** A backend for Burn, the Rust framework, whose arrays are XQL tables
     would do for Rust what torch-sql does for PyTorch (S6.6).
 13. **Atomic state across workers.** When state is spread across workers,
     whether publication is atomic across all of them (R5), or recovery
@@ -1834,7 +1861,7 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
   resident on workers, and tasks placed where their partitions live
   (§10.5).
 - **P-U.** Kernel contracts and memory tiers are defined per device
-  family, so that CUDA, ROCm and TPU backends each meet them (§5.2, §5.7).
+  family, so that CUDA, ROCm and TPU integrations each meet them (§5.2, §5.7).
 - **P-V.** Exchanges are lowered to collective capabilities, which
   transport integrations implement, eager or compiled, under
   datafusion-distributed's control plane (§10.5).
