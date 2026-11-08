@@ -234,6 +234,12 @@ against each.
   `sm_100`) in GB200 NVL72 racks. Each Grace CPU, an ARM CPU, is joined to
   two B200s by NVLink-C2C, which lets a GPU read the CPU's memory directly,
   and NVLink joins the 72 GPUs of a rack.
+- **Other clusters** test the design's portability (S7.8). **AMD**'s
+  MI300-class nodes join 8 GPUs in a full mesh of Infinity Fabric links,
+  programmed through *ROCm*, whose *HIP* mirrors CUDA and whose *RCCL*
+  implements NCCL's API. **Google's TPUs** join chips in a 2D or 3D torus,
+  with wraparound, over links called *ICI*, and are programmed only
+  through XLA, by way of PJRT.
 
 </details>
 
@@ -383,13 +389,15 @@ Rules:
 
 The runtime extends `RuntimeEnv`'s memory hierarchy. DataFusion already has
 two tiers: host memory, through its `MemoryPool`, and disk, through its
-`DiskManager`. The runtime adds the device tiers. Tiers are named by Arrow's
-device types (§2.1), with `storage` for files.
+`DiskManager`. The runtime adds the device tiers. Tiers are named by device family:
+by Arrow's device type where one exists (§2.1), by a name the backend
+defines where none does, and `storage` for files
+([#20](https://github.com/xqlsystems/xql-runtime/issues/20)).
 
-| Tier | Arrow device type | Accounting |
+| Tier | Device type | Accounting |
 |---|---|---|
-| device memory | `CUDA` (or `METAL`, ...) | a device memory pool per device, added by the runtime |
-| pinned host memory | `CUDA_HOST` | the device pool of the device it is pinned for |
+| device memory | `CUDA`, `ROCM`, `METAL`; a backend's name for a TPU | a device memory pool per device, added by the runtime |
+| pinned host memory | `CUDA_HOST`, `ROCM_HOST` | the device pool of the device it is pinned for |
 | host memory | `CPU` | DataFusion's `MemoryPool` |
 | storage | none | DataFusion's `DiskManager`, plus Zarr and Arrow IPC files |
 
@@ -399,7 +407,11 @@ Rules:
   refused reservation means spilling to a lower tier, as a refused host
   reservation means spilling to disk.
 - **The bytes come from a shared allocator**, never from an allocator of
-  the runtime's own (§7).
+  the runtime's own (§7). On a TPU, PJRT owns device memory, and the
+  runtime accounts for what it holds through PJRT's buffers.
+- **A TPU's tables cross into DataFusion only through the host.** Neither
+  Arrow nor DLPack has a TPU device type, so device data on a TPU stays
+  behind PJRT's handles.
 - **A table handle** refers to a table the runtime owns, as a buffer handle
   refers to an allocation. It carries the table's schema, its lifetime (one
   run, or until the caller releases it), and one or more *instances*. Each
@@ -545,19 +557,22 @@ node's SQL is the kernel's specification, and runs if the kernel declines.
 
 **The kernel contract.** The runtime depends on no kernel library.
 Instead it gives every kernel what any library needs to run on memory and
-streams it doesn't own. Each item below is what a kernel library asks of
+queues it doesn't own, in terms each device family can meet
+([#20](https://github.com/xqlsystems/xql-runtime/issues/20)). Each item below is what a kernel library asks of
 a foreign host, checked against cuTile Rust, Triton and Pallas (S6.2):
 - **Arrays the kernel can borrow.** Each input, and each output the
   runtime has allocated from the node's schema, is a device array with a
   pointer, shape, strides, element type, named axes and an *owner*: a
   reference-counted handle that keeps the runtime's buffer alive for as
-  long as the kernel's library holds it. Each exports DLPack, and in
-  Python a `data_ptr()`.
+  long as the kernel's library holds it. Each exports DLPack where its
+  device has a DLPack type, and in Python a `data_ptr()`. On a TPU, arrays
+  are PJRT buffers.
 - **Masks.** Each input's presence and NULL masks, unless the kernel
   assumes there are none.
-- **The context and stream, borrowable.** The raw CUDA context and the
-  partition's stream, each with an owner, so a library launches on the
-  runtime's stream rather than its own.
+- **The execution context and queue, borrowable.** The backend's raw
+  context and the partition's queue, each with an owner, so a library
+  launches on the runtime's queue rather than its own: a CUDA or HIP
+  context and stream, or on a TPU, a PJRT client and device.
 - **Async launches.** A launch is awaited on the Tokio runtime DataFusion
   executes on, so a library whose launches are futures awaits them.
 - **A compile hook**, run at the program's compile with the shapes and
@@ -566,6 +581,12 @@ a foreign host, checked against cuTile Rust, Triton and Pallas (S6.2):
 - **The partition's placement**: which device and stream each partition
   runs on, so a library with its own scheduler can follow DataFusion's
   partitions instead of choosing for itself.
+
+A binding is one of two kinds, by device family:
+- **a callable**, launched on the queue: CUDA and ROCm;
+- **a function the backend compiles in**, to the program of the region
+  that contains the node: a Pallas kernel on a TPU, which runs only inside
+  an XLA program.
 
 Binding a library's kernel then takes a few lines of the user's own code,
 and none in the runtime.
@@ -764,6 +785,9 @@ between the two gets closed.
   wherever a `CopyExec` hands them to DataFusion's operators (S2.5).
 - **B-1, regions within one step**: einfold nodes connected through
   elementwise projections run as one array program, in one `KernelExec`.
+  A region may contain exchanges, which a compiled transport lowers into
+  the region's program (§10.5). A TPU backend needs regions to be fast,
+  since its collectives exist only inside compiled programs.
 - **B-2, regions across steps**, through einfold's program mode, with
   ddx's step graph (ddx#157) and regions (ddx#251).
 
@@ -1049,7 +1073,7 @@ as Greenplum and Redshift do (S8.7):
 CREATE EXTERNAL TABLE ocean STORED AS ZARR LOCATION 'om4.zarr'
   OPTIONS ('xql.distribution' 'tiles(lat 6, lon 6)');   -- a grid tile per GPU
 CREATE EXTERNAL TABLE w STORED AS XQL
-  OPTIONS ('xql.distribution' 'hash(k)');               -- weights and moments sharded
+  OPTIONS ('xql.distribution' 'blocks(k)');             -- weights and moments sharded
 CREATE EXTERNAL TABLE stats STORED AS XQL
   OPTIONS ('xql.distribution' 'replicated');            -- a copy on every GPU
 ```
@@ -1057,7 +1081,7 @@ CREATE EXTERNAL TABLE stats STORED AS XQL
 | Strategy | Declared distribution |
 |---|---|
 | Data parallelism | the batch `hash(sample)`, the weights `replicated` |
-| Sharded weights and optimizer state, as FSDP and ZeRO do | the state tables `hash(k)` |
+| Sharded weights and optimizer state, as FSDP and ZeRO do | the state tables `blocks(k)`: contiguous ranges of the key, which a reduce-scatter needs |
 | Tensor parallelism, as Megatron does | a weight `hash` by its output axis, or `tiles` over both axes for 2D variants |
 | Domain decomposition | the grid `tiles(lat, lon)` |
 | Pipeline parallelism | labelled parts of the program on groups of devices, with `SET xql_runtime.place.<label>` |
@@ -1108,6 +1132,49 @@ and `explain()` shows them:
 - a halo exchange is the rows of a convolution's join that cross a tile's
   edge.
 
+**Exchanges are lowered to the hardware's transports** (S7.7). The
+relational layer decides *what* moves; the runtime decides *how*. Under
+datafusion-distributed's gRPC as the *control plane* (plans, stages, task
+assignment, metrics, and the setup of each collective library), the
+*data plane* is the device's own
+([#6](https://github.com/xqlsystems/xql-runtime/issues/6)):
+
+| Exchange in the plan | Eager transport: NCCL, or RCCL on AMD | Exact when |
+|---|---|---|
+| partial `SUM` → shuffle by key → final `SUM` | `ReduceScatter` | the key's owners are contiguous ranges (`blocks(k)`), and the partials are dense over the key |
+| the same, into a replicated table | `AllReduce` | as above |
+| a replicated table read everywhere | `AllGather`, `Broadcast` | always |
+| a general shuffle | grouped `Send` and `Recv` | always |
+| a halo exchange | grouped `Send` and `Recv` between neighbours; within an NVL72 rack, one-sided writes into fabric-mapped memory | always |
+| host rows | datafusion-distributed's gRPC | always |
+
+Transports come in two kinds, and the device plan is the same under either
+([#21](https://github.com/xqlsystems/xql-runtime/issues/21)):
+- **eager**, one call per exchange, on the partition's queue: NCCL, RCCL
+  and gRPC;
+- **compiled**, lowered into the program of the region that holds the
+  exchange: XLA's collectives on a TPU, through StableHLO with sharding
+  annotations, inside the backend (D2); and on CUDA, perhaps NCCL captured
+  in a CUDA graph.
+
+Rules for the lowering:
+- **A collective reduces a count beside each sum**, so a group no
+  partition reached stays absent, as SQL's `SUM` over no rows gives no row.
+- **Collective libraries are set up once per compiled program**: their
+  communicators for exactly the devices the placement uses, bootstrapped
+  over the control plane, and their buffers registered once, since state
+  is written in place and exchange buffers are allocated once
+  ([#19](https://github.com/xqlsystems/xql-runtime/issues/19)).
+- **Reductions are bucketed and overlapped.** The reductions of one step
+  are fused into grouped calls over flat buffers, and a layer's reduction
+  starts while earlier layers' backward steps still compute
+  ([#18](https://github.com/xqlsystems/xql-runtime/issues/18)).
+- **A host application's communicator can be borrowed.** As a co-processor
+  beside PyTorch, the runtime derives its communicator from one the host
+  exposes (`ncclCommSplit`), rather than starting a second world.
+- **A session that requires reproducibility** (R9) pins the collective
+  library's algorithm, since the order of a reduction depends on it.
+
 **What the schedule holds.** Not the partitioning, which is in SQL. The
 schedule records how partitions map to devices, and which link each
 exchange uses, and a developer may override either (§5.6).
@@ -1126,23 +1193,25 @@ More rules:
   and the tasks that read or update a partition run where it lives, as
   HaLoop schedules iterations (S8.5,
   [#7](https://github.com/xqlsystems/xql-runtime/issues/7)).
-- **Exchanges follow the topology**: a device copy between GPUs in a node,
-  NVLink within a GB200 NVL72 rack, and the network only across racks.
-  `explain()` shows the link each exchange uses
+- **The topology is a graph**, of devices and links with their speeds and
+  tiers, taken from each platform's own discovery (NCCL and NVML, RCCL and
+  AMD's tools, PJRT's device coordinates), not declared. It covers a
+  switched NVLink domain, an AMD node's full mesh, a TPU slice's torus and
+  the networks between domains. Placement embeds the partition grid into
+  it, and `explain()` shows the link each exchange uses
   ([#8](https://github.com/xqlsystems/xql-runtime/issues/8)).
-- **Device data crosses machines without the host**, through a
-  device-aware transport for datafusion-distributed's network nodes, built
-  on NCCL or NVLink peer memory and contributed to datafusion-distributed
-  rather than forked from it
-  ([#6](https://github.com/xqlsystems/xql-runtime/issues/6)). Until then,
-  distribution is correct but slow.
+- **Device data crosses machines without the host** once exchanges are
+  lowered. Until then, distribution is correct but slow.
 - **A distributed run is synchronous**, in the bulk-synchronous model. One
   slow GPU stalls a step, and `report()` names it by worker and device.
   Recovery from a failed worker restarts from the last checkpoint, whose
   shards each worker writes to one Zarr store
   ([#11](https://github.com/xqlsystems/xql-runtime/issues/11)).
-- **The first distribution stays within one rack.** One NVL72 rack holds a
-  whole Samudra run, so every exchange can stay on NVLink.
+- **The first distribution stays within one fast domain where it can.** One
+  NVL72 rack holds a whole Samudra run on NVLink. On an AMD cluster, 36
+  GPUs span five nodes, so placement keeps most halos within a node. On a
+  TPU slice, the grid's tiles map onto the torus's axes, and Samudra's
+  periodic longitude onto its wraparound.
 
 torch-sql's hypothesis H1 is that a planner choosing the partitioning per
 join distributes Samudra better than PyTorch's FSDP (Fully Sharded Data
@@ -1162,7 +1231,7 @@ ctx = SessionContext().with_extensions(
 ctx.sql("""CREATE EXTERNAL TABLE ocean STORED AS ZARR LOCATION 'om4.zarr'
            OPTIONS ('xql.distribution' 'tiles(lat 6, lon 6)')""")    # 36 GPUs
 ctx.sql("""CREATE EXTERNAL TABLE w STORED AS XQL
-           OPTIONS ('xql.distribution' 'hash(k)')""")                # sharded state
+           OPTIONS ('xql.distribution' 'blocks(k)')""")              # sharded state
 
 compiled = Program(ctx, STEP, state={"w": w0}, outputs=["loss"]).lower().compile()
 print(compiled.explain())                      # the exchanges the planner added, and their links
@@ -1227,7 +1296,9 @@ DataFusion, ddx and einfold do (D6):
 |---|---|---|
 | crates.io | `xql-runtime` | programs, table handles, tiers, the schedule, labels, the `Kernel` trait and the counters, with no engine and no GPU library |
 | crates.io | `xql-runtime-datafusion` | the DataFusion extension: the builder method, settings, device memory pools in `RuntimeEnv`, the physical rule, `KernelExec`, `CopyExec`, handle batches, table providers, the codec, and `ddx_ad::Backend`. It pins the DataFusion version xarray-sql, ddx and einfold share. |
-| crates.io | `xql-runtime-cuda` | the CUDA array backend, device memory, streams and kernel launching, with no kernel library as a dependency |
+| crates.io | `xql-runtime-cuda` | the CUDA array backend, device memory, streams, kernel launching and NCCL, with no kernel library as a dependency |
+| crates.io | `xql-runtime-rocm` | the same for AMD, through HIP and RCCL; later |
+| crates.io | `xql-runtime-pjrt` | a TPU backend, lowering regions with their exchanges through PJRT; later |
 | PyPI | `xql-runtime` | one package built with maturin: the Python binding of all of the above, the `XqlRuntime` extension object for `with_extensions`, Python kernels, and extras `[cuda]` and `[mlx]` (Apple silicon only) |
 
 Rules:
@@ -1302,11 +1373,12 @@ stops short.
 rack (§10.5).
 - *Builds:* distribution declared in SQL (#15), partitioning of
   intermediates derived through DataFusion's properties by cost (#16),
-  tiles over several axes (#17), workers built with the runtime's
-  extension, programs whose stages and state persist on
-  workers (#7), topology-aware exchange (#8), and the device-aware
-  transport (#6).
-- *Needs:* spikes 8 and 9.
+  tiles over several axes (#17), exchanges lowered to NCCL with bucketing
+  and overlap (#6, #18), workers built with the runtime's extension,
+  programs whose stages and state persist on workers (#7), and placement
+  over the topology graph (#8).
+- *Needs:* spikes 8 and 9. Spikes 10 and 11 test the same design on AMD
+  and TPU before any backend for them is built.
 - *Done when:* demo 4 trains with its grid split by tile across the GPUs
   of one rack, in one physical plan with network nodes and device nodes,
   gives the same results as on one GPU within §6.3's bound, and its
@@ -1329,6 +1401,8 @@ are the first work for the GPU half days, since they wait on no decision.
 | 7 | Can handle batches carry device data between DataFusion nodes? | Two `KernelExec`s in one plan passing handle batches, through repartitioning and the planner's other rewrites, with a `CopyExec` where rows are needed | Whether §5.3's device plans work as written, or device work must stay inside single nodes |
 | 8 | Can relational collectives match NCCL? ([#12](https://github.com/xqlsystems/xql-runtime/issues/12)) | Reduce one demo 2 step's gradients on 8 GPUs, then 2 nodes: NCCL all-reduce, NCCL reduce-scatter and all-gather, and a shuffle by key with a final sum | Whether the runtime needs a collective node that calls NCCL, or plain shuffles suffice |
 | 9 | Which host suits distributed training, datafusion-distributed or Ballista? ([#13](https://github.com/xqlsystems/xql-runtime/issues/13)) | One distributed demo 2 step on each, CPU first: per-run overhead over 100 runs, and deploying stages once | Whether D7 holds for training, or the distributed contract stays neutral between them (S7.5) |
+| 10 | Does AMD's stack slot in with no runtime changes beyond a backend? ([#22](https://github.com/xqlsystems/xql-runtime/issues/22)) | One distributed demo 2 step on an 8-GPU MI300-class node: HIP, RCCL, a Triton kernel, tiles placed per node | Whether the device-family contract holds for ROCm, and whether AMD needs placement from the start |
+| 11 | Do a region's exchanges lower to one XLA program on a TPU? ([#23](https://github.com/xqlsystems/xql-runtime/issues/23)) | One demo 4 block, with its halo exchange and a gradient reduction, through StableHLO and PJRT on a small slice, against the same in JAX's `shard_map` | Whether a TPU backend fits the runtime's contract |
 
 ---
 
@@ -1352,8 +1426,9 @@ are the first work for the GPU half days, since they wait on no decision.
    and for hand-written kernels.
 6. **The shared allocator.** This draft leans toward CUDA's
    stream-ordered pools (§7). What is open is how each library in a
-   process is configured to draw from them, and what happens when one
-   can't be.
+   process is configured to draw from them, what happens when one can't
+   be, and whether NCCL's registered buffers, which NVLS needs, can come
+   from them ([#19](https://github.com/xqlsystems/xql-runtime/issues/19)).
 7. **The schedule's JSON format**, and how it is versioned as the runtime
    grows (§5.6).
 8. **einfold's node types as an MLIR dialect.** Publishing them that way
@@ -1409,7 +1484,7 @@ are the first work for the GPU half days, since they wait on no decision.
 ### Proposed
 
 <details>
-<summary>Proposals P-A to P-T, for approval</summary>
+<summary>Proposals P-A to P-W, for approval</summary>
 
 P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
 
@@ -1459,5 +1534,11 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
 - **P-T.** Distributed programs persist: stages deployed once, state
   resident on workers, and tasks placed where their partitions live
   (§10.5).
+- **P-U.** Kernel contracts and memory tiers are defined per device
+  family, so that CUDA, ROCm and TPU backends each meet them (§5.2, §5.7).
+- **P-V.** Exchanges are lowered to the hardware's transports, eager or
+  compiled, under datafusion-distributed's control plane (§10.5).
+- **P-W.** The topology is a graph taken from each platform's discovery,
+  and placement embeds partitions into it (§10.5).
 
 </details>

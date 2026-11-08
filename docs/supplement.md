@@ -1036,8 +1036,9 @@ step it puts a host round trip into every gradient reduction and every
 halo exchange: the cost that S1.1 measured on one machine, now multiplied
 by the network. A GB200 NVL72 rack joins its 72 GPUs with NVLink, so
 within a rack the right transport never touches a host. That is why the
-design treats a device-aware transport as part of distribution, not an
-optimization of it ([#6](https://github.com/xqlsystems/xql-runtime/issues/6)),
+design lowers exchanges to the device's own transports as part of
+distribution, not an optimization of it (S7.7,
+[#6](https://github.com/xqlsystems/xql-runtime/issues/6)),
 and why the schedule records the topology: device copies within a node,
 NVLink within a rack, the network across racks
 ([#8](https://github.com/xqlsystems/xql-runtime/issues/8)).
@@ -1103,6 +1104,114 @@ from the last checkpoint, which each worker writes its shards into
 ([#11](https://github.com/xqlsystems/xql-runtime/issues/11)). Whether a
 run can survive a lost worker without a restart, as Ballista's staged mode
 allows for queries, is open.
+
+### S7.7 Lowering exchanges to NCCL and NVLink
+
+The relational layer decides *what* moves: the exchanges in a device plan
+say which blocks go to which partition. The runtime decides *how*, by
+lowering each exchange to the fastest transport that is exact for it
+(design §10.5). Under that sits a standard split of distributed systems:
+datafusion-distributed's gRPC as the *control plane*, carrying plans,
+stages, task assignment, metrics and the bootstrap of each collective
+library, and NCCL and NVLink as the *data plane*, carrying the bytes. The
+SQL is the same, the plan has the same nodes, and `EXPLAIN` shows the
+transport each exchange got.
+
+**Exactness reduces to two conditions.** A shuffle by key between a partial
+and a final `SUM` is a reduce-scatter only if each rank's share of the key
+is a contiguous slice, which is why sharded state is declared `blocks(k)`
+rather than `hash(k)`, and only if each partial is dense over the key, which
+compact arrays are. A third subtlety is absence: in SQL a `SUM` over no rows
+gives no row, where a dense collective gives zero. So the collective reduces
+a count beside each sum, and a group that no partition reached stays absent.
+This is einfold's three cell states (absent, NULL, a value) carried through
+a collective.
+
+**Speed comes from what DDP already does, plus what the design makes easy:**
+- *Persistent communicators and registered buffers.* Communicators are
+  created once per compiled program, and buffers are registered with NCCL
+  once, because state is written in place and exchange buffers are
+  allocated once. Registration enables zero-copy transfers, and on NVL72,
+  NVLS, the NVLink switches' in-network reductions. NVLS wants buffers from
+  CUDA's virtual-memory APIs, which may conflict with stream-ordered pools
+  ([#19](https://github.com/xqlsystems/xql-runtime/issues/19)).
+- *Bucketing.* A step's many small reductions are fused into grouped calls
+  over flat buffers, as DDP's gradient buckets do.
+- *Overlap.* A layer's reduction starts on a communication stream while
+  earlier layers' backward steps still compute, ordered by events
+  ([#18](https://github.com/xqlsystems/xql-runtime/issues/18)).
+- *CUDA graphs.* NCCL calls can be captured, so a compiled step with stable
+  buffers could replay whole, collectives included.
+- *One-sided halos.* Within an NVL72 rack, GB200's fabric memory handles let
+  a GPU map a neighbour's memory across nodes, so a halo can be written
+  straight into the neighbour's buffer by an ordinary bound kernel.
+
+**Composing with what is already in the process.** NCCL finds the topology
+itself, so the runtime asks it rather than keeping a second model. As a
+co-processor beside PyTorch, the runtime derives its communicator from one
+the host exposes (`ncclCommSplit`) rather than starting a second world.
+`ncclCommAbort` on a failed worker fits the design's restart rule (S7.6).
+And since NCCL's reduction order depends on the algorithm it picks, a
+session that requires reproducibility pins the algorithm.
+
+### S7.8 The portability test: AMD and TPU clusters
+
+A design that only fits NVIDIA's hardware would be a CUDA runtime with SQL
+on top. So the design was tested against two other kinds of cluster:
+
+| | NVIDIA GB200 | AMD MI300-class | Google TPU |
+|---|---|---|---|
+| Within a domain | NVLink through NVSwitches: 72 GPUs per rack, any to any | Infinity Fabric: 8 GPUs per node, a full mesh with no switch | ICI: a 2D or 3D torus with wraparound, up to thousands of chips per slice |
+| Between domains | InfiniBand | Ethernet (RoCE) or InfiniBand | the data-centre network, between slices |
+| Collectives | NCCL, called per operation on a stream | RCCL, which implements NCCL's API | compiled by XLA into the program; nothing to call on its own |
+| Raw pointers and queues for users | yes | yes, through HIP | no: buffers belong to PJRT, inside compiled programs |
+| Arrow and DLPack device type | `CUDA`, `CUDA_HOST` | `ROCM`, `ROCM_HOST` | none |
+| Kernel languages | Triton, Gluon, Pallas, cuTile Rust, CUTLASS | Triton, HIP, CubeCL | Pallas (Mosaic TPU), inside XLA programs |
+
+**The relational core passed unchanged.** Declared partitioning,
+exchanges in the plan and collectives as relational operators assume no
+topology, so they hold on all three. A torus suits domain decomposition
+especially well: torus networks were built for stencils, every halo
+exchange of a grid mapped onto the torus goes to a direct neighbour, and
+Samudra's periodic longitude, which wraps around the globe, maps onto the
+torus's own wraparound.
+
+**AMD mapped almost one to one.** HIP mirrors CUDA's contexts, streams,
+events and stream-ordered allocator, RCCL speaks NCCL's API, and Arrow and
+DLPack have ROCm device types. What it tested was the topology: with no
+72-GPU domain, Samudra's 36 GPUs span five nodes, so the design's "first
+distribution stays within one rack" turned out to be NVIDIA-specific, and
+placement has to keep most halos within a node from the start. With no
+switch, there are no in-switch reductions; rings and trees do instead.
+
+**The TPU found four places where the device layer was CUDA-shaped:**
+1. **The kernel contract** handed kernels raw pointers, contexts and
+   streams, which TPUs don't give users. It is now defined per device
+   family: DLPack where a device has a type, the backend's native buffers
+   otherwise, an execution context and queue rather than a CUDA context and
+   stream, and bindings that are either callables or functions the backend
+   compiles in
+   ([#20](https://github.com/xqlsystems/xql-runtime/issues/20)).
+2. **Collectives were assumed callable.** On a TPU they exist only inside a
+   compiled program, and speed comes from XLA scheduling them across the
+   whole step. So transports are either eager or compiled, and regions may
+   contain exchanges, which a compiled transport lowers with the region's
+   computation. B-0, one node at a time, is therefore a poor fit for TPUs
+   ([#21](https://github.com/xqlsystems/xql-runtime/issues/21)).
+3. **Tiers were named by Arrow device types**, and a TPU has none. They are
+   now named by device family, and a TPU's tables cross into DataFusion only
+   through the host.
+4. **The topology was a list of tiers.** It is now a graph, covering
+   switched domains, full meshes and tori, taken from each platform's own
+   discovery, with placement as an embedding of the partition grid into it
+   ([#8](https://github.com/xqlsystems/xql-runtime/issues/8)).
+
+None of these changed the design's shape, which is why it passed: the
+generalizations sit in the backends, in how an exchange is lowered, how a
+kernel binds and how partitions are placed. Spikes 10 and 11 test the
+prediction on real AMD and TPU hardware
+([#22](https://github.com/xqlsystems/xql-runtime/issues/22),
+[#23](https://github.com/xqlsystems/xql-runtime/issues/23)).
 
 ---
 
