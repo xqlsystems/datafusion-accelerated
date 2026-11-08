@@ -106,6 +106,11 @@ docs, docstrings, issues, PR descriptions).
   through an installer or a subclass of `SessionContext`.
 - **Rust and Python** (principle R12). Build every capability in Rust and
   bind it to Python. A Rust program must never need Python.
+- **The core delegates to hardware** (principle R13). The core depends on
+  no hardware or vendor library: no CUDA, ROCm, Metal, PJRT, NCCL or
+  libcudf. Every integration is a separate crate or Python package that
+  implements the core's interfaces (design §5.8), and the core's tests run
+  on its CPU reference implementations, with no GPU.
 - **No hidden decisions** (principle R10). Every physical choice the
   runtime makes goes in the schedule, with who made it. An override is
   binding, and one the runtime can't obey is an error, never ignored.

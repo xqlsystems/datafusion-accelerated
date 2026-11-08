@@ -589,9 +589,11 @@ That precedent is also why the goal widened with the name (design D10). An
 accelerator for DataFusion that sped up only array work would promise
 more than it gives, since a DataFusion user expects joins and aggregates
 to run faster too. The kernel contract already allows any node to be
-bound, so relational operators come in as bindings to libcudf, with
-DataFusion's own operators as their specification. Array work still comes
-first.
+bound, so relational operators come in through integrations, the first
+over libcudf, with DataFusion's own operators as their specification. The
+core integrates no hardware itself (design D13): a library like libcudf
+may be replaced by its successor, and only its integration crate would
+change. Array work still comes first.
 
 Three facts checked when the name was chosen:
 - `datafusion-accelerated` was free on crates.io and PyPI;

@@ -87,6 +87,12 @@ run to run (§5.4).
 - **Rust and Python.** Everything the runtime offers works from both, as
   DataFusion does, so that accelerated ML code is as easy to write in Rust
   as in Python (R12).
+- **It delegates to hardware.** The runtime is an interstitial layer
+  between DataFusion and accelerator primitives. It makes CUDA, ROCm,
+  Metal, TPUs and the libraries built on them trivially easy to integrate,
+  and integrates none of them itself. Each integration is a separate crate
+  or Python package, mixed in as an extension of its own, so that the
+  runtime stays relevant whichever libraries come and go (R13, §5.8).
 
 ---
 
@@ -295,6 +301,8 @@ against each.
   checked against DataFusion's (§5.7, S2.1).
 - **Differentiation, plan rewriting, or drawing a program's step
   boundaries.** Those are ddx's and einfold's (§6.4).
+- **Any particular hardware, in the core.** Integrations with CUDA, ROCm,
+  Metal, PJRT, NCCL or libcudf are separate crates and packages (§5.8).
 - **A kernel compiler, a memory allocator or a communication library.**
   Kernels come from Triton, Gluon, Pallas, cuTile Rust, CUTLASS, XLA,
   `torch.compile`, MLX, CubeCL or a developer's own code. GPU memory comes from a shared
@@ -359,6 +367,11 @@ against each.
 - **R12. Rust and Python, one design.** Every capability is in Rust, and
   every one is reachable from Python. Kernels may be written in either,
   and a Rust program needs no Python (S6.6).
+- **R13. The core delegates to hardware.** The core defines interfaces and
+  the DataFusion integration, and depends on no hardware or vendor
+  library. Every integration knows the core; the core knows no
+  integration. Replacing one, as libcudf might be by a successor, changes
+  only its own crate (§5.8).
 
 ---
 
@@ -378,7 +391,8 @@ let state = SessionStateBuilder::new()
     .with_default_features()
     .with_ddx()                              // grad, vjp and jvp in SQL (§10.2)
     .with_einfold()                          // einfold's detection (§10.3)
-    .with_accelerator(RuntimeOptions::new().device("cuda:0"))
+    .with_accelerator(AcceleratorOptions::new())
+    .with_accelerated_cuda()                 // an integration, mixed in (§5.8)
     .build();
 let ctx = SessionContext::new_with_state(state);
 ```
@@ -387,7 +401,7 @@ In Python, each project provides an extension object for
 `SessionContext.with_extensions`, as einfold's `EinFold` already is:
 
 ```python
-ctx = SessionContext().with_extensions(Ddx(), EinFold(), Accelerator(devices=["cuda:0"]))
+ctx = SessionContext().with_extensions(Ddx(), EinFold(), Accelerator(), Cuda(devices="local"))
 ```
 
 Rules:
@@ -472,7 +486,7 @@ Rules:
   `CopyExec` wherever a handle batch would reach one of DataFusion's
   operators (S6.5).
 - **Partitions map to the hardware.** On one GPU, a node's partitions run
-  on separate CUDA streams. Across GPUs in one machine, each partition
+  on separate queues, such as CUDA or HIP streams. Across GPUs in one machine, each partition
   runs on one device.
 - **`EXPLAIN` shows the device plan**, with each runtime node's device,
   layout, kernel, and who chose it: a default, einfold or the developer.
@@ -633,7 +647,7 @@ Python kernel's compile hook is passed as `prepare=`, beside the kernel.
 <summary>A Triton kernel and a Pallas kernel, bound by label</summary>
 
 ```python
-runtime = Accelerator(devices=["cuda:0"])
+runtime = Accelerator()
 
 @runtime.kernel("predict", assumes=["complete", "no_nulls"])
 def predict(args):                                     # Triton or Gluon
@@ -690,7 +704,7 @@ impl Kernel for Scale {
     }
 }
 
-builder.with_accelerator(RuntimeOptions::new().device("cuda:0").kernel("scale", Scale))
+builder.with_accelerator(AcceleratorOptions::new().kernel("scale", Scale)).with_accelerated_cuda()
 ```
 
 `Borrowed` is a few lines that implement cuTile's trait for foreign
@@ -717,6 +731,55 @@ Rules:
   tested against its SQL, which is weaker (S5.3). So checking mode samples
   hand-written kernels more often, their runs are counted separately, and
   a session may refuse them in strict mode.
+
+### 5.8 Integrations
+
+The core defines what each kind of hardware or library must provide, and
+implements none of them for any hardware (R13). Every integration is a
+separate crate in Rust, or package in Python, that registers itself with
+the accelerator as a DataFusion extension of its own, mixed in beside it.
+
+| Interface | What it provides | Integrations, for example |
+|---|---|---|
+| `Device` | memory tiers and their shared allocator, queues and events, and the execution context of §5.7 | CUDA, ROCm, Metal, PJRT for TPUs |
+| `ArrayBackend` | runs einfold's nodes on arrays | NumPy (the reference), MLX, CuPy, JAX, PyTorch |
+| `KernelLibrary` | kernels bound by node type, such as DataFusion's relational operators | libcudf, and whatever succeeds it |
+| `Kernel` | one kernel bound by label (§5.7) | Triton, Gluon, Pallas, cuTile Rust, a developer's own |
+| `Transport` | the collective capabilities it implements, eager or compiled (§10.5) | NCCL, RCCL, XLA's collectives, gRPC |
+| `Topology` | devices and links, as discovered | NVML and NCCL, AMD's tools, PJRT |
+
+In Rust, each integration adds a builder method, and in Python an
+extension object:
+
+```rust
+let state = SessionStateBuilder::new()
+    .with_default_features()
+    .with_accelerator(AcceleratorOptions::new())
+    .with_accelerated_cuda()       // datafusion-accelerated-cuda: devices, memory, streams
+    .with_accelerated_nccl()       // datafusion-accelerated-nccl: a transport
+    .with_accelerated_cudf()       // datafusion-accelerated-cudf: relational kernels
+    .build();
+```
+
+```python
+ctx = SessionContext().with_extensions(Accelerator(), Cuda(devices="local"), Nccl(), Cudf())
+```
+
+Rules:
+- **The core runs with no accelerator.** It ships a CPU reference
+  implementation of every interface, and its whole test suite runs on it,
+  in CI with no GPU.
+- **Integrations declare their capabilities**: the tiers, collectives,
+  node types and precisions they support. The planner uses only what is
+  declared, and a declared capability that fails at run time is a decline
+  (R8).
+- **Integrations are pinned by the user's project**, not by the core. The
+  core pins only DataFusion, ddx and einfold.
+- **An integration in Python alone needs no Rust build**, as an MLX array
+  backend or a set of Triton kernels doesn't.
+- **This repository may host some integrations**, as separate crates, for
+  convenience and continuous integration. That is a choice of where code
+  lives, not a dependency of the core.
 
 ---
 
@@ -911,9 +974,10 @@ tensor columns, stays open through spike 1 (S2.3).
   The schedule records the choice, and a developer can override it (§5.6).
 - **The runtime allocates no GPU memory of its own.** It draws from a
   shared allocator, so that it shares a GPU with PyTorch, JAX and kernel
-  libraries instead of competing with them for it (S4.2). This draft leans
-  toward CUDA's stream-ordered pools as the shared one, since RMM, PyTorch
-  and kernel libraries such as cuTile Rust can each draw from them (§13,
+  libraries instead of competing with them for it (S4.2). Which allocator
+  is shared is each device integration's choice (§5.8). For CUDA, this
+  draft leans toward CUDA's stream-ordered pools, since RMM, PyTorch and
+  kernel libraries such as cuTile Rust can each draw from them (§13,
   question 6).
 - **State has room for two copies** while a step runs, unless the program
   donates: once the validation flag has been read, each state update writes
@@ -978,8 +1042,8 @@ from ddxdb.datafusion import Ddx
 from einfold.datafusion import EinFold
 from datafusion_accelerated import Accelerator, Program
 
-runtime = Accelerator(devices=["cuda:0"])
-ctx = SessionContext().with_extensions(Ddx(), EinFold(), runtime)
+runtime = Accelerator()
+ctx = SessionContext().with_extensions(Ddx(), EinFold(), runtime, Cuda(devices="local"))
 ctx.sql("SET accelerated.strict = true")            # declines are errors (R8)
 ctx.register_table("features", features)
 ctx.register_table("target", target)
@@ -1013,7 +1077,8 @@ let ctx = SessionContext::new_with_state(
         .with_default_features()
         .with_ddx()
         .with_einfold()
-        .with_accelerator(RuntimeOptions::new().device("cuda:0").strict(true))
+        .with_accelerator(AcceleratorOptions::new().strict(true))
+        .with_accelerated_cuda()
         .build(),
 );
 let lowered = Program::new(&ctx, STEP).state("w", w0).output("loss").lower().await?;
@@ -1160,21 +1225,23 @@ and `explain()` shows them:
 - a halo exchange is the rows of a convolution's join that cross a tile's
   edge.
 
-**Exchanges are lowered to the hardware's transports** (S7.7). The
-relational layer decides *what* moves; the runtime decides *how*. Under
-datafusion-distributed's gRPC as the *control plane* (plans, stages, task
-assignment, metrics, and the setup of each collective library), the
-*data plane* is the device's own
+**Exchanges are lowered to collective capabilities** (S7.7). The
+relational layer decides *what* moves. The core recognizes each
+exchange's pattern as a *capability*, and the session's transport
+integrations (§5.8) decide *how*, each declaring the capabilities it
+implements. Under datafusion-distributed's gRPC as the *control plane*
+(plans, stages, task assignment, metrics, and the setup of each
+transport), the *data plane* is the device's own
 ([#6](https://github.com/xqlsystems/datafusion-accelerated/issues/6)):
 
-| Exchange in the plan | Eager transport: NCCL, or RCCL on AMD | Exact when |
-|---|---|---|
-| partial `SUM` → shuffle by key → final `SUM` | `ReduceScatter` | the key's owners are contiguous ranges (`blocks(k)`), and the partials are dense over the key |
-| the same, into a replicated table | `AllReduce` | as above |
-| a replicated table read everywhere | `AllGather`, `Broadcast` | always |
-| a general shuffle | grouped `Send` and `Recv` | always |
-| a halo exchange | grouped `Send` and `Recv` between neighbours; within an NVL72 rack, one-sided writes into fabric-mapped memory | always |
-| host rows | datafusion-distributed's gRPC | always |
+| Exchange in the plan | Capability | Exact when | Implemented by, for example |
+|---|---|---|---|
+| partial `SUM` → shuffle by key → final `SUM` | reduce-scatter | the key's owners are contiguous ranges (`blocks(k)`), and the partials are dense over the key | NCCL, RCCL, XLA |
+| the same, into a replicated table | all-reduce | as above | NCCL, RCCL, XLA |
+| a replicated table read everywhere | all-gather, broadcast | always | NCCL, RCCL, XLA |
+| a general shuffle | all-to-all, as grouped sends and receives | always | NCCL, RCCL, XLA |
+| a halo exchange | neighbour exchange | always | NCCL's grouped sends; within an NVL72 rack, a kernel writing into fabric-mapped memory |
+| host rows | host transfer | always | datafusion-distributed's gRPC, built in |
 
 Transports come in two kinds, and the device plan is the same under either
 ([#21](https://github.com/xqlsystems/datafusion-accelerated/issues/21)):
@@ -1198,8 +1265,9 @@ Rules for the lowering:
   starts while earlier layers' backward steps still compute
   ([#18](https://github.com/xqlsystems/datafusion-accelerated/issues/18)).
 - **A host application's communicator can be borrowed.** As a co-processor
-  beside PyTorch, the runtime derives its communicator from one the host
-  exposes (`ncclCommSplit`), rather than starting a second world.
+  beside PyTorch, a transport derives its communicator from one the host
+  exposes (for NCCL, `ncclCommSplit`), rather than starting a second
+  world.
 - **A session that requires reproducibility** (R9) pins the collective
   library's algorithm, since the order of a reduction depends on it.
 
@@ -1253,7 +1321,7 @@ join (spike 8, S8.3).
 ```python
 ctx = SessionContext().with_extensions(
     Ddx(), EinFold(),
-    Accelerator(devices="local"),               # on each worker: that node's GPUs
+    Accelerator(), Cuda(devices="local"),       # on each worker: that node's GPUs
     Distributed(workers=SlurmWorkers()),       # proposed Python binding (#10)
 )
 ctx.sql("""CREATE EXTERNAL TABLE ocean STORED AS ZARR LOCATION 'om4.zarr'
@@ -1318,23 +1386,34 @@ Each piece of the code that exists today has a home.
 ### 12.1 Packages
 
 The project is `datafusion-accelerated` (D3, S4.3). It straddles Rust and
-Python as DataFusion, ddx and einfold do (D6):
+Python as DataFusion, ddx and einfold do (D6). The core is one crate and
+one Python package. Every integration is a crate or package of its own
+(R13, §5.8):
 
-| Channel | Package | Contents |
+| Package | What it is | Depends on |
 |---|---|---|
-| crates.io | `datafusion-accelerated` | the DataFusion extension: the builder method, settings, device memory pools in `RuntimeEnv`, the physical rules, `KernelExec`, `CopyExec`, handle batches, table providers and the codec; programs, table handles, tiers, the schedule, labels, the `Kernel` trait and the counters; and `ddx_ad::Backend`. It pins the DataFusion version xarray-sql, ddx and einfold share. |
-| crates.io | `datafusion-accelerated-cuda` | the CUDA array backend, device memory, streams, kernel launching and NCCL, with no kernel library as a dependency |
-| crates.io | `datafusion-accelerated-rocm` | the same for AMD, through HIP and RCCL; later |
-| crates.io | `datafusion-accelerated-pjrt` | a TPU backend, lowering regions with their exchanges through PJRT; later |
-| PyPI | `datafusion-accelerated` | one package built with maturin, imported as `datafusion_accelerated`: the Python binding of all of the above, the `Accelerator` extension object for `with_extensions`, Python kernels, and extras `[cuda]` and `[mlx]` (Apple silicon only) |
+| `datafusion-accelerated` | the core: the DataFusion extension (builder method, settings, device memory pools in `RuntimeEnv`, physical rules, `KernelExec`, `CopyExec`, handle batches, table providers, the codec), programs, table handles, tiers, the schedule, labels, the interfaces of §5.8 with their CPU reference implementations, the counters, and `ddx_ad::Backend` | DataFusion, ddx, einfold; no hardware library |
+| `datafusion-accelerated-cuda` | a `Device` for CUDA | CUDA bindings |
+| `datafusion-accelerated-nccl` | a `Transport` over NCCL | NCCL |
+| `datafusion-accelerated-cudf` | a `KernelLibrary` of relational operators over libcudf | libcudf |
+| `datafusion-accelerated-rocm`, `-rccl` | the same for AMD; later | HIP, RCCL |
+| `datafusion-accelerated-metal` | a `Device` for Apple's GPUs, with MLX as an array backend; later | Metal, MLX |
+| `datafusion-accelerated-pjrt` | a `Device`, and a compiled `Transport`, for TPUs; later | PJRT |
+
+Each is published to crates.io, and to PyPI where it has a Python side,
+built with maturin, as `datafusion_accelerated` and
+`datafusion_accelerated_cuda` and so on. The core package offers extras
+that only install integrations, such as `datafusion-accelerated[cuda]`.
 
 Rules:
-- **The base install has no GPU library** (R6).
-- **DataFusion, ddx and einfold are pinned exactly.**
-- **Python kernels and array backends are Python code**, behind a Python
-  protocol, so that adding one never needs a Rust build.
-- **Dependencies point toward the runtime.** Frontends depend on it only
-  through an extra, such as `xarray-sql[accelerated]`.
+- **The core installs no GPU library** (R6, R13).
+- **The core pins DataFusion, ddx and einfold exactly.** Integrations pin
+  their own libraries.
+- **Python integrations, kernels and array backends are Python code**,
+  behind Python protocols, so that adding one never needs a Rust build.
+- **Dependencies point toward the core.** Integrations depend on it, and
+  frontends depend on it only through an extra, such as
+  `xarray-sql[accelerated]`.
 - **Linux on ARM wheels from the first release**, for the Beta cluster's
   Grace CPUs.
 
@@ -1367,9 +1446,11 @@ on the cloud or on the Beta cluster, are available half a day a week.
   table unchanged.
 
 **M2. A GPU, with B-0** (D4).
-- *Builds:* `KernelExec`, handle batches, the CUDA array backend for
-  einfold's nodes with NumPy on the CPU as the reference, memory from a
-  shared allocator, and kernels bound by label from Python and from Rust.
+- *Builds:* `KernelExec`, handle batches, and the interfaces of §5.8, with
+  the first integrations as separate crates: a CUDA `Device` and an array
+  backend for einfold's nodes, with NumPy on the CPU as the reference;
+  memory from a shared allocator; and kernels bound by label from Python
+  and from Rust.
   MLX follows, or comes first if the contributor's Apple work gets there
   sooner.
 - *Needs:* einfold's B-0 interface and fact table, and spikes 6 and 7.
@@ -1412,12 +1493,14 @@ rack (§10.5).
   gradient reduction runs within a stated factor of NCCL's.
 
 **M8. Relational operators on devices.**
-- *Builds:* bindings by node type for DataFusion's hash join, hash
-  aggregate, filter and sort, to libcudf, over handle batches.
+- *Builds:* `KernelLibrary` bindings by node type for DataFusion's hash
+  join, hash aggregate, filter and sort, over handle batches, with the
+  first library integrated as a separate crate over libcudf.
 - *Needs:* spike 12.
 - *Done when:* demo 4's data path and xarray-sql's geospatial queries run
   their joins and aggregates on a GPU in strict mode, matching DataFusion's
-  results, with the time in device nodes reported.
+  results, with the time in device nodes reported, and with no change to
+  the core when the libcudf integration is swapped for a CPU stand-in.
 
 M2 is the critical path. It waits on spikes 6 and 7, and on Alex's
 decision on einfold's roadmap. Spikes 2 and 3, which need NVIDIA hardware,
@@ -1520,9 +1603,9 @@ are the first work for the GPU half days, since they wait on no decision.
 - **D9** (Alex, 2026-11-07). Partitioning is declared in SQL, not in the
   schedule (§10.5).
 - **D10** (Alex, 2026-11-07). The goal widens: any DataFusion physical node
-  may have a device implementation, relational operators included, as
-  bindings to libraries such as libcudf. Array work comes first (§3.1,
-  §5.7, M8).
+  may have a device implementation, relational operators included. The
+  implementations come from integrations (D13), such as one over libcudf.
+  Array work comes first (§3.1, §5.7, M8).
 - **D11** (Alex, 2026-11-07). Executing on devices for DataFusion,
   relational operators included, lives here rather than in einfold, which
   keeps recognizing structure, and its paths to other engines' GPU hosts.
@@ -1530,6 +1613,12 @@ are the first work for the GPU half days, since they wait on no decision.
 - **D12** (Alex, 2026-11-07). The project lives under xqlsystems for now.
   A home beside datafusion-distributed, under datafusion-contrib, is a
   later conversation.
+- **D13** (Alex, 2026-11-07). DataFusion Accelerated is an interstitial
+  layer between DataFusion and accelerator primitives. It makes hardware
+  trivially easy to integrate and integrates none itself: every
+  integration, with CUDA, ROCm, Metal, TPUs or a library such as libcudf,
+  is a separate crate or package, mixed in as its own extension, so the
+  core's goal outlives any of them (R13, §5.8).
 
 ### Proposed
 

@@ -12,6 +12,11 @@ that:
   [datafusion-distributed](https://github.com/datafusion-contrib/datafusion-distributed)
   to go beyond one machine.
 
+It's an interstitial layer: it makes CUDA, ROCm, Metal, TPUs and the
+libraries built on them easy to integrate, and integrates none of them
+itself. Each integration is a separate crate or package, mixed in as an
+extension of its own.
+
 Its first user is [XQL](https://github.com/xqlsystems), whose projects
 compute on scientific arrays with databases and train models such as the
 ocean emulator Samudra in SQL.
