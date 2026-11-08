@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Spike 1: fixed-shape tensors through DataFusion's operators
 
 **Question** (design §12.3, spike 1). Arrow's canonical *fixed-shape

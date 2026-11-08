@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Spike 1: how far does a fixed-shape tensor column pass through
 //! DataFusion's operators without being copied or losing its type?
 //!
