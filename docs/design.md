@@ -1,9 +1,9 @@
 # DataFusion Accelerated: design
 
 _author_: Alex Merose
-_co-authors_: 🔥 Claude (torch-sql) and 🌀 Claude (xarray-sql), via Claude Code
+_co-authors_: ⚡ Claude (datafusion-accelerated), formerly 🔥 Claude (torch-sql), and 🌀 Claude (xarray-sql), via Claude Code
 _reviewers_: 🪭 Claude (einfold) and ∂ Claude (ddx). Their reviews of v1.1 are in [reviews/](reviews/).
-_status_: Draft v1.6, for approval. Nothing is built. Collapsed sections (▸) hold background and detail.
+_status_: Draft v1.7, for approval. Nothing is built. Collapsed sections (▸) hold background and detail.
 _last updated_: 2026-11-07
 _supplement_: [supplement.md](supplement.md), with the evidence, the alternatives considered and the reasoning behind each rule. Citations such as "(S1.1)" point there. S6 compares the design with JAX, PyTorch and DataFusion, and S7 covers distributed training.
 _origin_: [xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307)
@@ -12,87 +12,100 @@ _origin_: [xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307)
 
 ## 1. What we're building
 
+**DataFusion Accelerated** (`datafusion-accelerated`) runs
+[Apache DataFusion](https://datafusion.apache.org/)'s physical plans on GPUs
+and other accelerators. DataFusion is a SQL query engine in Rust, designed
+to be extended (§2.2), and DataFusion Accelerated is one of its
+extensions. Any node of a physical plan, whether one of DataFusion's
+relational operators or the array work in a query, can have a device
+implementation, checked against DataFusion's own. This doc calls it *the
+runtime* for short.
+
+It is an interstitial layer. Hardware, and the libraries built on it, come
+in through *integrations*, each a separate crate or package mixed in as
+an extension of its own: CUDA, ROCm, Metal and TPUs; NCCL; libcudf; and
+whatever replaces them (§5.8). The runtime integrates none of them itself,
+so its job outlives every one.
+
+DataFusion Accelerated is not part of the Apache DataFusion project, as
+datafusion-distributed isn't. "Apache DataFusion" is a trademark of the
+Apache Software Foundation.
+
+### 1.1 Its shape
+
+The runtime extends DataFusion the way
+[datafusion-distributed](https://github.com/datafusion-contrib/datafusion-distributed)
+does. datafusion-distributed adds distributed execution to an ordinary
+DataFusion session with one call on its builder, and a distributed plan is
+an ordinary physical plan with a few extra nodes that move Arrow data
+between machines. The runtime adds devices the same way: one call on the
+builder, and a device plan is an ordinary physical plan with a few extra
+nodes that move data between memory tiers and run work on a device (§5).
+Nothing a DataFusion user knows changes, and the two extensions compose: a
+plan can have network nodes and device nodes at once (§10.5).
+
+It is to DataFusion what Spark RAPIDS is to Spark and Sirius to DuckDB:
+operators swapped for device ones, with explicit transitions between them,
+and the engine's own operators as the fallback and the reference (S4.3).
+
+It adds one thing DataFusion has no layer for: a *program*, several
+queries run as one unit, many times, with state that persists from run to
+run, as a training step or an iterative algorithm needs (§5.4).
+
+### 1.2 Why
+
+DataFusion can't run a plan on a GPU today. It has no device memory to
+keep tables in between operators or between runs, and no way to hand a
+node to a device library and check the answer. The measurements of its
+first user (§1.4) show what matters once it can: how data is held and moved
+between queries, more than planning or arithmetic (S1). On a
+123.6M-parameter GPT written in SQL, sending matrix products to a GPU
+changed nothing, while holding intermediates as dense arrays made the step
+67 times faster. Keeping weights and optimizer state on the GPU then took a
+smaller model's step from 2.02 s to 101 ms, against PyTorch's 27 ms
+(S1.1). Without a shared layer, each project builds this for itself:
+xarray-sql's experiments built three executors and a training session
+inside xarray-sql, and torch-sql's optimizer step runs a query per tensor
+(S1.3).
+
+### 1.3 Its values
+
+- **One job, and delegation.** The runtime is the layer between
+  DataFusion's plans and accelerator primitives. It builds no compiler,
+  allocator, communication library or kernel library of its own, and
+  makes the ones that exist trivially easy to integrate. It is one
+  component of a composable data system, a *deconstructed tensor runtime*
+  in the sense of Wes McKinney's deconstructed database (R11, R13, S5.4).
+- **Every control within reach.** The SQL says what a program computes.
+  Every physical choice the runtime makes, such as where a table lives and
+  which kernel computes it, is visible and can be overridden, so the
+  runtime is never a compiler its users have to outsmart (R10, S5.1).
+- **Rust and Python.** Everything the runtime offers works from both, as
+  DataFusion does, so that accelerated code is as easy to write in Rust as
+  in Python (R12).
+
+### 1.4 Its first user: XQL
+
 **XQL** is a group of open-source projects, under the
 [xqlsystems](https://github.com/xqlsystems) organization, for computing on
 scientific arrays with databases. An N-dimensional array becomes a table in
 *long format*: one row per element, with one column per dimension holding
 the element's position and one column holding its value. Array programs
 then become SQL queries, and a database's query optimizer plans them.
-
-XQL is organized as layers, and each layer is a separate, optional project:
+XQL is organized as layers, each a separate, optional project, and
+DataFusion Accelerated is its runtime layer:
 
 ```
 frontends:   SQL text · xarray (xarray-sql) · PyTorch (torch-sql)
 transforms:  ddx (differentiation) · einfold (plan rewrites)
-runtime:     execution, device residency, kernels, memory, scheduling, distribution
+runtime:     DataFusion Accelerated: execution, device residency, kernels, memory, scheduling, distribution
 engines:     DataFusion · DuckDB · GPU engines (Sirius, GQE) · any ADBC database
 ```
 
-§2 introduces each project. This doc specifies the missing layer, which
-turns out to be missing from DataFusion's ecosystem as a whole:
-**DataFusion Accelerated** (`datafusion-accelerated`), which runs
-DataFusion's physical plans on GPUs and other devices. Any physical node,
-whether einfold's array work or one of DataFusion's own relational
-operators, can have a device implementation, checked against DataFusion's
-own. XQL is its first user, and training XQL's models is what shaped it.
-This doc calls it *the runtime* for short.
-
-DataFusion Accelerated is not part of the Apache DataFusion project, as
-datafusion-distributed isn't. "Apache DataFusion" is a trademark of the
-Apache Software Foundation.
-
-**Why.** How data is held and moved between queries, more than planning
-or arithmetic, decides how fast XQL runs a training step (S1). On a
-123.6M-parameter GPT, sending matrix products to a GPU changed nothing,
-while holding intermediates as dense arrays made the step 67 times
-faster. Keeping weights and optimizer state on the GPU then took a
-smaller model's step from 2.02 s to 101 ms, against PyTorch's 27 ms
-(S1.1). Today each frontend builds this for itself: xarray-sql's
-experiments built three executors and a training session inside
-xarray-sql, and torch-sql's optimizer step runs a query per tensor (S1.3).
-
-**Its shape: a DataFusion extension.** The runtime extends
-[DataFusion](https://datafusion.apache.org/) the way
-[datafusion-distributed](https://github.com/datafusion-contrib/datafusion-distributed)
-does. datafusion-distributed adds distributed execution to an ordinary
-DataFusion session with one call on its builder, and a distributed plan is
-an ordinary DataFusion physical plan with a few extra nodes that move
-Arrow data between machines. The runtime adds devices the same way: one
-call on the session's builder, and a device plan is an ordinary physical
-plan with a few extra nodes that move data between memory tiers and run
-work on a device (§5). Nothing a DataFusion user knows changes, and the
-two extensions compose: a plan can have network nodes and device nodes at
-once (§10.5).
-
-It is the accelerator for DataFusion that Spark RAPIDS is for Spark and
-Sirius is for DuckDB: operators swapped for device ones, with explicit
-transitions between them, and the engine's own operators as the fallback
-and the reference (S4.3).
-
-The runtime adds one thing DataFusion has no layer for: a *program*,
-several queries run as one training step, with state that persists from
-run to run (§5.4).
-
-**Its values.**
-- **One job.** The runtime is the bridge between relational plans and
-  array hardware. It builds no compiler, allocator or communication
-  library of its own, and meets the systems that do through DataFusion's
-  extension points and standard formats. It is one component of a
-  composable data system, a *deconstructed tensor runtime* in the sense of
-  Wes McKinney's deconstructed database (R11, S5.4).
-- **Every control within reach.** The SQL says what a program computes.
-  Every physical choice the runtime makes, such as where a table lives and
-  which kernel computes it, is visible and can be overridden, so the
-  runtime is never a compiler its users have to outsmart (R10, S5.1).
-- **Rust and Python.** Everything the runtime offers works from both, as
-  DataFusion does, so that accelerated ML code is as easy to write in Rust
-  as in Python (R12).
-- **It delegates to hardware.** The runtime is an interstitial layer
-  between DataFusion and accelerator primitives. It makes CUDA, ROCm,
-  Metal, TPUs and the libraries built on them trivially easy to integrate,
-  and integrates none of them itself. Each integration is a separate crate
-  or Python package, mixed in as an extension of its own, so that the
-  runtime stays relevant whichever libraries come and go (R13, §5.8).
+Training XQL's models, the ocean emulator Samudra first (§2.6), shaped the
+design, and its milestones are measured on XQL's programs (§12.2). But XQL
+is a user, not a dependency: ddx and einfold come in through integrations,
+as hardware does (§5.8), and a DataFusion user with neither gets the rest.
 
 ---
 
@@ -105,7 +118,7 @@ ones you need.
 <summary><b>2.1 Formats and terms</b>: Arrow, ADBC, Substrait, DLPack, Zarr, CTEs, compact arrays</summary>
 
 - **[Apache Arrow](https://arrow.apache.org/)** is a columnar memory
-  format, which every XQL engine reads and writes. Its *PyCapsule
+  format, which DataFusion and every XQL engine read and write. Its *PyCapsule
   interface* hands Arrow data between Python libraries without copying,
   and its [*C Device Data Interface*](https://arrow.apache.org/docs/format/CDeviceDataInterface.html)
   does the same for GPU memory, naming each kind of memory with a device
@@ -270,8 +283,9 @@ against each.
 
 ### 3.1 Goals
 
-1. **Run programs from any XQL frontend or transform** through DataFusion:
-   ddx's gradient programs, frontends' training steps, and plain queries.
+1. **Run DataFusion's plans on devices**, for any DataFusion user: plain
+   queries, and programs, such as ddx's gradient programs and XQL's
+   training steps.
 2. **Own tables and their memory.** Every table the runtime holds has an
    owner, a lifetime and a placement.
 3. **Keep data where the computation is**, between operators and between
@@ -291,6 +305,9 @@ against each.
    kernels of their own bound to any part of a program, and a report of
    what each run cost.
 9. **Work the same from Rust and Python.**
+10. **Make hardware trivially easy to integrate**, through integrations that
+    implement the core's interfaces (§5.8), and integrate none in the
+    core.
 
 ### 3.2 Non-goals
 
@@ -305,8 +322,9 @@ against each.
   Metal, PJRT, NCCL or libcudf are separate crates and packages (§5.8).
 - **A kernel compiler, a memory allocator or a communication library.**
   Kernels come from Triton, Gluon, Pallas, cuTile Rust, CUTLASS, XLA,
-  `torch.compile`, MLX, CubeCL or a developer's own code. GPU memory comes from a shared
-  allocator, and data moves between GPUs through NCCL.
+  `torch.compile`, MLX, CubeCL or a developer's own code. GPU memory comes
+  from a shared allocator, and data moves between GPUs through a transport
+  integration such as NCCL.
 - **A distributed planner.** datafusion-distributed is one (§10.5).
 - **Its own way of assembling a session.** The runtime attaches through
   DataFusion's own mechanisms, and adds no installer of its own (§5.1).
@@ -379,11 +397,12 @@ against each.
 
 ### 5.1 The session
 
-A runtime session is a DataFusion session with the runtime's extension
-added. Each XQL project attaches the same way, and the runtime adds no
-installer of its own (S6.7).
+An accelerated session is a DataFusion session with the runtime's
+extension added. Every extension attaches the same way, the runtime, its
+integrations and XQL's ddx and einfold alike, and none has an installer of
+its own (S6.7).
 
-In Rust, each project adds a method to `SessionStateBuilder`, as
+In Rust, each adds a method to `SessionStateBuilder`, as
 datafusion-distributed's `.with_distributed_planner()` does:
 
 ```rust
@@ -397,7 +416,7 @@ let state = SessionStateBuilder::new()
 let ctx = SessionContext::new_with_state(state);
 ```
 
-In Python, each project provides an extension object for
+In Python, each provides an extension object for
 `SessionContext.with_extensions`, as einfold's `EinFold` already is:
 
 ```python
@@ -411,9 +430,9 @@ Rules:
 - **The runtime's state lives in DataFusion's.** Its device memory and
   device handles are in the session's `RuntimeEnv` (§5.2), and its nodes
   find them through the `TaskContext` they run with.
-- **Frontends assemble the session.** xarray-sql's context adds whichever
-  XQL extensions are installed, so that, with ddxdb installed, its SQL
-  understands `grad` with no other step.
+- **Frontends may assemble the session.** xarray-sql's context adds
+  whichever XQL extensions are installed, so that, with ddxdb installed,
+  its SQL understands `grad` with no other step.
 - **Workers are sessions too.** Under datafusion-distributed, each worker
   builds its session with the same extensions (§10.5).
 
@@ -461,8 +480,9 @@ Rules:
 - **Reading a handle's rows is the only way data leaves the runtime**, and
   it is always explicit.
 - **Names are stable.** Each handle has a stable name, by which plans read
-  it, and the runtime passes ddx a namespace (`Options::namespace`) so that
-  the same plan gives the same program byte for byte (S3.3).
+  it. With ddx, the ddx integration passes it a namespace
+  (`Options::namespace`), so that the same plan gives the same program byte
+  for byte (S3.3).
 - **A table that holds state reads the handle's current buffer** each time
   its plan runs, so that publishing new state never forces a plan to be
   planned again (S3.3).
@@ -521,13 +541,13 @@ A compiled program is reused only while the backend's session key is
 unchanged, as ddx's `prepare` does.
 
 Rules:
-- **A training step can be one statement.** With ddx's functions in the
-  session, `SELECT k, v - $lr * grad(loss, v) AS v FROM w` is a whole step
+- **A training step can be one statement.** With the ddx integration in
+  the session (§5.8), `SELECT k, v - $lr * grad(loss, v) AS v FROM w` is a whole step
   of gradient descent. ddx writes the program from it.
 - **Programs compose.** A program may also be ddx's program followed by
   update steps that read its gradient tables. The runtime takes both as
   one program.
-- **ddx's checks run when they must.** Each states a promise: that some key
+- **ddx's checks, where there are any, run when they must.** Each states a promise: that some key
   columns of one table are unique. The runtime runs a check once per
   compile for a table whose keys don't change, on each run otherwise, and
   never when a frontend's fact gives the same promise.
@@ -539,10 +559,12 @@ Rules:
 
 ### 5.5 Labels
 
-One marker names a part of the forward program for every layer:
-`ddx_name(expr, 'label')`, proposed on ddx#251, since CTE and view names
-don't survive the engines' Substrait producers (torch-sql's spike S3). In
-ddx's SQL path, CTE names serve too. Labels carry:
+One marker names a part of a program for every layer: a function call,
+`ddx_name(expr, 'label')`, as proposed on ddx#251, since CTE and view names
+don't survive the engines' Substrait producers (torch-sql's spike S3). The
+core registers the marker itself when ddx isn't in the session, so labels
+work without ddx, and ddx reads the same marker when it is. In ddx's SQL
+path, CTE names serve too. Labels carry:
 - ddx#251's regions, and the save points and recompute policies of §6.4
   and §6.5;
 - provenance: which forward relation each backward step comes from
@@ -748,6 +770,14 @@ the accelerator as a DataFusion extension of its own, mixed in beside it.
 | `Transport` | the collective capabilities it implements, eager or compiled (§10.5) | NCCL, RCCL, XLA's collectives, gRPC |
 | `Topology` | devices and links, as discovered | NVML and NCCL, AMD's tools, PJRT |
 
+Other DataFusion extensions integrate the same way, and XQL's are the
+first:
+- **ddx**, through `datafusion-accelerated-ddx`, which implements ddx's
+  `Backend`, so ddx's programs run as the runtime's programs, and passes
+  ddx the runtime's save points, policies and engine limits (§6.4, §10.2);
+- **einfold**, through `datafusion-accelerated-einfold`, which turns the
+  nodes einfold detects into bindings to array backends (§6.2, §10.3).
+
 In Rust, each integration adds a builder method, and in Python an
 extension object:
 
@@ -774,7 +804,7 @@ Rules:
   declared, and a declared capability that fails at run time is a decline
   (R8).
 - **Integrations are pinned by the user's project**, not by the core. The
-  core pins only DataFusion, ddx and einfold.
+  core depends on DataFusion alone, and pins it exactly.
 - **An integration in Python alone needs no Rust build**, as an MLX array
   backend or a set of Triton kernels doesn't.
 - **This repository may host some integrations**, as separate crates, for
@@ -792,9 +822,10 @@ chooses:
 
 1. **On DataFusion**, as a plain query. This is the reference (R1), and
    always available.
-2. **With bound nodes.** Each node einfold marked, or a developer bound,
-   runs as a `KernelExec` on compact arrays kept resident, or declines, and
-   then its subplan runs on DataFusion. With einfold's nodes, this is stage
+2. **With bound nodes.** Each node einfold marked, a kernel library bound
+   by its type, or a developer bound by label, runs as a `KernelExec` on
+   data kept on the device, or declines, and then its subplan runs on
+   DataFusion. With einfold's nodes, this is stage
    B-0 (§6.2).
 3. **As a region**: several nodes, and the elementwise expressions between
    them, run as one array program, with their intermediates kept compact.
@@ -915,6 +946,10 @@ tensor columns, stays open through spike 1 (S2.3).
 
 ### 6.4 Step boundaries and saving
 
+The rules in this section and the next apply to programs that ddx writes,
+through the ddx integration (§5.8). A program written as plain steps draws
+its own boundaries.
+
 - **ddx draws step boundaries.** The runtime takes ddx's program as ddx
   writes it (S3.4).
 - **The runtime changes them only through ddx's inputs:**
@@ -1004,18 +1039,8 @@ tensor columns, stays open through spike 1 (S2.3).
 
 ## 9. State, checkpoints and randomness
 
-`TrainingSession` (S1.1) splits along the line between execution and
-training:
-
-| Part of `TrainingSession` | Goes to |
-|---|---|
-| State tables kept as arrays between runs, with their device buffers | runtime (§5.2) |
-| Publishing new state only after validation | runtime (R5) |
-| Compiling the whole step once, guarded by the session key | runtime (§5.4) |
-| Reusing the loss ddx already computed ([ddx#257](https://github.com/xqlsystems/ddx/pull/257)) | runtime, through ddx's public API |
-| Checkpoints of state, with the step counter and random state | runtime |
-| Dropout with explicit seed and step keys | the runtime's random function; the frontend decides where dropout goes |
-| AdamW, gradient clipping, the learning-rate schedule and evaluation | frontend |
+State that persists across runs (§5.4) needs checkpoints, and training
+needs random numbers every implementation agrees on.
 
 - **Checkpoints are Zarr stores**, written from published state only, so
   that a checkpoint is a Dataset SQL can query. State that isn't
@@ -1034,13 +1059,30 @@ training:
 
 ### 10.1 To developers and frontends
 
-A training step from Python. The runtime's names are placeholders:
+A query, from Python, with relational operators on a GPU. The runtime's
+names are placeholders:
+
+```python
+from datafusion import SessionContext
+from datafusion_accelerated import Accelerator
+from datafusion_accelerated_cuda import Cuda
+from datafusion_accelerated_cudf import Cudf
+
+ctx = SessionContext().with_extensions(Accelerator(), Cuda(devices="local"), Cudf())
+ctx.register_parquet("trips", "trips/")
+ctx.sql("EXPLAIN ANALYZE SELECT zone, AVG(fare) FROM trips GROUP BY zone").show()
+# the scan's batches are copied to the GPU once; libcudf's hash aggregate runs there,
+# DataFusion's is its fallback and reference, and the plan shows both
+```
+
+A training step, with XQL's ddx and einfold mixed in:
 
 ```python
 from datafusion import SessionContext
 from ddxdb.datafusion import Ddx
 from einfold.datafusion import EinFold
 from datafusion_accelerated import Accelerator, Program
+from datafusion_accelerated_cuda import Cuda
 
 runtime = Accelerator()
 ctx = SessionContext().with_extensions(Ddx(), EinFold(), runtime, Cuda(devices="local"))
@@ -1100,10 +1142,11 @@ for i in 0..1_000 {
 
 ### 10.2 To ddx
 
-The runtime implements `ddx_ad::Backend`, and `ddxdb.Backend` through its
-Python binding. From the runtime's first release, `Backend` is a contract:
-ddx lists its changes in its changelog, and the runtime pins ddx exactly.
-The runtime needs, each as an ordinary ddx PR:
+ddx comes in through an integration, `datafusion-accelerated-ddx` (§5.8),
+which implements `ddx_ad::Backend`, and `ddxdb.Backend` through its Python
+binding. From its first release, `Backend` is a contract: ddx lists its
+changes in its changelog, and the integration pins ddx exactly. The
+runtime needs, each as an ordinary ddx PR:
 
 1. **ddx as a DataFusion extension**: `.with_ddx()` on the builder in Rust
    and a `Ddx` object for `with_extensions` in Python, so that `grad`,
@@ -1127,10 +1170,11 @@ The runtime needs, each as an ordinary ddx PR:
 
 ### 10.3 To einfold
 
-einfold already attaches as a DataFusion extension, and the runtime's rule
-runs after its rules. The runtime needs from einfold:
+einfold comes in through an integration, `datafusion-accelerated-einfold`
+(§5.8). einfold already attaches as a DataFusion extension, and the
+runtime's rule runs after its rules. The runtime needs from einfold:
 1. a builder method, `.with_einfold()`, beside its `install` function, so
-   that every XQL extension attaches the same way;
+   that every extension attaches the same way;
 2. the B-0 interface: each detected node's IR, checks and subplan, which
    the runtime's rule wraps in a `KernelExec` (§6.2);
 3. published, versioned node types, with a conformance suite;
@@ -1346,9 +1390,9 @@ python train.py
 
 - **Kernels arrive through bindings** (§5.7), from any compiler. The
   runtime has no kernel language, and no compiler of its own.
-- **Array backends** wrap an array library, and lower einfold's nodes
-  through it: NumPy as the reference, CUDA at M2, and MLX beside it (§13,
-  question 1).
+- **Array backends** are integrations that wrap an array library and lower
+  einfold's nodes through it: NumPy in the core, as the reference, then a
+  CUDA backend at M2, and MLX beside it (§5.8, §13, question 1).
 - **StableHLO and MLIR** appear only inside a backend, as the route to XLA
   through JAX or PJRT, never as XQL's representation of a program (D2).
 - **Memory** comes from the shared allocator (§7).
@@ -1371,11 +1415,24 @@ Each piece of the code that exists today has a home.
 | MLX kernels (`xarray_sql/mlx.py`) | xarray-sql (#302) | runtime, as an array backend for einfold's nodes |
 | `DenseProgram` | einfold (#157) | a corpus for spike 6, and an oracle for einfold's new detection, which goes in Rust beside its existing detection |
 | `DenseExecutor` and its MLX operators | xarray-sql (#303) | runtime, as array backends for B-0 |
-| `TrainingSession` | xarray-sql (#305) | split as in §9 |
+| `TrainingSession` | xarray-sql (#305) | split as below |
 | `erf` as a DataFusion function (`xarray_sql/math.py`) | xarray-sql (#305) | xarray-sql for now; DataFusion upstream eventually |
 | The Shakespeare recipe (`03_shakespeare.py`) | xarray-sql (#305) | xarray-sql, as demo 3, on public APIs |
 | `ddxdb.Context`, a `SessionContext` subclass | ddx | ddx's DataFusion extension (§10.2) |
 | Cut points and their chain rule (`torch_sql.program`) | torch-sql | nowhere: ddx's SQL path replaces them (§6.4) |
+
+`TrainingSession` (S1.1) splits along the line between execution and
+training:
+
+| Part of `TrainingSession` | Goes to |
+|---|---|
+| State tables kept as arrays between runs, with their device buffers | runtime (§5.2) |
+| Publishing new state only after validation | runtime (R5) |
+| Compiling the whole step once, guarded by the session key | runtime (§5.4) |
+| Reusing the loss ddx already computed ([ddx#257](https://github.com/xqlsystems/ddx/pull/257)) | runtime, through ddx's public API |
+| Checkpoints of state, with the step counter and random state | runtime |
+| Dropout with explicit seed and step keys | the runtime's random function; the frontend decides where dropout goes |
+| AdamW, gradient clipping, the learning-rate schedule and evaluation | frontend |
 
 </details>
 
@@ -1392,7 +1449,9 @@ one Python package. Every integration is a crate or package of its own
 
 | Package | What it is | Depends on |
 |---|---|---|
-| `datafusion-accelerated` | the core: the DataFusion extension (builder method, settings, device memory pools in `RuntimeEnv`, physical rules, `KernelExec`, `CopyExec`, handle batches, table providers, the codec), programs, table handles, tiers, the schedule, labels, the interfaces of §5.8 with their CPU reference implementations, the counters, and `ddx_ad::Backend` | DataFusion, ddx, einfold; no hardware library |
+| `datafusion-accelerated` | the core: the DataFusion extension (builder method, settings, device memory pools in `RuntimeEnv`, physical rules, `KernelExec`, `CopyExec`, handle batches, table providers, the codec), programs, table handles, tiers, the schedule, labels, the interfaces of §5.8 with their CPU reference implementations, and the counters | DataFusion alone |
+| `datafusion-accelerated-ddx` | ddx's `Backend`, and programs from ddx (§10.2) | ddx |
+| `datafusion-accelerated-einfold` | einfold's nodes as bindings (§10.3) | einfold |
 | `datafusion-accelerated-cuda` | a `Device` for CUDA | CUDA bindings |
 | `datafusion-accelerated-nccl` | a `Transport` over NCCL | NCCL |
 | `datafusion-accelerated-cudf` | a `KernelLibrary` of relational operators over libcudf | libcudf |
@@ -1407,8 +1466,9 @@ that only install integrations, such as `datafusion-accelerated[cuda]`.
 
 Rules:
 - **The core installs no GPU library** (R6, R13).
-- **The core pins DataFusion, ddx and einfold exactly.** Integrations pin
-  their own libraries.
+- **The core pins DataFusion exactly**, and every integration pins its own
+  library. The ddx and einfold integrations pin the DataFusion version that
+  xarray-sql, ddx and einfold share.
 - **Python integrations, kernels and array backends are Python code**,
   behind Python protocols, so that adding one never needs a Rust build.
 - **Dependencies point toward the core.** Integrations depend on it, and
@@ -1419,16 +1479,16 @@ Rules:
 
 ### 12.2 Milestones
 
-Each milestone is measured on demo 2, demo 4 and torch-sql's nanoGPT, and
-reported on [xarray-sql#285](https://github.com/xqlsystems/xarray-sql/issues/285)
+Each milestone is measured on XQL's programs (demo 2, demo 4 and
+torch-sql's nanoGPT), and from M8 on TPC-H's queries too, and reported on [xarray-sql#285](https://github.com/xqlsystems/xarray-sql/issues/285)
 with the hardware and versions, whichever way the numbers go. NVIDIA GPUs,
 on the cloud or on the Beta cluster, are available half a day a week.
 
 **M0. A CPU runtime, in Rust and Python.**
 - *Builds:* `.with_accelerator()` and the `Accelerator` extension object,
   the `accelerated` settings, table handles and providers, `Program` with
-  `lower`, `compile` and `run`, `ddx_ad::Backend` with compiled plans and
-  tables kept in place, the counters of R8 as metrics, and the schedule
+  `lower`, `compile` and `run`, the ddx integration, implementing
+  `ddx_ad::Backend` with compiled plans and tables kept in place, the counters of R8 as metrics, and the schedule
   and `explain()` in their first form, even while every step runs on
   DataFusion. They are cheap to build first and expensive to add later.
 - *Done when:* torch-sql's test suite passes on both engines with the
@@ -1527,9 +1587,9 @@ are the first work for the GPU half days, since they wait on no decision.
 
 ## 13. Open questions
 
-1. **Which libraries the runtime's own CUDA backend uses** for einfold's
+1. **Which libraries the first CUDA array backend uses** for einfold's
    nodes: from Python, JAX, PyTorch, CuPy, or PJRT directly (S4.2); from
-   Rust, kernels launched through its CUDA bindings. More than one backend
+   Rust, kernels launched through CUDA bindings. More than one backend
    can exist, and developers can bind any library's kernels besides.
 2. **Substrait as the plan format between layers.** Engines without a
    Substrait producer need SQL text in their dialect
@@ -1554,8 +1614,7 @@ are the first work for the GPU half days, since they wait on no decision.
    would let MLIR-based compilers consume einfold's nodes directly. That is
    a seam to the compiler ecosystem, not a change of XQL's representation
    (D2), and it is einfold's to decide.
-9. **NVIDIA's CUDA bindings or cudarc**, for the runtime's own CUDA
-   layer: NVIDIA's `cuda-rust` crates, or cudarc, which is older and more
+9. **NVIDIA's CUDA bindings or cudarc**, for the CUDA integration: NVIDIA's `cuda-rust` crates, or cudarc, which is older and more
    widely used, by Candle among others. Either way, `KernelArgs` hands out
    raw handles with owners (§5.7), so kernels from libraries built on the
    other still bind.
@@ -1633,9 +1692,9 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
   compiled as a JAX function is (R3, R5, §5.4).
 - **P-C.** Design B, staged from B-0 (§6.2). It needs an einfold design
   change approved by its maintainer. Design C stays open through spike 1.
-- **P-D.** The runtime implements ddx's and einfold's public interfaces,
-  and depends on their published types, rather than either depending on
-  the runtime.
+- **P-D.** ddx and einfold come in through integrations, which implement
+  their public interfaces and depend on their published types. Neither
+  depends on the runtime, and the core depends on neither (§5.8).
 - **P-E.** Where a value is held is the runtime's default, recorded in the
   schedule and open to the developer's override (R7, R10). ddx draws step
   boundaries, and the runtime changes them only through ddx's options and
@@ -1656,16 +1715,16 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
 - **P-N.** Developers bind their own kernels to labelled nodes, from
   Python or Rust, with the node's SQL as the specification. einfold's
   nodes are bindings made automatically (§5.7).
-- **P-O.** Memory tiers extend `RuntimeEnv`, named by Arrow's device types,
-  with device memory accounted as DataFusion accounts host memory (§5.2).
+- **P-O.** Memory tiers extend `RuntimeEnv`, named by device family, with
+  device memory accounted as DataFusion accounts host memory (§5.2).
 - **P-P.** The runtime builds no compiler, allocator, communication library
   or distributed planner (§3.2, R11).
 - **P-Q.** A device plan is a DataFusion physical plan with `KernelExec`
   and `CopyExec` nodes, passing handle batches between device nodes
   (§5.3, spike 7).
-- **P-R.** Every XQL project attaches to DataFusion the same way: a builder
-  method in Rust, and an extension object for `with_extensions` in Python
-  (§5.1, §10.2, §10.3).
+- **P-R.** Every extension attaches to DataFusion the same way, the runtime,
+  its integrations and XQL's projects alike: a builder method in Rust, and
+  an extension object for `with_extensions` in Python (§5.1, §5.8).
 - **P-S.** Parallelism is partitioning. Base and state tables declare their
   distribution in SQL (D9), the planner derives intermediates through
   DataFusion's physical properties and a cost model, and collectives are
@@ -1675,8 +1734,9 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
   (§10.5).
 - **P-U.** Kernel contracts and memory tiers are defined per device
   family, so that CUDA, ROCm and TPU backends each meet them (§5.2, §5.7).
-- **P-V.** Exchanges are lowered to the hardware's transports, eager or
-  compiled, under datafusion-distributed's control plane (§10.5).
+- **P-V.** Exchanges are lowered to collective capabilities, which
+  transport integrations implement, eager or compiled, under
+  datafusion-distributed's control plane (§10.5).
 - **P-W.** The topology is a graph taken from each platform's discovery,
   and placement embeds partitions into it (§10.5).
 

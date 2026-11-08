@@ -709,6 +709,12 @@ That means the runtime builds only what no other component does:
 | Tables, arrays and plans across each seam | Arrow, DLPack, Substrait |
 | Lifetimes, placement across tiers, the schedule, bindings, checks and reports | the runtime |
 
+The same holds for XQL's own projects. ddx and einfold come in through
+integrations, as CUDA and libcudf do (design §5.8), so a DataFusion user
+who wants a hash join on a GPU installs neither, and the core depends on
+DataFusion alone. XQL is the runtime's first user, and shaped it, but the
+core knows it no better than it knows NVIDIA.
+
 The risk of a bridge layer is that it grows into everything it connects.
 Design R11 is the test against that: if a feature could be a library of
 its own, used without the runtime, it should be one. Borrowing the
@@ -917,6 +923,7 @@ question 11).
 | Runtime concept | DataFusion layer | The runtime's piece |
 |---|---|---|
 | Attaching | `SessionStateBuilder`; `with_extensions` | `.with_accelerator`; `Accelerator` |
+| Hardware and libraries | none | integrations, each its own crate or package: `.with_accelerated_cuda()`, `Cuda()` |
 | Settings | `SessionConfig` namespaces | `accelerated.*` |
 | Memory tiers | `RuntimeEnv`: `MemoryPool`, `DiskManager` | device pools, beside DataFusion's |
 | Tables | table providers | runtime tables, readable as rows or compact arrays |

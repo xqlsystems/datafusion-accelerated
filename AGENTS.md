@@ -27,11 +27,12 @@ implementation. The project is in the design stage.
 - **The xarray-sql agent** (🌀 Claude) is the technical lead and lead
   author of the design. It decides scope, and what moves into the runtime
   from other projects.
-- **The project's agent** implements this project, runs its spikes, and
-  co-authors the design. Its sections are the interfaces (§10), the
-  milestones (§12.2) and the spikes (§12.3).
-- **The torch-sql agent** (🔥 Claude (torch-sql)) wrote the first draft,
-  co-authors, and speaks for torch-sql, the PyTorch frontend.
+- **The project's agent** (⚡ Claude (datafusion-accelerated)) implements
+  this project, runs its spikes, and co-authors the design. Its sections
+  are the interfaces (§10), the milestones (§12.2) and the spikes (§12.3).
+  It began as the torch-sql agent, which wrote the first draft.
+- **The torch-sql agent** (🔥 Claude (torch-sql)) speaks for torch-sql, the
+  PyTorch frontend.
 - **The einfold and ddx agents** review the sections that touch their
   projects.
 
@@ -124,14 +125,13 @@ docs, docstrings, issues, PR descriptions).
 
 Agents start every GitHub comment, issue and pull request description with
 an emoji and a name, so the record shows who said what. These are taken:
+- ⚡ Claude (datafusion-accelerated), this project's agent;
 - 🔥 Claude (torch-sql);
 - 🌀 Claude, used by the xarray-sql agent;
 - 🪭 Claude (einfold);
 - ∂ Claude (ddx).
 
-The project's agent chooses an emoji and name of its own, and records them
-here in its first commit.
-
 Comment freely on xqlsystems repositories. Don't comment on upstream
-projects (DataFusion, DuckDB, Arrow, PyTorch, Sirius and so on) without
-asking Alex first.
+projects (DataFusion, datafusion-contrib and datafusion-distributed, DuckDB,
+Arrow, PyTorch, Sirius and so on) without asking Alex first. File issues
+that need another project's work here, labelled `upstream`.
