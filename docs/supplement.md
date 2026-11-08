@@ -970,3 +970,134 @@ collide, which is why the design asks ddx for an extension that plans
 order and a transaction: each extension contributes codecs and planners
 in two phases, and nothing is written to the session until every
 extension has returned.
+
+---
+
+## S7. Distributed training
+
+The design distributes a program by partitioning its tables and composing
+with datafusion-distributed (design §10.5). This section records why, and
+what is still unproven. The aspiration, as code, is
+[#5](https://github.com/xqlsystems/xql-runtime/issues/5).
+
+### S7.1 Parallelism as partitioning
+
+A database spreads a query across machines by partitioning its tables, and
+moving rows between partitions where a join or an aggregate needs them. A
+training step is a query over the batch, the weights, the optimizer's state
+and, for Samudra, the grid, so the usual kinds of parallelism are choices
+of which table to partition, and by what:
+- **data parallelism** partitions the batch by sample, and keeps a copy of
+  the weights on every GPU, as PyTorch's DDP does;
+- **sharded state** partitions the weights and the optimizer's moments by
+  weight index, as FSDP and ZeRO do;
+- **domain decomposition** partitions the grid by tile, as numerical ocean
+  models run on HPC. For a partial tensor, such as a masked Samudra, land
+  cells have no rows, so they are never stored or moved at all.
+
+In PyTorch these are different wrappers around a model, each with its own
+code path. Here they are entries in one schedule, which a developer, an
+agent or the planner can change without touching the model, and a planner
+can choose per join, from the whole step's plan. That is torch-sql's
+hypothesis H1: that choosing the partitioning this way distributes a model
+like Samudra better than FSDP does.
+
+### S7.2 Collectives as relational operators
+
+| Collective | Relational form |
+|---|---|
+| all-reduce of gradients | partial `SUM` per partition, shuffle by key, final `SUM`: a reduce-scatter, with the gather left to whoever reads the result next |
+| reduce-scatter | the same, without the gather |
+| all-gather | a replicated table, or a broadcast join |
+| broadcast | a broadcast join |
+| all-to-all | a repartition |
+| halo exchange | the rows of an index-table join that cross a tile's edge |
+| send and receive | a shuffle between two partitions |
+
+The relational form has two advantages. The planner writes it, so nothing
+in the model names a collective, and it moves only the rows a join needs:
+a halo exchange moves a tile's edge, and land cells never move.
+
+It also has a disadvantage, which is unmeasured. NCCL's collectives are
+tuned for each topology: rings and trees, and on NVLink switch systems
+reductions done inside the switch. A shuffle-and-sum is bandwidth-optimal
+on paper, but nobody has run it against NCCL on the same GPUs. Design spike
+8 does. If it loses, the runtime adds a collective node that recognizes a
+shuffle-and-sum and calls NCCL's reduce-scatter, which keeps the relational
+form in the plan and NCCL's speed in the run.
+
+### S7.3 Transport decides whether it's fast
+
+datafusion-distributed moves Arrow record batches over gRPC, through host
+memory. For queries over files that is the right default. For a training
+step it puts a host round trip into every gradient reduction and every
+halo exchange: the cost that S1.1 measured on one machine, now multiplied
+by the network. A GB200 NVL72 rack joins its 72 GPUs with NVLink, so
+within a rack the right transport never touches a host. That is why the
+design treats a device-aware transport as part of distribution, not an
+optimization of it ([#6](https://github.com/xqlsystems/xql-runtime/issues/6)),
+and why the schedule records the topology: device copies within a node,
+NVLink within a rack, the network across racks
+([#8](https://github.com/xqlsystems/xql-runtime/issues/8)).
+
+### S7.4 Queries against training programs
+
+Distributed query engines are built for queries that run once: plan,
+ship stages, run, discard. A training step runs thousands of times, with
+state that must stay where it was computed. Three things follow, none of
+which distributed query engines provide today
+([#7](https://github.com/xqlsystems/xql-runtime/issues/7)):
+- **stages deployed once**, which a run only triggers, as a compiled
+  program does on one machine (design §5.4);
+- **state resident on workers**, each partition of `w` on one worker's GPU,
+  referred to from the coordinating session by a remote table handle;
+- **placement by affinity**, so the task that updates `w[k]` runs where
+  `w[k]` lives.
+
+This extends the runtime's own layer, the program, across machines. It is
+the largest piece of new design in distribution, and the one most likely
+to need hooks from whichever distributed engine hosts it.
+
+### S7.5 datafusion-distributed and Ballista
+
+[Ballista](https://github.com/apache/datafusion-ballista) is Apache
+DataFusion's own distributed engine, and the alternative to
+datafusion-distributed (design D7).
+
+| | datafusion-distributed | Ballista |
+|---|---|---|
+| Shape | a library on `SessionStateBuilder`; any node can coordinate | an engine: scheduler and executor processes |
+| Data between stages | streamed over gRPC | staged mode writes shuffle files; pipelined mode (experimental) streams over Arrow Flight |
+| Python | no binding ([#10](https://github.com/xqlsystems/xql-runtime/issues/10)) | `BallistaSessionContext`, but no custom codecs from Python yet ([ballista#2618](https://github.com/apache/datafusion-ballista/issues/2618)) |
+| Custom nodes | a codec registered on every session | extension codecs, in Rust |
+| Failure | a failed task fails the query | staged mode re-runs failed tasks; pipelined mode fails the job |
+| Processes | workers are servers, stateless per query | executors are long-lived, under a central scheduler |
+| Published speed | its README reports beating Ballista on TPC-H | |
+
+datafusion-distributed fits the design's shape better: it is a library,
+"vanilla DataFusion plus nodes" as the runtime is (design R11), it streams
+between stages instead of writing them to disk, and it composes with the
+runtime on the same builder. Ballista's strengths are where training's
+needs differ from queries': a central scheduler and long-lived executors
+are a natural home for stages deployed once and for placement by affinity
+(S7.4), its staged mode recovers from a failed task without restarting the
+run, and its Python client exists. Neither has a device-aware transport.
+
+So D7 stands, and design spike 9 checks it against a distributed training
+step before M7 ([#13](https://github.com/xqlsystems/xql-runtime/issues/13)).
+Either way, the runtime's side of the contract should stay the same:
+device nodes with a codec, and hooks for placement. Then the runtime
+depends on neither engine's internals, and a training job could move from
+one to the other.
+
+### S7.6 Failure
+
+A distributed training step is synchronous: every tile's gradient is
+summed before the weights update. One slow GPU stalls every step, and one
+failed worker fails the run, as with DDP. With state spread across
+workers, R5's atomic publication would need every worker to agree before
+any publishes. The simpler rule, which the design takes, is to restart
+from the last checkpoint, which each worker writes its shards into
+([#11](https://github.com/xqlsystems/xql-runtime/issues/11)). Whether a
+run can survive a lost worker without a restart, as Ballista's staged mode
+allows for queries, is open.

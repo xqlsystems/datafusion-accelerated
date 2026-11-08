@@ -5,7 +5,7 @@ _co-authors_: 🔥 Claude (torch-sql) and 🌀 Claude (xarray-sql), via Claude C
 _reviewers_: 🪭 Claude (einfold) and ∂ Claude (ddx). Their reviews of v1.1 are in [reviews/](reviews/).
 _status_: Draft v1.5, for approval. Nothing is built. Collapsed sections (▸) hold background and detail.
 _last updated_: 2026-11-07
-_supplement_: [supplement.md](supplement.md), with the evidence, the alternatives considered and the reasoning behind each rule. Citations such as "(S1.1)" point there. S6 compares the design with JAX, PyTorch and DataFusion.
+_supplement_: [supplement.md](supplement.md), with the evidence, the alternatives considered and the reasoning behind each rule. Citations such as "(S1.1)" point there. S6 compares the design with JAX, PyTorch and DataFusion, and S7 covers distributed training.
 _origin_: [xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307)
 
 ---
@@ -1032,32 +1032,96 @@ runs after its rules. The runtime needs from einfold:
   toward PyTorch and JAX. The device path needs a device-stream export
   upstream and a converter into PyTorch, since neither exists (S1.3).
 
-### 10.5 Distribution, through datafusion-distributed
+### 10.5 Distribution
 
-The runtime distributes by composing with datafusion-distributed, not by
-building a distributed planner:
-- **A distributed device plan** has datafusion-distributed's network nodes
-  and the runtime's device nodes in one physical plan.
-- **Workers are built with the runtime's extension**, with the same
-  devices and kernels registered, as datafusion-distributed requires of
-  every custom node's codec.
-- **The runtime's codec** serializes a `KernelExec` as its kernel's name
-  and tuning parameters, and the worker finds the kernel in its own
-  session.
-- **GPU-to-GPU transfer** would use NCCL inside datafusion-distributed's
-  network nodes, as a contribution there rather than a fork of them.
-  Within one NVL72 rack, a kernel that reads and writes another GPU's
-  memory over NVLink, as cuTile Rust's peer-memory operations allow, is a
-  lower-level alternative for exchanging the cells along a tile's edges,
-  bound like any other kernel.
+The runtime distributes a program by composing with datafusion-distributed
+(D7), not by building a distributed planner. The aspiration, as the code a
+user would run, is [#5](https://github.com/xqlsystems/xql-runtime/issues/5).
+The reasoning is in S7.
 
-Partitioning a training step by batch index is data parallelism, by a
-weight's index weight sharding, and by grid tile *domain decomposition*,
-where each GPU owns a tile of the grid and exchanges only its edges with
-its neighbours. torch-sql's hypothesis H1 is that a planner choosing the
-partitioning per join distributes Samudra better than PyTorch's FSDP
-(Fully Sharded Data Parallel). One NVL72 rack holds a whole Samudra run,
-so the first distribution stays within a rack.
+**Parallelism is partitioning.** Every strategy is a choice, in the
+schedule (§5.6), of how to partition a table:
+
+| Strategy | Schedule entry |
+|---|---|
+| Data parallelism | `partition("batch", by=["sample"])` |
+| DDP-style weights, a copy on every GPU | `replicate("w")` |
+| Sharded weights and optimizer state, as FSDP and ZeRO do | `partition("w", by=["k"])` |
+| Domain decomposition, a grid tile per GPU | `partition("ocean", by=["lat", "lon"], tiles=(6, 6))` |
+
+The model's SQL is the same under every strategy. A strategy that fits no
+table's partitioning is an error when the program compiles (R10).
+
+**Collectives are relational operators** (S7.2). The planner writes them,
+and `explain()` shows them:
+- an all-reduce of gradients is a partial `SUM` per GPU, a shuffle of the
+  partials by weight key, and a final `SUM` where each key lives: a
+  reduce-scatter, after which each shard updates where it lives and the
+  next run gathers what it reads;
+- a halo exchange is the rows of a convolution's join that cross a tile's
+  edge.
+
+Rules:
+- **Workers are sessions too**, built with the same extensions, devices
+  and kernels as the coordinating session (§5.1). The runtime's codec
+  ships a `KernelExec` as its kernel's name and tuning parameters, and the
+  worker finds the kernel in its own session.
+- **A distributed device plan** holds datafusion-distributed's network
+  nodes and the runtime's device nodes in one physical plan.
+- **Distributed programs persist.** A compiled program's stages are
+  deployed to their workers once, and each run only triggers them. Each
+  partition of a state table is resident on one worker's device across
+  runs, as a table handle the coordinating session refers to remotely,
+  and the tasks that read or update a partition run where it lives
+  ([#7](https://github.com/xqlsystems/xql-runtime/issues/7)).
+- **Exchanges follow the topology** recorded in the schedule: a device
+  copy between GPUs in a node, NVLink within a GB200 NVL72 rack, and the
+  network only across racks. `explain()` shows the link each exchange uses
+  ([#8](https://github.com/xqlsystems/xql-runtime/issues/8)).
+- **Device data crosses machines without the host**, through a
+  device-aware transport for datafusion-distributed's network nodes, built
+  on NCCL or NVLink peer memory and contributed to datafusion-distributed
+  rather than forked from it
+  ([#6](https://github.com/xqlsystems/xql-runtime/issues/6)). Until then,
+  distribution is correct but slow.
+- **A distributed run is synchronous.** One slow GPU stalls a step, and
+  `report()` names it by worker and device. Recovery from a failed worker
+  restarts from the last checkpoint, whose shards each worker writes to one
+  Zarr store ([#11](https://github.com/xqlsystems/xql-runtime/issues/11)).
+- **The first distribution stays within one rack.** One NVL72 rack holds a
+  whole Samudra run, so every exchange can stay on NVLink.
+
+torch-sql's hypothesis H1 is that a planner choosing the partitioning per
+join distributes Samudra better than PyTorch's FSDP (Fully Sharded Data
+Parallel). Whether relational shuffles can match NCCL's tuned collectives
+is the open half of it (spike 8).
+
+<details>
+<summary>The aspiration, in Python: Samudra across a rack (#5)</summary>
+
+```python
+ctx = SessionContext().with_extensions(
+    Ddx(), EinFold(),
+    XqlRuntime(devices="local"),               # on each worker: that node's GPUs
+    Distributed(workers=SlurmWorkers()),       # proposed Python binding (#10)
+)
+xs.register(ctx, "ocean", xr.open_zarr("om4.zarr"))
+
+lowered = Program(ctx, STEP, state={"w": w0}, outputs=["loss"]).lower()
+schedule = lowered.schedule()
+schedule.partition("ocean", by=["lat", "lon"], tiles=(6, 6))   # domain decomposition: 36 GPUs
+schedule.partition("w", by=["k"])                              # sharded weights and moments
+compiled = lowered.compile(schedule=schedule)
+for i in range(10_000):
+    compiled.run(lr=1e-3 * 0.999**i)
+```
+
+```bash
+srun --nodes=9 --ntasks-per-node=1 xql-runtime worker --devices all &   # proposed CLI
+python train.py
+```
+
+</details>
 
 ### 10.6 To kernel compilers and GPU libraries
 
@@ -1181,10 +1245,16 @@ stops short.
 **M6. B-2, regions across steps**, with ddx#157 and ddx#251.
 
 **M7. Distribution, through datafusion-distributed**, within one NVL72
-rack.
+rack (§10.5).
+- *Builds:* `partition` and `replicate` in the schedule, workers built with
+  the runtime's extension, programs whose stages and state persist on
+  workers (#7), topology-aware exchange (#8), and the device-aware
+  transport (#6).
+- *Needs:* spikes 8 and 9.
 - *Done when:* demo 4 trains with its grid split by tile across the GPUs
   of one rack, in one physical plan with network nodes and device nodes,
-  and gives the same results as on one GPU.
+  gives the same results as on one GPU within §6.3's bound, and its
+  gradient reduction runs within a stated factor of NCCL's.
 
 M2 is the critical path. It waits on spikes 6 and 7, and on Alex's
 decision on einfold's roadmap. Spikes 2 and 3, which need NVIDIA hardware,
@@ -1201,6 +1271,8 @@ are the first work for the GPU half days, since they wait on no decision.
 | 5 | Where does the last 3.76× against PyTorch go? | Trace one warm resident step on the M5 Ultra against PyTorch MPS, by kind of operation, after reading the contributor's own comparison | What M2 and M5 should fix first |
 | 6 | How much of each step does einfold already cover? | `EXPLAIN ANALYZE` with einfold on, for demo 2, demo 4 and torch-sql's nanoGPT: the share of time inside einfold's nodes, and how often a DataFusion operator sits between two of them (S2.5). einfold's agent runs einfold's side | How far B-0 gets, and whether M5 is needed |
 | 7 | Can handle batches carry device data between DataFusion nodes? | Two `KernelExec`s in one plan passing handle batches, through repartitioning and the planner's other rewrites, with a `CopyExec` where rows are needed | Whether §5.3's device plans work as written, or device work must stay inside single nodes |
+| 8 | Can relational collectives match NCCL? ([#12](https://github.com/xqlsystems/xql-runtime/issues/12)) | Reduce one demo 2 step's gradients on 8 GPUs, then 2 nodes: NCCL all-reduce, NCCL reduce-scatter and all-gather, and a shuffle by key with a final sum | Whether the runtime needs a collective node that calls NCCL, or plain shuffles suffice |
+| 9 | Which host suits distributed training, datafusion-distributed or Ballista? ([#13](https://github.com/xqlsystems/xql-runtime/issues/13)) | One distributed demo 2 step on each, CPU first: per-run overhead over 100 runs, and deploying stages once | Whether D7 holds for training, or the distributed contract stays neutral between them (S7.5) |
 
 ---
 
@@ -1244,9 +1316,14 @@ are the first work for the GPU half days, since they wait on no decision.
 11. **Python kernels on distributed workers.** datafusion-distributed's
     workers are Rust servers. A kernel written in Python needs a worker
     that runs Python, or must be compiled ahead of time, as a Triton kernel
-    can be, and launched from Rust.
+    can be, and launched from Rust
+    ([#9](https://github.com/xqlsystems/xql-runtime/issues/9)).
 12. **A Rust frontend.** A backend for Burn whose arrays are XQL tables
     would do for Rust what torch-sql does for PyTorch (S6.6).
+13. **Atomic state across workers.** When state is spread across workers,
+    whether publication is atomic across all of them (R5), or recovery
+    restarts from a checkpoint
+    ([#11](https://github.com/xqlsystems/xql-runtime/issues/11)).
 
 ---
 
@@ -1274,7 +1351,7 @@ are the first work for the GPU half days, since they wait on no decision.
 ### Proposed
 
 <details>
-<summary>Proposals P-A to P-R, for approval</summary>
+<summary>Proposals P-A to P-T, for approval</summary>
 
 P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
 
@@ -1317,5 +1394,10 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
 - **P-R.** Every XQL project attaches to DataFusion the same way: a builder
   method in Rust, and an extension object for `with_extensions` in Python
   (§5.1, §10.2, §10.3).
+- **P-S.** Parallelism is partitioning, chosen in the schedule, and
+  collectives are relational operators the planner writes (§10.5).
+- **P-T.** Distributed programs persist: stages deployed once, state
+  resident on workers, and tasks placed where their partitions live
+  (§10.5).
 
 </details>
