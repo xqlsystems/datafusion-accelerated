@@ -741,7 +741,7 @@ The last column is what the design proposes, not what exists.
 | Asynchronous runs | async dispatch, `block_until_ready()` | streams and events | `execute_stream` | `run()` returns a future |
 | Names in a program | `checkpoint_name(x, "name")` | NVTX ranges, module paths | none | `ddx_name(expr, 'label')` |
 | Recompute policies | `save_only_these_names`, `save_and_offload_only_these_names` | selective activation checkpointing | none | the same names, passed to ddx by label |
-| Custom kernels | `pallas_call`, `jax.ffi.ffi_call` | `torch.library.custom_op`, `register_kernel`, `triton_op` | a custom `ExecutionPlan` | `@runtime.kernel("label")`; the `Kernel` trait in Rust, with cuTile Rust kernels |
+| Custom kernels | `pallas_call`, `jax.ffi.ffi_call` | `torch.library.custom_op`, `register_kernel`, `triton_op` | a custom `ExecutionPlan` | `@runtime.kernel("label")`; the `Kernel` trait in Rust |
 | A kernel's gradient | `custom_vjp` | `register_autograd` | none | none needed: ddx writes the backward SQL, and its steps are bound by label and role (ddx#259) |
 | Failing loudly | none | `fullgraph=True` | none (Polars has `GPUEngine(raise_on_fail=True)`) | `SET xql_runtime.strict = true` |
 | Distribution | sharding, IFRT | DTensor, FSDP | datafusion-distributed, Ballista | datafusion-distributed, with device nodes |
@@ -803,36 +803,49 @@ output's partition sets the launch grid, as Pallas's grid and `BlockSpec`s
 do. Kernels are JIT-compiled through CUDA Tile IR, and a launch is a
 future: `.await` it, `.sync_on(&stream)`, or capture it in a CUDA graph.
 
-It is the most natural of these to bind, because its host side was built
-to run on memory and streams someone else owns:
+The runtime doesn't depend on cuTile. It is a test of the design's kernel
+contract (design §5.7): if a cuTile user can bind a kernel with a few lines
+of their own code, the contract is right. cuTile passes easily, because
+its host side was built to run on memory and streams someone else owns,
+and each of the contract's requirements meets one of its interfaces:
 - `unsafe Tensor::from_foreign(owner, shape, strides)` borrows device
   memory owned by another framework, keeping its owner alive by reference
   count. The runtime's table handle is that owner.
 - `Context::borrow_with_owner` and `Stream::borrow_with_owner` borrow
   another framework's CUDA context and stream, so cuTile runs on the
   runtime's streams rather than its own.
-- `.schedule(&policy)` takes a `SchedulingPolicy`, which the runtime can
-  implement so that cuTile places work as DataFusion's partitions say.
+- `.schedule(&policy)` takes a `SchedulingPolicy`, which a user can
+  implement from the partition's placement in `KernelArgs`, so that cuTile
+  places work as DataFusion's partitions say.
 - Launches are futures on Tokio, the async runtime DataFusion executes on,
   so a `KernelExec` awaits a kernel without blocking a thread.
 - `.compile()` with `api::meta` placeholder tensors compiles a kernel for a
-  shape without running it, which is what a program's `compile` step
-  needs.
+  shape without running it, which is what the `Kernel` trait's `prepare`
+  hook is for.
 - Its ownership types, exclusive outputs and shared inputs, keep a kernel
   from aliasing its output with an input. That is the kernel-level form of
   the design's rule that tables are values (S5.6).
 - `cutile-kernels` has attention, embeddings, norms and pointwise kernels
-  to start a CUDA backend from.
+  that a user could bind to einfold's nodes.
 
-The frictions are small. cuTile's element types and some shapes are
-static, where Arrow's are known only at run time, so a binding dispatches
-on type. Its shapes are positional, so the runtime orders a node's named
-axes as the node declares them. And it is a research release, requiring
-CUDA 13.2 or later and `sm_80` or newer, with API changes expected.
+The frictions are small, and they sit in the user's glue, not in the
+runtime:
+- cuTile has its own trait for memory someone else owns, so the user
+  writes a few lines implementing it over the runtime's device array. No
+  Rust standard spans such traits, as DLPack does in Python.
+- cuTile's element types and some shapes are static, where Arrow's are
+  known only at run time, so a binding dispatches on type.
+- Its shapes are positional, so `KernelArgs` orders a node's named axes as
+  the node declares them.
+
+The same check applied to Triton passes through `data_ptr()` and the
+stream, and to Pallas through DLPack and the shared allocator. A library
+that fails it would show the contract is missing something.
 
 Its peer-memory operations, which read and write another GPU's memory
-over NVLink, may also matter later: within one NVL72 rack they are a way
-to exchange the edges of grid tiles without going through NCCL.
+over NVLink, may also matter later: within one NVL72 rack, a user's
+kernel built on them could exchange the edges of grid tiles without going
+through NCCL.
 
 **Other Rust routes.** NVIDIA's `cuda-rust` crates, which cuTile is built
 on, and cudarc both load and launch compiled kernels: PTX or cubins from
@@ -924,8 +937,9 @@ leave Rust users with DataFusion and no devices. So every capability is in
 Rust first, and the Python package binds it (design R12):
 - **Programs** are Rust types: `Program::new(&ctx, sql)`, `lower`,
   `compile`, `run`.
-- **Kernels** implement the `Kernel` trait, written in cuTile Rust first,
-  or loaded and launched through NVIDIA's CUDA bindings or cudarc.
+- **Kernels** implement the `Kernel` trait, written in any Rust kernel
+  library, such as cuTile Rust or CubeCL, or loaded and launched through
+  NVIDIA's CUDA bindings or cudarc.
 - **Arrays** cross to Rust array libraries through DLPack.
 - **Differentiation** is ddx-ad, already Rust.
 

@@ -183,8 +183,9 @@ distributed by registering its codec on every session.
 <details>
 <summary><b>2.5 Kernels, compilers and GPU libraries</b>: Triton, Gluon, Pallas, cuTile Rust, CUTLASS, XLA, RMM, NCCL</summary>
 
-The runtime calls these rather than replacing them (R11). S6.2 has how
-each fits.
+The runtime depends on none of these. Developers bring them, and the
+runtime's kernel contract (§5.7) is designed so that each binds without
+help. S6.2 checks the contract against each.
 - **[Triton](https://triton-lang.org/)** is a Python language for GPU
   kernels, run as a grid of programs that each load, compute and store a
   tile, with masks at the array's edges. **Gluon** is Triton's lower-level
@@ -540,13 +541,32 @@ detection makes bindings automatically, to the runtime's array backends
 (§6.2). A developer, or an agent, binds a kernel by hand. Either way, the
 node's SQL is the kernel's specification, and runs if the kernel declines.
 
-**What a kernel receives.** The runtime calls a kernel with:
-- each input as a device array, through DLPack, with its axes named and
-  their extents given;
-- each input's presence and NULL masks, unless the kernel assumes there
-  are none;
-- the output arrays, allocated by the runtime from the node's schema;
-- the stream to launch on.
+**The kernel contract.** The runtime depends on no kernel library.
+Instead it gives every kernel what any library needs to run on memory and
+streams it doesn't own. Each item below is what a kernel library asks of
+a foreign host, checked against cuTile Rust, Triton and Pallas (S6.2):
+- **Arrays the kernel can borrow.** Each input, and each output the
+  runtime has allocated from the node's schema, is a device array with a
+  pointer, shape, strides, element type, named axes and an *owner*: a
+  reference-counted handle that keeps the runtime's buffer alive for as
+  long as the kernel's library holds it. Each exports DLPack, and in
+  Python a `data_ptr()`.
+- **Masks.** Each input's presence and NULL masks, unless the kernel
+  assumes there are none.
+- **The context and stream, borrowable.** The raw CUDA context and the
+  partition's stream, each with an owner, so a library launches on the
+  runtime's stream rather than its own.
+- **Async launches.** A launch is awaited on the Tokio runtime DataFusion
+  executes on, so a library whose launches are futures awaits them.
+- **A compile hook**, run at the program's compile with the shapes and
+  types every run will have, so JIT compilation and autotuning never
+  happen during a run.
+- **The partition's placement**: which device and stream each partition
+  runs on, so a library with its own scheduler can follow DataFusion's
+  partitions instead of choosing for itself.
+
+Binding a library's kernel then takes a few lines of the user's own code,
+and none in the runtime.
 
 The kernel chooses its own grid, blocks and on-chip memory. Shared memory,
 tensor memory and registers are below the runtime's tiers, and belong to
@@ -555,7 +575,8 @@ block sizes and warp counts, are recorded in the schedule, so that a
 compiled program keeps them and a developer can set them.
 
 **From Python**, kernels are registered on the runtime's extension object
-before the session is built, so the session has them from the start.
+before the session is built, so the session has them from the start. A
+Python kernel's compile hook is passed as `prepare=`, beside the kernel.
 
 <details>
 <summary>A Triton kernel and a Pallas kernel, bound by label</summary>
@@ -576,10 +597,20 @@ def attention(args):                                   # Pallas, through JAX
 </details>
 
 **From Rust**, a kernel implements the `Kernel` trait, and is registered
-on the session builder. cuTile Rust is the first-class way to write one.
+on the session builder. `KernelArgs` carries the contract above:
+
+```rust
+#[async_trait]
+pub trait Kernel: Send + Sync {
+    /// Once per shape, when the program compiles: JIT-compile, autotune, plan scratch space.
+    async fn prepare(&self, signature: &Signature) -> Result<()> { Ok(()) }
+    /// On every run, on the partition's stream, into outputs the runtime allocated.
+    async fn launch(&self, args: KernelArgs<'_>) -> Result<()>;
+}
+```
 
 <details>
-<summary>A cuTile Rust kernel, bound by label</summary>
+<summary>Binding a cuTile Rust kernel: the user's code, not the runtime's</summary>
 
 ```rust
 #[cutile::module]
@@ -595,10 +626,15 @@ mod kernels {
 struct Scale;
 #[async_trait]
 impl Kernel for Scale {
-    async fn launch(&self, args: &mut KernelArgs) -> Result<()> {
-        let x = args.cutile_input::<f32>("x")?;                // the runtime's buffer, not a copy
-        let out = args.cutile_output::<f32>()?.partition([128]);
-        kernels::scale(out, x, 2.0).await?;                    // a future, on the runtime's stream
+    async fn prepare(&self, sig: &Signature) -> Result<()> {
+        // cuTile's .compile() on placeholder tensors of sig's shapes
+    }
+    async fn launch(&self, args: KernelArgs<'_>) -> Result<()> {
+        // The glue: borrow the runtime's stream and buffers. cuTile keeps each owner alive.
+        let stream = unsafe { Stream::borrow_with_owner(args.stream().raw(), &args.context().borrow(), args.stream().owner()) };
+        let x = unsafe { Tensor::<f32>::from_foreign(Borrowed::new(args.input("x")?), ..) };
+        let mut out = unsafe { Tensor::<f32>::from_foreign(Borrowed::new(args.output()?), ..) };
+        kernels::scale((&mut out).partition([128]), &x, 2.0).sync_on(&stream)?;
         Ok(())
     }
 }
@@ -606,21 +642,14 @@ impl Kernel for Scale {
 builder.with_xql_runtime(RuntimeOptions::new().device("cuda:0").kernel("scale", Scale))
 ```
 
-</details>
+`Borrowed` is a few lines that implement cuTile's trait for foreign
+allocations over the runtime's device array. The one thing the runtime
+can't remove is that kind of glue: cuTile, cudarc and others each define
+their own trait for "memory someone else owns", and no Rust standard
+spans them. DLPack is the standard in Python, and the runtime exports it
+in Rust too for libraries that read it.
 
-cuTile needs no adapter of its own beyond `KernelArgs` (S6.2):
-- **Memory and streams are the runtime's.** Inputs are lent as cuTile
-  tensors over the runtime's buffers (`Tensor::from_foreign`), outputs as
-  borrowed partitions, and the runtime lends its CUDA context and the
-  partition's stream. The runtime implements cuTile's `SchedulingPolicy`.
-- **Launches are awaited**, inside a `KernelExec`, on the Tokio runtime
-  DataFusion already executes on.
-- **JIT compilation happens at `compile`**, through cuTile's `.compile()`
-  on placeholder tensors, never during a run.
-- **Types are dispatched at run time.** cuTile's element types are static
-  and Arrow's are not, so a binding matches on the column's type.
-- **cuTile is pinned exactly, behind a feature.** It is a research release
-  that requires CUDA 13.2 or later on `sm_80` or newer.
+</details>
 
 A kernel compiled elsewhere, from CUDA C, CUTLASS or Triton ahead of time,
 is loaded as PTX or a cubin and launched through the same CUDA bindings.
@@ -826,11 +855,11 @@ tensor columns, stays open through spike 1 (S2.3).
   DataFusion's limits, each tier's capacity and the session's policies.
   The schedule records the choice, and a developer can override it (§5.6).
 - **The runtime allocates no GPU memory of its own.** It draws from a
-  shared allocator, so that it shares a GPU with PyTorch, JAX and cuTile
-  instead of competing with them for it (S4.2). This draft leans toward
-  CUDA's stream-ordered pools as the shared one: cuTile's driver layer
-  allocates stream-ordered, and RMM and PyTorch can each be configured to
-  draw from the same pools (§13, question 6).
+  shared allocator, so that it shares a GPU with PyTorch, JAX and kernel
+  libraries instead of competing with them for it (S4.2). This draft leans
+  toward CUDA's stream-ordered pools as the shared one, since RMM, PyTorch
+  and kernel libraries such as cuTile Rust can each draw from them (§13,
+  question 6).
 - **State has room for two copies** while a step runs, unless the program
   donates: once the validation flag has been read, each state update writes
   into the old table's memory, as JAX's buffer donation does (S3.9).
@@ -1015,9 +1044,10 @@ building a distributed planner:
   session.
 - **GPU-to-GPU transfer** would use NCCL inside datafusion-distributed's
   network nodes, as a contribution there rather than a fork of them.
-  Within one NVL72 rack, cuTile's peer-memory operations, which read and
-  write another GPU's memory over NVLink, are a lower-level alternative
-  for exchanging the cells along a tile's edges.
+  Within one NVL72 rack, a kernel that reads and writes another GPU's
+  memory over NVLink, as cuTile Rust's peer-memory operations allow, is a
+  lower-level alternative for exchanging the cells along a tile's edges,
+  bound like any other kernel.
 
 Partitioning a training step by batch index is data parallelism, by a
 weight's index weight sharding, and by grid tile *domain decomposition*,
@@ -1076,7 +1106,7 @@ DataFusion, ddx and einfold do (D6):
 |---|---|---|
 | crates.io | `xql-runtime` | programs, table handles, tiers, the schedule, labels, the `Kernel` trait and the counters, with no engine and no GPU library |
 | crates.io | `xql-runtime-datafusion` | the DataFusion extension: the builder method, settings, device memory pools in `RuntimeEnv`, the physical rule, `KernelExec`, `CopyExec`, handle batches, table providers, the codec, and `ddx_ad::Backend`. It pins the DataFusion version xarray-sql, ddx and einfold share. |
-| crates.io | `xql-runtime-cuda` | the CUDA array backend and kernel launching, on NVIDIA's `cuda-rust` crates, with cuTile kernels behind a `cutile` feature |
+| crates.io | `xql-runtime-cuda` | the CUDA array backend, device memory, streams and kernel launching, with no kernel library as a dependency |
 | PyPI | `xql-runtime` | one package built with maturin: the Python binding of all of the above, the `XqlRuntime` extension object for `with_extensions`, Python kernels, and extras `[cuda]` and `[mlx]` (Apple silicon only) |
 
 Rules:
@@ -1127,8 +1157,9 @@ on the cloud or on the Beta cluster, are available half a day a week.
 - *Done when:* demo 2 trains on an NVIDIA GPU in strict mode, its state
   never leaving the device between steps, within the bound of §6.3 against
   NumPy, with the share of time in device nodes shown by `EXPLAIN ANALYZE`.
-  One node runs a hand-written Triton kernel and another a Rust kernel,
-  and checking mode verifies both.
+  Hand-written kernels from three libraries, Triton and Pallas from Python
+  and cuTile Rust from Rust, each run one node, each bound with no code in
+  the runtime specific to its library, and checking mode verifies them.
 
 **M3. Save points and memory policies.**
 - *Builds:* save points and recompute policies passed to ddx by label, and
@@ -1172,9 +1203,10 @@ are the first work for the GPU half days, since they wait on no decision.
 
 ## 13. Open questions
 
-1. **Which libraries run einfold's nodes on NVIDIA GPUs.** From Rust,
-   cuTile and `cutile-kernels`; from Python, JAX, PyTorch, CuPy, or PJRT
-   directly (S4.2). More than one backend can exist.
+1. **Which libraries the runtime's own CUDA backend uses** for einfold's
+   nodes: from Python, JAX, PyTorch, CuPy, or PJRT directly (S4.2); from
+   Rust, kernels launched through its CUDA bindings. More than one backend
+   can exist, and developers can bind any library's kernels besides.
 2. **Substrait as the plan format between layers.** Engines without a
    Substrait producer need SQL text in their dialect
    ([ddx#159](https://github.com/xqlsystems/ddx/issues/159)), and einfold
@@ -1198,12 +1230,12 @@ are the first work for the GPU half days, since they wait on no decision.
    a seam to the compiler ecosystem, not a change of XQL's representation
    (D2), and it is einfold's to decide.
 9. **NVIDIA's CUDA bindings or cudarc**, for the runtime's own CUDA
-   layer. NVIDIA's `cuda-rust` crates are what cuTile is built on, so the
-   runtime would share contexts, streams and pools with cuTile directly.
-   cudarc is older and more widely used, by Candle among others, and cuTile
-   can borrow its handles. This draft leans toward NVIDIA's.
-10. **CUDA graphs.** A compiled step could be captured as a CUDA graph, as
-    cuTile can, replaying all its launches at once. A graph bakes in its
+   layer: NVIDIA's `cuda-rust` crates, or cudarc, which is older and more
+   widely used, by Candle among others. Either way, `KernelArgs` hands out
+   raw handles with owners (§5.7), so kernels from libraries built on the
+   other still bind.
+10. **CUDA graphs.** A compiled step could be captured as a CUDA graph,
+    replaying all its launches at once. A graph bakes in its
     buffers, which suits state written in place (§7) and inputs copied into
     buffers allocated once. Worth measuring after M2.
 11. **Python kernels on distributed workers.** datafusion-distributed's
