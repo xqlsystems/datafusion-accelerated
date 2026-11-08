@@ -77,8 +77,8 @@ run to run (§5.4).
 
 ## 2. Background
 
-Every term the design uses is introduced here. Each group is collapsed;
-open the ones you need.
+The design's terms are introduced here, in collapsed groups. Open the
+ones you need.
 
 <details>
 <summary><b>2.1 Formats and terms</b>: Arrow, ADBC, Substrait, DLPack, Zarr, CTEs, compact arrays</summary>
@@ -183,9 +183,10 @@ distributed by registering its codec on every session.
 <details>
 <summary><b>2.5 Kernels, compilers and GPU libraries</b>: Triton, Gluon, Pallas, cuTile Rust, CUTLASS, XLA, RMM, NCCL</summary>
 
-The runtime depends on none of these. Developers bring them, and the
-runtime's kernel contract (§5.7) is designed so that each binds without
-help. S6.2 checks the contract against each.
+The runtime builds none of these, and depends on no kernel library.
+Developers bring their kernels, and the kernel contract (§5.7) is designed
+so that each library's kernels bind without help. S6.2 checks the contract
+against each.
 - **[Triton](https://triton-lang.org/)** is a Python language for GPU
   kernels, run as a grid of programs that each load, compute and store a
   tile, with masks at the array's edges. **Gluon** is Triton's lower-level
@@ -271,8 +272,8 @@ help. S6.2 checks the contract against each.
 - **Differentiation, plan rewriting, or drawing a program's step
   boundaries.** Those are ddx's and einfold's (§6.4).
 - **A kernel compiler, a memory allocator or a communication library.**
-  Kernels come from Triton, Gluon, Pallas, CUTLASS, XLA, `torch.compile`,
-  MLX, CubeCL or a developer's own code. GPU memory comes from a shared
+  Kernels come from Triton, Gluon, Pallas, cuTile Rust, CUTLASS, XLA,
+  `torch.compile`, MLX, CubeCL or a developer's own code. GPU memory comes from a shared
   allocator, and data moves between GPUs through NCCL.
 - **A distributed planner.** datafusion-distributed is one (§10.5).
 - **Its own way of assembling a session.** The runtime attaches through
@@ -318,8 +319,8 @@ help. S6.2 checks the contract against each.
 - **R9. Reproducibility is stated.** Each implementation says whether the
   same inputs give the same bits. A session may require reproducibility,
   and then gets only the implementations that give it (S3.7).
-- **R10. Defaults, not hidden decisions.** Every physical choice is in a
-  plan or a schedule a developer can read (§5.6). The runtime fills in
+- **R10. Defaults, not hidden decisions.** Every physical choice is in the
+  schedule, which a developer can read (§5.6). The runtime fills in
   defaults, and a developer may override any of them. An override is
   binding: if the runtime can't obey it, compiling fails and says why.
   Nothing is ignored silently (S5.1).
@@ -479,7 +480,7 @@ Rules:
 - **A training step can be one statement.** With ddx's functions in the
   session, `SELECT k, v - $lr * grad(loss, v) AS v FROM w` is a whole step
   of gradient descent. ddx writes the program from it.
-- **Programs compose.** A step may also be ddx's program followed by
+- **Programs compose.** A program may also be ddx's program followed by
   update steps that read its gradient tables. The runtime takes both as
   one program.
 - **ddx's checks run when they must.** Each states a promise: that some key
@@ -652,7 +653,8 @@ in Rust too for libraries that read it.
 </details>
 
 A kernel compiled elsewhere, from CUDA C, CUTLASS or Triton ahead of time,
-is loaded as PTX or a cubin and launched through the same CUDA bindings.
+is loaded as PTX or a cubin and launched on the borrowed stream, through
+whichever CUDA bindings the user prefers (§13, question 9).
 
 Rules:
 - **`assumes` lists the facts a kernel relies on** (§6.2). The runtime
@@ -1062,10 +1064,11 @@ so the first distribution stays within a rack.
 - **Kernels arrive through bindings** (§5.7), from any compiler. The
   runtime has no kernel language, and no compiler of its own.
 - **Array backends** wrap an array library, and lower einfold's nodes
-  through it: NumPy and MLX first, then a CUDA backend (§13, question 1).
+  through it: NumPy as the reference, CUDA at M2, and MLX beside it (§13,
+  question 1).
 - **StableHLO and MLIR** appear only inside a backend, as the route to XLA
   through JAX or PJRT, never as XQL's representation of a program (D2).
-- **Memory** comes from RMM or the array library's allocator (§7).
+- **Memory** comes from the shared allocator (§7).
 
 ---
 
@@ -1196,7 +1199,7 @@ are the first work for the GPU half days, since they wait on no decision.
 | 3 | Can a B200 read Arrow buffers in place from Grace memory fast enough? | Read against copy, on the Beta cluster | Whether Grace memory is a tier worth spilling to (§7) |
 | 4 | What does crossing from Python cost? | datafusion-ffi's overhead for the runtime's nodes (S4.1); launching a Triton kernel from a `KernelExec` through Python, and whether the call holds Python's lock | Which Python kernels are worth binding, and whether some must be compiled ahead of time |
 | 5 | Where does the last 3.76× against PyTorch go? | Trace one warm resident step on the M5 Ultra against PyTorch MPS, by kind of operation, after reading the contributor's own comparison | What M2 and M5 should fix first |
-| 6 | How much of each step does einfold already cover? | `EXPLAIN ANALYZE` with einfold on, for demo 2, demo 4 and torch-sql's nanoGPT: the share of time inside einfold's nodes, and the share of steps that are one node from scans to result. einfold's agent runs einfold's side | How far B-0 gets, and whether M5 is needed |
+| 6 | How much of each step does einfold already cover? | `EXPLAIN ANALYZE` with einfold on, for demo 2, demo 4 and torch-sql's nanoGPT: the share of time inside einfold's nodes, and how often a DataFusion operator sits between two of them (S2.5). einfold's agent runs einfold's side | How far B-0 gets, and whether M5 is needed |
 | 7 | Can handle batches carry device data between DataFusion nodes? | Two `KernelExec`s in one plan passing handle batches, through repartitioning and the planner's other rewrites, with a `CopyExec` where rows are needed | Whether §5.3's device plans work as written, or device work must stay inside single nodes |
 
 ---
@@ -1235,13 +1238,13 @@ are the first work for the GPU half days, since they wait on no decision.
    raw handles with owners (§5.7), so kernels from libraries built on the
    other still bind.
 10. **CUDA graphs.** A compiled step could be captured as a CUDA graph,
-    replaying all its launches at once. A graph bakes in its
-    buffers, which suits state written in place (§7) and inputs copied into
-    buffers allocated once. Worth measuring after M2.
+    replaying all its launches at once. A graph bakes in its buffers, which
+    suits state written in place (§7) and inputs copied into buffers
+    allocated once. Worth measuring after M2.
 11. **Python kernels on distributed workers.** datafusion-distributed's
-   workers are Rust servers. A kernel written in Python needs a worker that
-   runs Python, or must be compiled ahead of time, as a Triton kernel can
-   be, and launched from Rust.
+    workers are Rust servers. A kernel written in Python needs a worker
+    that runs Python, or must be compiled ahead of time, as a Triton kernel
+    can be, and launched from Rust.
 12. **A Rust frontend.** A backend for Burn whose arrays are XQL tables
     would do for Rust what torch-sql does for PyTorch (S6.6).
 
@@ -1272,6 +1275,8 @@ are the first work for the GPU half days, since they wait on no decision.
 
 <details>
 <summary>Proposals P-A to P-R, for approval</summary>
+
+P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
 
 - **P-A.** The runtime is a separate project. einfold stays free of device
   execution, and keeps its CPU operator (xarray-sql#307).

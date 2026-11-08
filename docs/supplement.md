@@ -318,16 +318,20 @@ Three kinds of step in torch-sql's nanoGPT need care:
   output position to an input position. Reshapes and slices become gathers
   on those tables, and convolutions shifted folds.
 
-### S2.5 Why B-0 keeps values resident only between steps
+### S2.5 Where B-0 keeps values resident
 
-In B-0, a node's neighbours inside a step are engine operators, which read
-rows. So a node's output stays a compact array only when it is the step's
-result, and a node reads a compact array only when its input is a scan of
-a runtime table. Between those, values become rows. B-0's gain therefore
-depends on how many steps are one node from their scans to their result,
-as well as on how much time is spent inside nodes. That is why the
-design's runtime tables can be read two ways, and why spike 6 measures
-both numbers.
+In B-0, values stay on the device for as long as they pass from one device
+node to another, as handle batches (design §5.3), and become rows wherever
+one of DataFusion's operators sits between two device nodes. A node reads
+a compact array without a copy when its input is a scan of a runtime
+table, which is why runtime tables can be read two ways. B-0's gain
+therefore depends on two numbers, which spike 6 measures: how much of each
+step's time is inside einfold's nodes, and how often a DataFusion operator
+sits between two of them.
+
+If handle batches don't survive DataFusion's rewrites (design spike 7),
+device data can stay on the device only inside one node, and residency
+shrinks to what crosses steps as runtime tables.
 
 ### S2.6 Why B is staged
 
@@ -389,10 +393,12 @@ ddx's two paths handle new data differently:
   the caller: a table changes only by writes into the memory it already
   holds, and is never registered again (ddx#214).
 
-The design publishes new state by swapping in a second copy (R5). In
-Python, that breaks the promise and forces every plan that reads the state
-to be planned again. Hence the design's rule that an engine table holding
-state reads the handle's current buffer when its plan runs.
+The design publishes new state by swapping in a second copy (R5). The
+runtime runs ddx's programs through Rust (design D6), whose compiled plans
+take fresh scans, but a Python caller of ddxdb's `in_place` mode would see
+the promise broken, and every plan that reads the state planned again.
+Hence the design's rule that a table holding state reads the handle's
+current buffer when its plan runs, whichever path runs it.
 
 ### S3.4 Step boundaries and shared subplans
 
@@ -523,7 +529,7 @@ are still moving and are cheaper to change in Python, the costly work
 (engine planning, kernels, array libraries) is native already, and
 `ddxdb.Backend`, xarray-sql and torch-sql are Python.
 
-torch-sql's prototype settled the co-authors on Python first. It is all
+Before D6, torch-sql's prototype led the co-authors to Python first. It is all
 Python, and Python was never its bottleneck: its slow parts are the number
 of queries and planning, both native. Its internals changed in every round
 of review, which Python made cheap. Its one bug of the kind Rust prevents,
@@ -604,7 +610,7 @@ Halide, a language for image-processing pipelines, separates a program's
 the order of loops, what is stored and where, and what runs in parallel.
 A developer can change the schedule freely, because no schedule changes the
 result. The design takes the same split. The SQL is the algorithm, and the
-schedule (design §5.5) holds every physical choice.
+schedule (design §5.6) holds every physical choice.
 
 The split matters because both of the traditions XQL draws on hid the
 schedule:
@@ -620,7 +626,7 @@ schedule:
 
 Agents change the trade-off further. An agent improves a program by a
 loop: change something, run, read the cost, repeat. That needs three
-things, which design R10, §5.5 and §6.6 provide: a schedule the agent can
+things, which design R10, §5.6 and §6.6 provide: a schedule the agent can
 edit, a report it can parse, and a check that its change is still correct.
 XQL has an unusually strong version of the third, since the SQL computes
 the right answer on any engine, and checking mode compares against it.
@@ -644,7 +650,7 @@ time the facts the proof needs. A developer's kernel has no such proof. It
 is tested against its SQL, on the runs that checking mode samples, which
 finds most errors but can miss one that appears only on rare inputs. The
 design therefore treats hand-written bindings as a separate class: counted
-apart, sampled more often, and refusable in strict mode (design §5.6). The
+apart, sampled more often, and refusable in strict mode (design §5.7). The
 two classes share one mechanism, so a binding can move from hand-written
 to detected when einfold learns its pattern.
 
@@ -665,9 +671,10 @@ That means the runtime builds only what no other component does:
 | Planning and running SQL | DataFusion, DuckDB, GPU engines |
 | Differentiation | ddx |
 | Recognizing array work in SQL | einfold |
-| Kernels | Triton, CUTLASS, XLA, `torch.compile`, MLX, or a developer's code |
-| GPU memory | RMM, or the array library's allocator |
+| Kernels | Triton, Gluon, Pallas, cuTile Rust, CUTLASS, XLA, `torch.compile`, MLX, or a developer's code |
+| GPU memory | a shared allocator, such as CUDA's stream-ordered pools or RMM |
 | Moving data between GPUs | NCCL |
+| Distribution | datafusion-distributed |
 | Tables, arrays and plans across each seam | Arrow, DLPack, Substrait |
 | Lifetimes, placement across tiers, the schedule, bindings, checks and reports | the runtime |
 
@@ -690,8 +697,8 @@ making either XQL's representation of a program (design D2):
   is einfold's decision (design §13, question 8).
 
 Building the runtime itself on MLIR would make it a compiler, which is a
-non-goal, and would tie the first, Python-only releases to a large C++
-framework.
+non-goal, and would tie the runtime to a large C++ framework that
+DataFusion doesn't use.
 
 ### S5.6 Values and buffers
 
@@ -730,7 +737,7 @@ The last column is what the design proposes, not what exists.
 | Settings | `jax.config` | `torch.backends`, `torch._dynamo.config` | `SessionConfig`, `SET` | `SET xql_runtime.*` |
 | Memory kinds | `device`, `pinned_host`, `unpinned_host` | `.to(device)`, `pin_memory()` | `MemoryPool`, `DiskManager` | tiers named by Arrow device types: `CUDA`, `CUDA_HOST`, `CPU`, `storage` |
 | Memory accounting | XLA's allocator | caching allocator | `MemoryReservation` from a `MemoryPool` | device reservations from a device pool in `RuntimeEnv` |
-| Allocator | XLA's own (takes 75% at start) | pluggable; `rmm.allocators.torch` | the system allocator | RMM, or the array library's |
+| Allocator | XLA's own (takes 75% at start) | pluggable; `rmm.allocators.torch` | the system allocator | a shared allocator: CUDA's stream-ordered pools, or RMM |
 | Copies between tiers | `jax.device_put` | `.to()`, non-blocking copies | none | `CopyExec` nodes; `prefetch`, `evict`, `pin` |
 | Where work runs | XLA's compiler | the tensor's device | the physical plan | the device plan: `KernelExec` nodes |
 | A program | `jax.jit(f)` | `torch.compile(f)` | none (one query at a time) | `Program(ctx, sql, state=..., outputs=...)` |

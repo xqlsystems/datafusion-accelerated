@@ -2,11 +2,12 @@
 
 ## Status
 
-This project is a proposed layer of XQL that runs programs: it owns the
-memory that holds their tables, keeps data on devices between steps,
-chooses kernels, schedules steps and, later, distributes them. Its design
-is in [docs/design.md](docs/design.md). Nothing is built. Its proposed name is
-`xql-runtime` (design §12.1).
+This project, `xql-runtime`, is a proposed layer of XQL that runs
+programs on devices, as an extension of DataFusion in Rust and Python: it
+owns the memory that holds their tables, keeps data on devices between
+steps, runs kernels, schedules steps, and distributes them through
+datafusion-distributed. Its design is in [docs/design.md](docs/design.md).
+Nothing is built.
 
 Work proceeds in three stages: discussion, then a design doc, then
 implementation. The project is in the design stage.
