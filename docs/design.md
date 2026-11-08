@@ -960,14 +960,9 @@ between the two gets closed.
 - **B-2, regions across steps**, through einfold's program mode, with
   ddx's step graph (ddx#157) and regions (ddx#251).
 
-B-0 comes first because it is the right first interface, not because it
-is expected to be enough. The contributor's measurements already say it
-will stop short. Their fastest steps compile each whole step as one MLX
-program, fuse pointwise chains of up to 64 nodes, and, on Modded-NanoGPT,
-share values across the forward and backward parts of a step, which alone
-took the step from 417 to 233 ms (S1.1). B-0 runs one node at a time and
-has a place for none of these. So B-1 and B-2 are planned (M5, M6), and
-spike 6 measures how far short B-0 stops.
+B-0 comes first as the first interface, not as enough on its own. The
+evidence expects it to stop short (S2.6), so B-1 and B-2 are planned (M5,
+M6), and spike 6 measures by how much.
 
 B pulls einfold's fact table and program mode ahead of its DuckDB and
 sparse-kernel milestones. That is Alex's decision as einfold's maintainer,

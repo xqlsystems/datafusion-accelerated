@@ -390,6 +390,14 @@ whole program is einfold's *program mode*, planned for its M7, after DuckDB
 would make the runtime's GPU milestone wait on all of those. B-0 needs no
 new detection, only a new way to hand over the node einfold already finds.
 
+B-0 is the right first interface, but the contributor's measurements say
+it won't be enough. Their fastest steps compile each whole step as one MLX
+program, fuse pointwise chains of up to 64 nodes, and, on Modded-NanoGPT,
+share values across the forward and backward parts of a step, which alone
+took the step from 417 to 233 ms (S1.1). B-0 runs one node at a time and
+has a place for none of these, so the design plans B-1 and B-2 rather than
+waiting to see whether they are needed.
+
 ---
 
 ## S3. Reasoning behind the execution rules
