@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Spike 7: can handle batches carry device data between DataFusion nodes?
 //!
 //! A *handle batch* is a record batch whose one column holds handles to
