@@ -300,7 +300,17 @@ whole, so a coastline cuts tiles in half, and land cells come back as
 values in a mask: the dense box that torch-sql's design rejected StableHLO
 for. Tiles along one trailing dimension only, such as an embedding's 384
 features per token, would keep cell-level absence for the other
-dimensions, and may be where C starts. The design's spike 1 tests it.
+dimensions, and may be where C starts.
+
+Spike 1 then tested C directly on DataFusion 55.2
+([report](spikes/s01-fixed-shape-tensors/README.md)). A fixed-shape tensor
+column keeps its type through every operator that keeps the column, and
+passes zero-copy through projections, `LIMIT` and `UNION ALL`. But filters,
+sorts, joins, windows and aggregates copy the tiles, arithmetic and `SUM`
+on a tensor column don't plan at all, and arrow-rs has no device memory to
+put the tiles in. So C would need tensor-valued functions in DataFusion,
+each with a derivative rule in ddx, and device memory in arrow-rs, before
+it could run a training step. The design closes it for the milestones.
 
 ### S2.4 What torch-sql's lowerings ask of B
 
@@ -1386,7 +1396,8 @@ query from it:
 - Amazon Redshift: `DISTKEY (k)`, `DISTSTYLE ALL`;
 - Citus: `create_distributed_table` and `create_reference_table`;
 - Hive and Spark: `CLUSTERED BY (k) INTO n BUCKETS`, and `DISTRIBUTE BY`
-  on a query, which DataFusion also parses.
+  on a query, which DataFusion parses but, in 55.2, refuses to plan
+  physically (design spike 1).
 
 Declaring a base table's distribution, and letting the optimizer derive
 the rest, is the design's rule (design D9).
