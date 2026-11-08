@@ -970,3 +970,391 @@ collide, which is why the design asks ddx for an extension that plans
 order and a transaction: each extension contributes codecs and planners
 in two phases, and nothing is written to the session until every
 extension has returned.
+
+---
+
+## S7. Distributed training
+
+The design distributes a program by partitioning its tables and composing
+with datafusion-distributed (design §10.5). This section records why, and
+what is still unproven. The aspiration, as code, is
+[#5](https://github.com/xqlsystems/xql-runtime/issues/5).
+
+### S7.1 Parallelism as partitioning
+
+A database spreads a query across machines by partitioning its tables, and
+moving rows between partitions where a join or an aggregate needs them. A
+training step is a query over the batch, the weights, the optimizer's state
+and, for Samudra, the grid, so the usual kinds of parallelism are choices
+of which table to partition, and by what:
+- **data parallelism** partitions the batch by sample, and keeps a copy of
+  the weights on every GPU, as PyTorch's DDP does;
+- **sharded state** partitions the weights and the optimizer's moments by
+  weight index, as FSDP and ZeRO do;
+- **domain decomposition** partitions the grid by tile, as numerical ocean
+  models run on HPC. For a partial tensor, such as a masked Samudra, land
+  cells have no rows, so they are never stored or moved at all.
+
+In PyTorch these are different wrappers around a model, each with its own
+code path. Here they are declarations in SQL: each table's distribution,
+stated where the table is created, which a developer or an agent can change
+without touching the training step, while the planner chooses the
+partitioning of everything in between, per join, from the whole step's
+plan. That is torch-sql's
+hypothesis H1: that choosing the partitioning this way distributes a model
+like Samudra better than FSDP does.
+
+### S7.2 Collectives as relational operators
+
+| Collective | Relational form |
+|---|---|
+| all-reduce of gradients | partial `SUM` per partition, shuffle by key, final `SUM`: a reduce-scatter, with the gather left to whoever reads the result next |
+| reduce-scatter | the same, without the gather |
+| all-gather | a replicated table, or a broadcast join |
+| broadcast | a broadcast join |
+| all-to-all | a repartition |
+| halo exchange | the rows of an index-table join that cross a tile's edge |
+| send and receive | a shuffle between two partitions |
+
+The relational form has two advantages. The planner writes it, so nothing
+in the model names a collective, and it moves only the rows a join needs:
+a halo exchange moves a tile's edge, and land cells never move.
+
+It also has a disadvantage, which is unmeasured. NCCL's collectives are
+tuned for each topology: rings and trees, and on NVLink switch systems
+reductions done inside the switch. A shuffle-and-sum is bandwidth-optimal
+on paper, but nobody has run it against NCCL on the same GPUs. Design spike
+8 does. If it loses, the runtime adds a collective node that recognizes a
+shuffle-and-sum and calls NCCL's reduce-scatter, which keeps the relational
+form in the plan and NCCL's speed in the run.
+
+### S7.3 Transport decides whether it's fast
+
+datafusion-distributed moves Arrow record batches over gRPC, through host
+memory. For queries over files that is the right default. For a training
+step it puts a host round trip into every gradient reduction and every
+halo exchange: the cost that S1.1 measured on one machine, now multiplied
+by the network. A GB200 NVL72 rack joins its 72 GPUs with NVLink, so
+within a rack the right transport never touches a host. That is why the
+design lowers exchanges to the device's own transports as part of
+distribution, not an optimization of it (S7.7,
+[#6](https://github.com/xqlsystems/xql-runtime/issues/6)),
+and why the schedule records the topology: device copies within a node,
+NVLink within a rack, the network across racks
+([#8](https://github.com/xqlsystems/xql-runtime/issues/8)).
+
+### S7.4 Queries against training programs
+
+Distributed query engines are built for queries that run once: plan,
+ship stages, run, discard. A training step runs thousands of times, with
+state that must stay where it was computed. Three things follow, none of
+which distributed query engines provide today
+([#7](https://github.com/xqlsystems/xql-runtime/issues/7)):
+- **stages deployed once**, which a run only triggers, as a compiled
+  program does on one machine (design §5.4);
+- **state resident on workers**, each partition of `w` on one worker's GPU,
+  referred to from the coordinating session by a remote table handle;
+- **placement by affinity**, so the task that updates `w[k]` runs where
+  `w[k]` lives.
+
+This extends the runtime's own layer, the program, across machines. It is
+the largest piece of new design in distribution, and the one most likely
+to need hooks from whichever distributed engine hosts it.
+
+### S7.5 datafusion-distributed and Ballista
+
+[Ballista](https://github.com/apache/datafusion-ballista) is Apache
+DataFusion's own distributed engine, and the alternative to
+datafusion-distributed (design D7).
+
+| | datafusion-distributed | Ballista |
+|---|---|---|
+| Shape | a library on `SessionStateBuilder`; any node can coordinate | an engine: scheduler and executor processes |
+| Data between stages | streamed over gRPC | staged mode writes shuffle files; pipelined mode (experimental) streams over Arrow Flight |
+| Python | no binding ([#10](https://github.com/xqlsystems/xql-runtime/issues/10)) | `BallistaSessionContext`, but no custom codecs from Python yet ([ballista#2618](https://github.com/apache/datafusion-ballista/issues/2618)) |
+| Custom nodes | a codec registered on every session | extension codecs, in Rust |
+| Failure | a failed task fails the query | staged mode re-runs failed tasks; pipelined mode fails the job |
+| Processes | workers are servers, stateless per query | executors are long-lived, under a central scheduler |
+| Published speed | its README reports beating Ballista on TPC-H | |
+
+datafusion-distributed fits the design's shape better: it is a library,
+"vanilla DataFusion plus nodes" as the runtime is (design R11), it streams
+between stages instead of writing them to disk, and it composes with the
+runtime on the same builder. Ballista's strengths are where training's
+needs differ from queries': a central scheduler and long-lived executors
+are a natural home for stages deployed once and for placement by affinity
+(S7.4), its staged mode recovers from a failed task without restarting the
+run, and its Python client exists. Neither has a device-aware transport.
+
+So D7 stands, and design spike 9 checks it against a distributed training
+step before M7 ([#13](https://github.com/xqlsystems/xql-runtime/issues/13)).
+Either way, the runtime's side of the contract should stay the same:
+device nodes with a codec, and hooks for placement. Then the runtime
+depends on neither engine's internals, and a training job could move from
+one to the other.
+
+### S7.6 Failure
+
+A distributed training step is synchronous: every tile's gradient is
+summed before the weights update. One slow GPU stalls every step, and one
+failed worker fails the run, as with DDP. With state spread across
+workers, R5's atomic publication would need every worker to agree before
+any publishes. The simpler rule, which the design takes, is to restart
+from the last checkpoint, which each worker writes its shards into
+([#11](https://github.com/xqlsystems/xql-runtime/issues/11)). Whether a
+run can survive a lost worker without a restart, as Ballista's staged mode
+allows for queries, is open.
+
+### S7.7 Lowering exchanges to NCCL and NVLink
+
+The relational layer decides *what* moves: the exchanges in a device plan
+say which blocks go to which partition. The runtime decides *how*, by
+lowering each exchange to the fastest transport that is exact for it
+(design §10.5). Under that sits a standard split of distributed systems:
+datafusion-distributed's gRPC as the *control plane*, carrying plans,
+stages, task assignment, metrics and the bootstrap of each collective
+library, and NCCL and NVLink as the *data plane*, carrying the bytes. The
+SQL is the same, the plan has the same nodes, and `EXPLAIN` shows the
+transport each exchange got.
+
+**Exactness reduces to two conditions.** A shuffle by key between a partial
+and a final `SUM` is a reduce-scatter only if each rank's share of the key
+is a contiguous slice, which is why sharded state is declared `blocks(k)`
+rather than `hash(k)`, and only if each partial is dense over the key, which
+compact arrays are. A third subtlety is absence: in SQL a `SUM` over no rows
+gives no row, where a dense collective gives zero. So the collective reduces
+a count beside each sum, and a group that no partition reached stays absent.
+This is einfold's three cell states (absent, NULL, a value) carried through
+a collective.
+
+**Speed comes from what DDP already does, plus what the design makes easy:**
+- *Persistent communicators and registered buffers.* Communicators are
+  created once per compiled program, and buffers are registered with NCCL
+  once, because state is written in place and exchange buffers are
+  allocated once. Registration enables zero-copy transfers, and on NVL72,
+  NVLS, the NVLink switches' in-network reductions. NVLS wants buffers from
+  CUDA's virtual-memory APIs, which may conflict with stream-ordered pools
+  ([#19](https://github.com/xqlsystems/xql-runtime/issues/19)).
+- *Bucketing.* A step's many small reductions are fused into grouped calls
+  over flat buffers, as DDP's gradient buckets do.
+- *Overlap.* A layer's reduction starts on a communication stream while
+  earlier layers' backward steps still compute, ordered by events
+  ([#18](https://github.com/xqlsystems/xql-runtime/issues/18)).
+- *CUDA graphs.* NCCL calls can be captured, so a compiled step with stable
+  buffers could replay whole, collectives included.
+- *One-sided halos.* Within an NVL72 rack, GB200's fabric memory handles let
+  a GPU map a neighbour's memory across nodes, so a halo can be written
+  straight into the neighbour's buffer by an ordinary bound kernel.
+
+**Composing with what is already in the process.** NCCL finds the topology
+itself, so the runtime asks it rather than keeping a second model. As a
+co-processor beside PyTorch, the runtime derives its communicator from one
+the host exposes (`ncclCommSplit`) rather than starting a second world.
+`ncclCommAbort` on a failed worker fits the design's restart rule (S7.6).
+And since NCCL's reduction order depends on the algorithm it picks, a
+session that requires reproducibility pins the algorithm.
+
+### S7.8 The portability test: AMD and TPU clusters
+
+A design that only fits NVIDIA's hardware would be a CUDA runtime with SQL
+on top. So the design was tested against two other kinds of cluster:
+
+| | NVIDIA GB200 | AMD MI300-class | Google TPU |
+|---|---|---|---|
+| Within a domain | NVLink through NVSwitches: 72 GPUs per rack, any to any | Infinity Fabric: 8 GPUs per node, a full mesh with no switch | ICI: a 2D or 3D torus with wraparound, up to thousands of chips per slice |
+| Between domains | InfiniBand | Ethernet (RoCE) or InfiniBand | the data-centre network, between slices |
+| Collectives | NCCL, called per operation on a stream | RCCL, which implements NCCL's API | compiled by XLA into the program; nothing to call on its own |
+| Raw pointers and queues for users | yes | yes, through HIP | no: buffers belong to PJRT, inside compiled programs |
+| Arrow and DLPack device type | `CUDA`, `CUDA_HOST` | `ROCM`, `ROCM_HOST` | none |
+| Kernel languages | Triton, Gluon, Pallas, cuTile Rust, CUTLASS | Triton, HIP, CubeCL | Pallas (Mosaic TPU), inside XLA programs |
+
+**The relational core passed unchanged.** Declared partitioning,
+exchanges in the plan and collectives as relational operators assume no
+topology, so they hold on all three. A torus suits domain decomposition
+especially well: torus networks were built for stencils, every halo
+exchange of a grid mapped onto the torus goes to a direct neighbour, and
+Samudra's periodic longitude, which wraps around the globe, maps onto the
+torus's own wraparound.
+
+**AMD mapped almost one to one.** HIP mirrors CUDA's contexts, streams,
+events and stream-ordered allocator, RCCL speaks NCCL's API, and Arrow and
+DLPack have ROCm device types. What it tested was the topology: with no
+72-GPU domain, Samudra's 36 GPUs span five nodes, so the design's "first
+distribution stays within one rack" turned out to be NVIDIA-specific, and
+placement has to keep most halos within a node from the start. With no
+switch, there are no in-switch reductions; rings and trees do instead.
+
+**The TPU found four places where the device layer was CUDA-shaped:**
+1. **The kernel contract** handed kernels raw pointers, contexts and
+   streams, which TPUs don't give users. It is now defined per device
+   family: DLPack where a device has a type, the backend's native buffers
+   otherwise, an execution context and queue rather than a CUDA context and
+   stream, and bindings that are either callables or functions the backend
+   compiles in
+   ([#20](https://github.com/xqlsystems/xql-runtime/issues/20)).
+2. **Collectives were assumed callable.** On a TPU they exist only inside a
+   compiled program, and speed comes from XLA scheduling them across the
+   whole step. So transports are either eager or compiled, and regions may
+   contain exchanges, which a compiled transport lowers with the region's
+   computation. B-0, one node at a time, is therefore a poor fit for TPUs
+   ([#21](https://github.com/xqlsystems/xql-runtime/issues/21)).
+3. **Tiers were named by Arrow device types**, and a TPU has none. They are
+   now named by device family, and a TPU's tables cross into DataFusion only
+   through the host.
+4. **The topology was a list of tiers.** It is now a graph, covering
+   switched domains, full meshes and tori, taken from each platform's own
+   discovery, with placement as an embedding of the partition grid into it
+   ([#8](https://github.com/xqlsystems/xql-runtime/issues/8)).
+
+None of these changed the design's shape, which is why it passed: the
+generalizations sit in the backends, in how an exchange is lowered, how a
+kernel binds and how partitions are placed. Spikes 10 and 11 test the
+prediction on real AMD and TPU hardware
+([#22](https://github.com/xqlsystems/xql-runtime/issues/22),
+[#23](https://github.com/xqlsystems/xql-runtime/issues/23)).
+
+---
+
+## S8. Database theory for parallelism
+
+The design's parallelism follows four decades of work on parallel
+databases. This section maps that work onto it. Most of it confirms the
+design. Five points changed it (design §10.5): placement through
+DataFusion's physical properties, blocks rather than rows in exchanges,
+tensor and pipeline parallelism, a cost model for the partitioning of
+intermediates, and a stated rule for halos.
+
+### S8.1 Exchange operators and physical properties
+
+Graefe's *exchange* operator, in the Volcano system (SIGMOD 1990), put all
+of a plan's parallelism into one operator, so that every other operator
+runs unchanged on its partition. datafusion-distributed's network nodes
+and the runtime's `CopyExec` are exchanges.
+
+The Volcano optimizer generator and its successor Cascades then treated
+partitioning as a *physical property*. Each operator requires a property of
+its inputs and delivers one on its output, and the optimizer inserts an
+*enforcer*, here an exchange, wherever the two differ. SCOPE, Microsoft's
+distributed SQL system (Zhou, Bruno and Lin, ICDE 2010), and Greenplum's
+Orca optimizer (Soliman et al., SIGMOD 2014) reason about distribution
+this way, and Orca's *Motion* operators (redistribute, broadcast, gather)
+are what the design calls shuffles.
+
+DataFusion has the same framework: `Distribution` requirements,
+`Partitioning`s that nodes deliver (hash, round robin, and, since
+DataFusion 55, ranges), and the `ensure_requirements` rule that inserts
+repartitions. That is why the design places tiles and shards through it,
+rather than through a rule of the runtime's own.
+
+### S8.2 Aggregates that can be summed in parts
+
+Gray et al.'s data cube paper classifies aggregates as *distributive*,
+such as `SUM`, *algebraic*, such as `AVG`, kept as a sum and a count, or
+*holistic*, such as a median. Only the first two can be computed in parts
+and combined, which is what makes "a partial sum per GPU, a shuffle, a
+final sum" a correct all-reduce. Yan and Larson's *eager aggregation*
+(VLDB 1995) is the general rule for moving an aggregate below a join. A
+float `SUM` computed in parts adds in a different order, which the design's
+floating-point bound covers (design §6.3).
+
+Training as an aggregate has its own prior art. Bismarck (Feng, Kumar,
+Recht and Ré, SIGMOD 2012) and MADlib (VLDB 2012) ran stochastic gradient
+descent inside databases as user-defined aggregates. The parameter server
+(Li et al., OSDI 2014) is weight state partitioned by key, pushed to and
+pulled from: the design's `hash(k)` state.
+
+### S8.3 Communication cost, and its lower bounds
+
+The *massively parallel communication* model (Beame, Koutris and Suciu,
+PODS 2013) measures a parallel join by the data each server receives. In
+it, the *HyperCube* or *Shares* algorithm (Afrati and Ullman, EDBT 2010) is
+optimal for joins done in one round, and the bounds depend on the join's
+structure.
+
+A matrix product is a join and a `SUM`. HyperCube applied to it is the
+3D distributed matrix multiply, whose communication lower bounds are known
+(Irony, Toledo and Tiskin, 2004), and which Solomonik and Demmel's 2.5D
+algorithm (2011) trades against memory. Tensor parallelism, as Megatron
+does it, and its 2D, 2.5D and 3D variants are therefore partitionings of a
+join too, which the design's table of strategies now lists.
+
+Two things follow:
+- the cost model that chooses intermediates' partitionings (design §10.5)
+  can use this communication load as its measure, as Alpa (Zheng et al.,
+  OSDI 2022) and EinDecomp do with their own;
+- spike 8 has a second target: the lower bound for each join, beside NCCL.
+
+### S8.4 Band joins, and halos
+
+A halo exchange is a *band join* on grid coordinates: each output cell
+joins input cells within a fixed distance (DeWitt, Naughton and Schneider,
+1991). Spatial joins handle it by replicating boundary tuples into
+neighbouring partitions, as PBSM does (Patel and DeWitt, SIGMOD 1996), and
+avoid duplicate results with the *reference point method* (Dittrich and
+Seeger, 2000): each result is produced only by the partition that owns it.
+The design's halo rule is that method: replicate to the band's width, and
+let the owner compute.
+
+### S8.5 Iterative computation
+
+Training repeats one step thousands of times, and distributed systems for
+iterative work keep data where it was computed:
+- HaLoop (Bu et al., VLDB 2010) schedules each iteration's tasks where the
+  previous iteration left its data, and caches what doesn't change;
+- Spark (Zaharia et al., NSDI 2012) persists data across iterations, and
+  recovers a lost partition from its lineage;
+- Naiad (Murray et al., SOSP 2013) deploys a dataflow with loops once.
+
+The design's distributed programs, with stages deployed once and state
+resident on workers, follow them ([#7](https://github.com/xqlsystems/xql-runtime/issues/7)). Synchronous steps are Valiant's
+bulk-synchronous parallel model. Its relaxations, such as stale-synchronous
+parallelism, would conflict with R5 and R9, so the design keeps steps
+synchronous.
+
+### S8.6 Tensor-relational systems, and ML's own sharding
+
+The closest prior art to the whole design is Chris Jermaine's group:
+SimSQL, which trained neural networks as relational computations; the
+[tensor relational algebra](https://par.nsf.gov/biblio/10320005-tensor-relational-algebra-distributed-machine-learning-system-design)
+(TRA, VLDB 2021), in which relations hold tiles of tensors rather than
+single values, and an implementation algebra chooses how each is
+partitioned; [relational auto-differentiation](https://arxiv.org/abs/2306.00088)
+(ICML 2023), which is ddx's territory; and
+[EinDecomp](https://arxiv.org/html/2410.02682v1), which chooses how to split
+einsums for parallel execution automatically.
+
+Their central lesson matches S1: at the grain of distribution, a tuple
+should be a block, not a scalar. Long-format rows are the right model of an
+array's meaning, and the wrong unit to send across a network. The design's
+compact arrays are its blocks, so its exchanges move them whole.
+
+On the ML side, Mesh-TensorFlow (Shazeer et al., 2018) maps named tensor
+dimensions onto a mesh of devices, and GSPMD (Xu et al., 2021) propagates
+sharding annotations through a program. Partitioning a table by named
+columns is the same idea in relational terms.
+
+### S8.7 Declaring distribution in SQL
+
+MPP databases declare a table's distribution in its DDL, and plan every
+query from it:
+- Greenplum: `DISTRIBUTED BY (k)`, `DISTRIBUTED REPLICATED`;
+- Amazon Redshift: `DISTKEY (k)`, `DISTSTYLE ALL`;
+- Citus: `create_distributed_table` and `create_reference_table`;
+- Hive and Spark: `CLUSTERED BY (k) INTO n BUCKETS`, and `DISTRIBUTE BY`
+  on a query, which DataFusion also parses.
+
+Declaring a base table's distribution, and letting the optimizer derive
+the rest, is the design's rule (design D9).
+
+### S8.8 Logical and physical
+
+In Codd's terms, partitioning is *physical*: it doesn't change what a query
+means, which is the guarantee data independence gives (design R7). It is
+still declared in SQL, as indexes and `DISTRIBUTED BY` are, because SQL is
+where a program's author states what they intend. One case looks like an
+exception, and isn't. When partitioning would change a result, as batch
+norm with statistics per device does, the dependence is part of the model,
+and the model says it: a `GROUP BY` on a tile column. The two never mix:
+declared distributions change nothing but speed, and anything that changes
+a result is written as logic, where ddx differentiates it and checking mode
+compares it.
