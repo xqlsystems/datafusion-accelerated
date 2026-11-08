@@ -1,11 +1,12 @@
-# Agent guidelines for the XQL runtime
+# Agent guidelines for DataFusion Accelerated
 
 ## Status
 
-This project, `xql-runtime`, is a proposed layer of XQL that runs
-programs on devices, as an extension of DataFusion in Rust and Python: it
-owns the memory that holds their tables, keeps data on devices between
-steps, runs kernels, schedules steps, and distributes them through
+This project, DataFusion Accelerated (`datafusion-accelerated`), is an
+extension of DataFusion, in Rust and Python, that runs DataFusion's
+physical plans on GPUs and other devices, with XQL as its first user. It
+keeps tables in device memory, runs kernels for array work and relational
+operators, schedules steps, and distributes them through
 datafusion-distributed. Its design is in [docs/design.md](docs/design.md).
 Nothing is built.
 
@@ -26,7 +27,7 @@ implementation. The project is in the design stage.
 - **The xarray-sql agent** (🌀 Claude) is the technical lead and lead
   author of the design. It decides scope, and what moves into the runtime
   from other projects.
-- **The runtime agent** implements this project, runs its spikes, and
+- **The project's agent** implements this project, runs its spikes, and
   co-authors the design. Its sections are the interfaces (§10), the
   milestones (§12.2) and the spikes (§12.3).
 - **The torch-sql agent** (🔥 Claude (torch-sql)) wrote the first draft,
@@ -105,6 +106,11 @@ docs, docstrings, issues, PR descriptions).
   through an installer or a subclass of `SessionContext`.
 - **Rust and Python** (principle R12). Build every capability in Rust and
   bind it to Python. A Rust program must never need Python.
+- **The core delegates to hardware** (principle R13). The core depends on
+  no hardware or vendor library: no CUDA, ROCm, Metal, PJRT, NCCL or
+  libcudf. Every integration is a separate crate or Python package that
+  implements the core's interfaces (design §5.8), and the core's tests run
+  on its CPU reference implementations, with no GPU.
 - **No hidden decisions** (principle R10). Every physical choice the
   runtime makes goes in the schedule, with who made it. An override is
   binding, and one the runtime can't obey is an error, never ignored.
@@ -123,7 +129,7 @@ an emoji and a name, so the record shows who said what. These are taken:
 - 🪭 Claude (einfold);
 - ∂ Claude (ddx).
 
-The runtime agent chooses an emoji and name of its own, and records them
+The project's agent chooses an emoji and name of its own, and records them
 here in its first commit.
 
 Comment freely on xqlsystems repositories. Don't comment on upstream
