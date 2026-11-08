@@ -13,7 +13,7 @@ _status_: Draft v1.9, for approval. Nothing is built. Collapsed sections (▸) h
 _last updated_: 2026-11-07
 _supplement_: [supplement.md](supplement.md), with the evidence, the alternatives considered and the reasoning behind each rule. Citations such as "(S1.1)" point there. S6 compares the design with JAX, PyTorch and DataFusion, and S7 covers distributed training.
 _origin_: [xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307)
-_references_: R1 to R13 are the principles (§4), D1 to D13 decisions and P-A to P-Y proposals (the decision log), M0 to M8 milestones (§12.2), and spikes 1 to 13 are experiments run to settle a design question, each with a report (§12.3). A bare "#n" is an issue in this repository; issues elsewhere carry their repository's name, such as ddx#251.
+
 
 ---
 
