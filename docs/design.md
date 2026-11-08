@@ -505,6 +505,23 @@ Rules:
   runtime's pool. Only device nodes read them. The physical rule places a
   `CopyExec` wherever a handle batch would reach one of DataFusion's
   operators (S6.5).
+- **Device segments are opaque to DataFusion's optimizer** (spike 7). A
+  handle batch's schema hides the logical columns, so DataFusion can't
+  reason about the data inside a segment, and three rules keep its
+  operators out:
+  - device nodes report that they don't benefit from more input
+    partitions (`benefits_from_input_partitioning` is `false`). With
+    DataFusion's default, its optimizer put a round-robin repartition
+    between device nodes, which moved handles to partitions that don't own
+    their buffers;
+  - the runtime's placement rule runs after DataFusion's rules, as a rule
+    added to the session builder does, so nothing rewrites a segment once
+    it is placed. The rule then checks the plan's invariants itself, since
+    DataFusion's `SanityCheckPlan` has already run;
+  - inside a segment, every exchange is the runtime's own node, never
+    DataFusion's `RepartitionExec`, which would hash the handles. A
+    segment's last node restates the logical partitioning and ordering for
+    the host plan above it.
 - **Partitions map to the hardware.** On one GPU, a node's partitions run
   on separate queues, such as CUDA or HIP streams. Across GPUs in one machine, each partition
   runs on one device.
@@ -1513,7 +1530,8 @@ on the cloud or on the Beta cluster, are available half a day a week.
   and from Rust.
   MLX follows, or comes first if the contributor's Apple work gets there
   sooner.
-- *Needs:* einfold's B-0 interface and fact table, and spikes 6 and 7.
+- *Needs:* einfold's B-0 interface and fact table, and spike 6. Spike 7
+  is done.
 - *Done when:* demo 2 trains on an NVIDIA GPU in strict mode, its state
   never leaving the device between steps, within the bound of §6.3 against
   NumPy, with the share of time in device nodes shown by `EXPLAIN ANALYZE`.
@@ -1562,7 +1580,7 @@ rack (§10.5).
   results, with the time in device nodes reported, and with no change to
   the core when the libcudf integration is swapped for a CPU stand-in.
 
-M2 is the critical path. It waits on spikes 6 and 7, and on Alex's
+M2 is the critical path. It waits on spike 6, and on Alex's
 decision on einfold's roadmap. Spikes 2 and 3, which need NVIDIA hardware,
 are the first work for the GPU half days, since they wait on no decision.
 
@@ -1576,7 +1594,7 @@ are the first work for the GPU half days, since they wait on no decision.
 | 4 | What does crossing from Python cost? | datafusion-ffi's overhead for the runtime's nodes (S4.1); launching a Triton kernel from a `KernelExec` through Python, and whether the call holds Python's lock | Which Python kernels are worth binding, and whether some must be compiled ahead of time |
 | 5 | Where does the last 3.76× against PyTorch go? | Trace one warm resident step on the M5 Ultra against PyTorch MPS, by kind of operation, after reading the contributor's own comparison | What M2 and M5 should fix first |
 | 6 | How much of each step does einfold already cover? | `EXPLAIN ANALYZE` with einfold on, for demo 2, demo 4 and torch-sql's nanoGPT: the share of time inside einfold's nodes, and how often a DataFusion operator sits between two of them (S2.5). einfold's agent runs einfold's side | How far B-0 gets, and whether M5 is needed |
-| 7 | Can handle batches carry device data between DataFusion nodes? | Two `KernelExec`s in one plan passing handle batches, through repartitioning and the planner's other rewrites, with a `CopyExec` where rows are needed | Whether §5.3's device plans work as written, or device work must stay inside single nodes |
+| 7 | Can handle batches carry device data between DataFusion nodes? | Two `KernelExec`s in one plan passing handle batches, through repartitioning and the planner's other rewrites, with a `CopyExec` where rows are needed | Whether §5.3's device plans work as written, or device work must stay inside single nodes. **Done:** they work, under three rules now in §5.3 ([report](spikes/s07-handle-batches/README.md)) |
 | 8 | Can relational collectives match NCCL? ([#12](https://github.com/xqlsystems/datafusion-accelerated/issues/12)) | Reduce one demo 2 step's gradients on 8 GPUs, then 2 nodes: NCCL all-reduce, NCCL reduce-scatter and all-gather, and a shuffle by key with a final sum | Whether the runtime needs a collective node that calls NCCL, or plain shuffles suffice |
 | 9 | Which host suits distributed training, datafusion-distributed or Ballista? ([#13](https://github.com/xqlsystems/datafusion-accelerated/issues/13)) | One distributed demo 2 step on each, CPU first: per-run overhead over 100 runs, and deploying stages once | Whether D7 holds for training, or the distributed contract stays neutral between them (S7.5) |
 | 10 | Does AMD's stack slot in with no runtime changes beyond a backend? ([#22](https://github.com/xqlsystems/datafusion-accelerated/issues/22)) | One distributed demo 2 step on an 8-GPU MI300-class node: HIP, RCCL, a Triton kernel, tiles placed per node | Whether the device-family contract holds for ROCm, and whether AMD needs placement from the start |
@@ -1720,8 +1738,8 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
 - **P-P.** The runtime builds no compiler, allocator, communication library
   or distributed planner (§3.2, R11).
 - **P-Q.** A device plan is a DataFusion physical plan with `KernelExec`
-  and `CopyExec` nodes, passing handle batches between device nodes
-  (§5.3, spike 7).
+  and `CopyExec` nodes, passing handle batches between device nodes, under
+  the three rules spike 7 found (§5.3).
 - **P-R.** Every extension attaches to DataFusion the same way, the runtime,
   its integrations and XQL's projects alike: a builder method in Rust, and
   an extension object for `with_extensions` in Python (§5.1, §5.8).
