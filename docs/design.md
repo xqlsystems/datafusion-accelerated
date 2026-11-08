@@ -1524,7 +1524,7 @@ In short:
 
 | Code | Goes to |
 |---|---|
-| `SharedExecutor`'s caching of CTEs (xarray-sql#302) | ddx's SQL path (ddx#168) for gradients, and DataFusion's planned-once CTEs for forward queries; the executor retires |
+| `SharedExecutor`'s caching of CTEs (xarray-sql#302) | ddx's SQL path (ddx#168) for gradients. For forward queries, DataFusion's `WITH … AS MATERIALIZED` once it lands, and shared views stored as tables until then, since DataFusion 55 computes a CTE once per read (xarray-sql#267); the executor retires |
 | `DenseExecutor` (xarray-sql#303) | the runtime's device plans over compact arrays (§5.3); the executor retires |
 | MLX kernels and `DenseExecutor`'s MLX operators | the Metal integration's MLX array backend (§5.8), never the core |
 | `TrainingSession` (xarray-sql#305) | the runtime's programs (§5.4), with state kept on the device and published after validation (R5); the session retires |
