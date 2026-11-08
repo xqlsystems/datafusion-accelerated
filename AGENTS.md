@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Agent guidelines for DataFusion Accelerated
 
 ## Status
@@ -115,6 +121,12 @@ docs, docstrings, issues, PR descriptions).
 - **No hidden decisions** (principle R10). Every physical choice the
   runtime makes goes in the schedule, with who made it. An override is
   binding, and one the runtime can't obey is an error, never ignored.
+- **License every file** under Apache 2.0, following the
+  [REUSE](https://reuse.software/) specification, as einfold and ddx do.
+  Give each new file an SPDX header:
+  `reuse annotate --copyright "Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors" --year 2026 --license Apache-2.0 <file>`.
+  A file that can't carry a header, such as a lockfile, goes in
+  `REUSE.toml`. `reuse lint` runs in CI and must pass.
 - **Cap memory in tests.** DataFusion can exhaust memory planning a deep
   query, which has crashed sessions on this machine. Run tests under a
   memory cap, for example

@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Coming from PyTorch on CUDA, or JAX on TPU
 
 _status_: Draft, for review. DataFusion Accelerated isn't built yet. Every
