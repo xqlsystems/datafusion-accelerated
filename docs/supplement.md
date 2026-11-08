@@ -49,23 +49,54 @@ Some limits on these numbers:
   compiled once with MLX's compiler.
 - The 101 ms run didn't check each step against PyTorch; a separate
   five-step run that did took 146 ms per warm step.
-- Nobody has measured where the remaining 3.76× goes (the design's spike
-  5).
+- Nobody has measured where the remaining 3.76× on the Shakespeare
+  recipe goes (the design's spike 5).
 
 The work has continued on unreviewed branches. Modded-NanoGPT is a
 124M-parameter GPT trained on FineWeb text at context 1,024 with Muon, an
-optimizer that orthogonalizes each update. On it, the latest SQL step takes
-239 ms on the M5 Ultra, against PyTorch MPS's 182 ms: about 1.3 times
-slower. The gains came from more proofs, in new modules in xarray-sql:
+optimizer that orthogonalizes each update. On it, the latest SQL step
+takes 238.95 ms on the M5 Ultra, against 185.40 ms for a PyTorch control
+refreshed on the same day: 1.29 times slower. Both ran at batch 1 in
+float32, and PyTorch ran eagerly on MPS, without `torch.compile`, with
+unfused AdamW (`GPU_NUMERICAL_VALUE_IDENTITIES.md` on xarray-sql's
+`codex/numerical-value-identities` branch). Five days earlier the same
+workload took 606 ms against PyTorch's 182 ms, and peaked at 24.67 GB of
+process resident memory against PyTorch's 2.44 GB
+(`MODDED_NANOGPT_PERFORMANCE.md`). The latest run peaked at 20.34 GB, and
+its report gives no PyTorch figure to compare. Resident memory isn't
+device memory, since MLX and MPS account for the GPU's memory
+differently, but the gap is large either way.
+
+Most of the speed comes from treating a step as a whole. `TrainingSession`
+compiles each whole step as one MLX program (`mx.compile`), and
+`_dense_mlx.py` fuses pointwise chains of up to 64 nodes into one compiled
+program. One more change did most of the latest gain: values shared across
+the forward and backward parts of a step took it from 417 to 233 ms. That
+cache holds a fixed number of bytes, evicts the least recently used value
+when it is full, and recomputes a value read again after its eviction.
+
+The gains came from proofs, and most of them live in einfold's
+`DenseProgram`, in the contributor's fork of einfold. Twelve commits on
+top of einfold#157, on `codex/compact-graph-optimizer`,
+`codex/typed-reduction-patterns` and ten `m7/*` branches (tip `3108f7a`),
+add 2,366 lines. Of those, 660 go to `dense_program.py`, now 2,211 lines,
+and none change einfold's Rust. Four modules in xarray-sql build on
+`DenseProgram`'s reduction graph:
 - `_dense_adjoint.py` proves that ddx's derivatives of attention match a
   kernel;
 - `_dense_proofs.py` proves when a row exists, from coordinates alone;
 - `_dense_attention.py` proves the shape of attention from einfold's
-  reduction graph.
+  reduction graph;
+- `_dense_indexed.py` (210 lines) checks when compact indexed partial
+  sums can be added on the GPU in the order of SQL's `UNION`.
+
+A fifth, `_dense_segment.py` (42 lines), is a kernel rather than a proof:
+it sums dynamic SQL groups on the GPU in a fixed order.
 
 That is the design's design B growing on its own, one proof at a time, but
-in a frontend instead of in einfold. Each proof that lands in the wrong
-layer makes the right layer harder to reach.
+on design A's interpreter (S2.1) instead of einfold's Rust IR. Each proof
+that lands there makes einfold's own detection harder to reach, and none
+of the proofs can move without being rewritten.
 
 Five lessons follow:
 
@@ -87,7 +118,8 @@ Five lessons follow:
 4. **Compact execution became a second implementation of SQL.**
    `DenseProgram` interprets DataFusion's logical plans operator by
    operator (joins, grouped aggregates, `UNION` with bag semantics, and NULL
-   handling) in 1,564 lines of Python beside einfold's Rust (S2.1).
+   handling) in 1,564 lines of Python beside einfold's Rust (S2.1), and
+   2,211 lines on the contributor's newest branch.
 5. **The pieces coupled through private names.** xarray-sql's executors
    import 18 private names from `einfold.dense_program`, einfold's private
    `einfold._native`, and ddx's private `ddxdb._ddxdb.to_sql`.
@@ -357,6 +389,14 @@ whole program is einfold's *program mode*, planned for its M7, after DuckDB
 (its M4), facts (its M5) and sparse kernels (its M6). Regions across steps
 would make the runtime's GPU milestone wait on all of those. B-0 needs no
 new detection, only a new way to hand over the node einfold already finds.
+
+B-0 is the right first interface, but the contributor's measurements say
+it won't be enough. Their fastest steps compile each whole step as one MLX
+program, fuse pointwise chains of up to 64 nodes, and, on Modded-NanoGPT,
+share values across the forward and backward parts of a step, which alone
+took the step from 417 to 233 ms (S1.1). B-0 runs one node at a time and
+has a place for none of these, so the design plans B-1 and B-2 rather than
+waiting to see whether they are needed.
 
 ---
 
