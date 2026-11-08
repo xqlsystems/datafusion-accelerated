@@ -476,9 +476,12 @@ def attention(args):
 - **Absence is free only as rows.** Cells with no row, such as land in an
   ocean model, cost nothing in long format. A compact array stores every
   cell of its domain, so there an absent cell costs its storage and its
-  arithmetic as a masked value, as in a dense array. The runtime holds a
-  table compactly only when its domain is known and dense enough
-  ([design §5.2](../design.md)), so a sparse table stays as rows.
+  arithmetic as a masked value, as in a dense array. The runtime stores
+  compact arrays as small dense blocks and leaves out the blocks with no
+  rows, so absence that comes in patches, such as continents, mostly stays
+  unstored. Absence scattered cell by cell still costs, and a table where
+  it would cost too much stays as rows
+  ([design §5.2](../design.md)).
 - **Nothing here is built yet,** except DataFusion, ddx, xarray-sql and
   torch-sql, which run today on the CPU. The design's
   [milestones](../design.md) say what comes first.

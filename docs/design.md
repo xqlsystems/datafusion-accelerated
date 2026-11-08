@@ -477,22 +477,30 @@ Rules:
 - **Runtime tables are DataFusion table providers**, read as Arrow batches
   by DataFusion's operators, and as compact arrays by device nodes that
   scan them directly (§5.3).
-- **A table is held compactly only when its domain is known and dense
-  enough.** A compact array stores every cell of its domain, so an absent
-  cell costs its storage and its arithmetic, as a masked value. Only rows
-  make absence free, and rows are the slow path (S1.1). The runtime
-  chooses the compact layout for a table that one of einfold's nodes reads
-  or writes when the fact table gives its domain (each dimension's extent,
-  or a table of the domain), and its density, the share of the domain's
-  cells that have rows, is at least `accelerated.compact.min_density`.
-  Density may be an estimate from statistics, as einfold's facts allow
-  for cost decisions. Other tables stay as rows. Each instance's layout is
-  a schedule entry (§5.6) that a developer can override, and `EXPLAIN`
-  shows it with its density. For Samudra's grid, about 30% land, a
-  compact array stores about 1.4 cells per ocean cell. Spike 13 sets the
-  default threshold, and tests a blocked layout that leaves absent blocks
-  unstored
-  ([#34](https://github.com/xqlsystems/datafusion-accelerated/issues/34)).
+- **A table's layout is chosen by what it would store.** A compact array
+  stores every cell of its domain, so an absent cell costs its storage and
+  its arithmetic, as a masked value. Only rows make absence free, and rows
+  are the slow path. Spike 13 measured both on a real ocean mask: compact
+  arrays ran a convolution faster than rows down to about 4% ocean, but
+  stored more bytes below about 40%, and dense blocks of 8 by 8 cells, with
+  the all-land blocks left out, beat both where land is clustered
+  ([report](spikes/s13-compact-absence/README.md)). So:
+  - **blocks are the compact layout**, and a dense array is the case of
+    one block. The block size is a schedule entry (§5.6);
+  - **the choice is by stored cells per present cell**, for each candidate
+    block size, which captures how clustered absence is, as density
+    doesn't. It is a measured fact about the domain, computed from its
+    mask when the table is registered;
+  - **a table one of einfold's nodes reads or writes is held as blocks**
+    when the fact table gives its domain. Other tables stay as rows. Under
+    a memory budget the runtime prefers smaller blocks, then rows, before
+    it spills;
+  - `EXPLAIN` shows each instance's layout, block size and ratio, and a
+    developer can override them.
+
+  On the 1° mask, 36% of surface cells are land, more at depth. A dense
+  array stores 1.56 cells per ocean cell at the surface and 12.04 at
+  5,500 m, and 8 by 8 blocks 1.28 and 2.78.
 - **Developers may move tables themselves**: `prefetch` to a tier, `evict`
   from one, and `pin` an instance so that it stays. Each tier reports its
   capacity and what it holds.
@@ -1665,7 +1673,7 @@ are the first work for the GPU half days, since they wait on no decision.
 | 10 | Does AMD's stack slot in with no runtime changes beyond a backend? ([#22](https://github.com/xqlsystems/datafusion-accelerated/issues/22)) | One distributed demo 2 step on an 8-GPU MI300-class node: HIP, RCCL, a Triton kernel, tiles placed per node | Whether the device-family contract holds for ROCm, and whether AMD needs placement from the start |
 | 11 | Do a region's exchanges lower to one XLA program on a TPU? ([#23](https://github.com/xqlsystems/datafusion-accelerated/issues/23)) | One demo 4 block, with its halo exchange and a gradient reduction, through StableHLO and PJRT on a small slice, against the same in JAX's `shard_map` | Whether a TPU backend fits the runtime's contract |
 | 12 | Can libcudf's relational kernels run DataFusion's operators over handle batches? ([#24](https://github.com/xqlsystems/datafusion-accelerated/issues/24)) | Bind DataFusion's hash aggregate and hash join to libcudf, exchanging columns through the C Device Data Interface, on TPC-H queries and one xarray-sql query | Whether relational acceleration fits the kernel contract, and what M8 needs |
-| 13 | Where do compact arrays stop paying for their absent cells, and does a blocked layout keep them unstored? ([#34](https://github.com/xqlsystems/datafusion-accelerated/issues/34)) | Demo 4's U-Net steps over Samudra's grid as rows, as compact arrays, and as dense blocks with absent blocks unstored, at the grid's own density and at lower ones | The default of `accelerated.compact.min_density`, and whether blocks become a third layout (§5.2) |
+| 13 | Where do compact arrays stop paying for their absent cells, and does a blocked layout keep them unstored? ([#34](https://github.com/xqlsystems/datafusion-accelerated/issues/34)) | A 3 by 3 convolution on each of a real ocean mask's 33 depth levels as rows, as compact arrays, and as dense blocks with absent blocks unstored, against the same density scattered at random | How §5.2 chooses a layout. **Done:** compact wins on time down to about 4% present and on memory only above about 40%; 8 by 8 blocks beat both on a real coastline, but not on scattered absence, so layouts are chosen by stored cells per present cell, and blocks are the compact layout ([report](spikes/s13-compact-absence/README.md)) |
 
 ---
 
@@ -1836,8 +1844,9 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
   identical by einfold and held by the runtime until the run ends. Under
   memory pressure it is spilled, and recomputed only where a recompute
   policy names it (§6.5, D1).
-- **P-Y.** A table is held as a compact array only when its domain is
-  known and its density reaches a session threshold, and stays as rows
-  otherwise (§5.2).
+- **P-Y.** Compact arrays are stored as blocks, with all-absent blocks
+  left out, and a table's layout and block size are chosen by the cells
+  each would store per present cell, a fact about its domain (§5.2,
+  spike 13).
 
 </details>
