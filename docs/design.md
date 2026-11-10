@@ -472,6 +472,23 @@ Rules:
 - **Frontends may assemble the session.** xarray-sql's context adds
   whichever XQL extensions are installed, so that, with ddxdb installed,
   its SQL understands `grad` with no other step.
+- **From Python, the runtime attaches as a query planner**, the one
+  `with_extensions` installs, never as a physical optimizer rule. The
+  planner wraps the session's own and keeps a copy of each plan in Rust,
+  which the runtime resets and runs itself, so Python never holds a plan
+  that must run again. A rule can't serve: the plan it sees belongs to
+  datafusion-python's library, whose operators need a Tokio runtime the
+  FFI doesn't pass on (spike 4a, S4.5).
+- **The runtime's codec carries what it can't serialize by reference.**
+  datafusion-python serializes the logical plan to reach the runtime's
+  planner, so a table it can't serialize, such as one registered from
+  Python's memory, would fail every query in the session. Within one
+  process, the codec carries it by an id instead, owned by the plans that
+  hold it (S4.5).
+- **From Python, settings come in through `SessionConfig.with_extension`**,
+  before the session is built, since `with_extensions` installs only codecs
+  and planners:
+  `SessionContext(SessionConfig().with_extension(AcceleratedConfig())).with_extensions(Accelerator())`.
 - **Workers are sessions too.** Under datafusion-distributed, each worker
   builds its session with the same extensions (§10.5).
 
@@ -542,6 +559,11 @@ Rules:
 - **A table that holds state reads the handle's current buffer** each time
   its plan runs, so that publishing new state never forces a plan to be
   planned again (S3.3).
+- **Runtime tables report statistics, and never exact ones.** Without row
+  counts, DataFusion plans every join partitioned, with a repartition on
+  each side. But a compiled plan outlives the rows it was planned on, and
+  DataFusion answers some queries, such as `COUNT(*)`, from exact
+  statistics without reading a row (spike 4a, S4.5).
 
 ### 5.3 Device plans
 
@@ -1694,7 +1716,7 @@ are the first work for the GPU half days, since they wait on no decision.
 | 2 | Do rows between operators cost a GPU SQL engine what they cost GPU kernels? | One of demo 2's steps on Sirius | Whether a GPU engine is an alternative to B |
 | 3 | Can a B200 read Arrow buffers in place from Grace memory fast enough? | Read against copy, on the Beta cluster | Whether Grace memory is a tier worth spilling to (§7) |
 | 4 | What does crossing from Python cost? | datafusion-ffi's overhead for the runtime's nodes (S4.1); launching a Triton kernel from a `KernelExec` through Python, and whether the call holds Python's lock | Which Python kernels are worth binding, and whether some must be compiled ahead of time |
-| 4a | Can the runtime's Rust core plan, compile and run steps again against a datafusion-python session, without the xqlsystems fork of datafusion-python? | From Python, attach the runtime with `with_extensions`, plan a step, run it twice with new rows in its input, and record what crosses datafusion-ffi, on datafusion-python 55.0.0 against the core's pinned DataFusion | Whether M0's Python side runs compiled plans, or plans every step on every run until `ExecutionPlan.reset_state` is upstream |
+| 4a | Can the runtime's Rust core plan, compile and run steps again against a datafusion-python session, without the xqlsystems fork of datafusion-python? | From Python, attach the runtime with `with_extensions`, plan a step, run it twice with new rows in its input, and record what crosses datafusion-ffi, on datafusion-python 55.0.0 against the core's pinned DataFusion | Whether M0's Python side runs compiled plans, or plans every step on every run until `ExecutionPlan.reset_state` is upstream. **Done:** compiled plans run on the released datafusion-python, through the planner `with_extensions` installs, with no fork and no upstream change, under four rules now in §5.1 and §5.2 ([report](spikes/s04a-python-compiled-plans/README.md)) |
 | 5 | Where does the remaining gap to PyTorch go, in time and in memory? | Start from the contributor's own ablations, which divide the step by kind of work (S1.1). Then trace one warm resident step on the M5 Ultra against PyTorch on MPS, for what they don't cover, peak memory included | What M2, M5 and M6 should fix first |
 | 6 | How much of each step does einfold already cover? | `EXPLAIN ANALYZE` with einfold on, for demo 2, demo 4 and torch-sql's nanoGPT: the share of time inside einfold's nodes, and how often a DataFusion operator sits between two of them (S2.5). The contributor's `DenseProgram` corpus and spike 5's ablations are its inputs. einfold's agent runs einfold's side | How far short B-0 stops, and so what M5 must recover (§6.2) |
 | 7 | Can handle batches carry device data between DataFusion nodes? | Two `KernelExec`s in one plan passing handle batches, through repartitioning and the planner's other rewrites, with a `CopyExec` where rows are needed | Whether §5.3's device plans work as written, or device work must stay inside single nodes. **Done:** they work, under three rules now in §5.3 ([report](spikes/s07-handle-batches/README.md)) |
@@ -1828,6 +1850,7 @@ are the first work for the GPU half days, since they wait on no decision.
 - **D18** (Alex, 2026-11-09). Spike 4a runs first, to settle whether M0's
   Python side can run compiled plans without a fork. If it needs
   `ExecutionPlan.reset_state`, Alex proposes it to datafusion-python.
+  Spike 4a found it doesn't (§12.3).
 
 ### Proposed
 

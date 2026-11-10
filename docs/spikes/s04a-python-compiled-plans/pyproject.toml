@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "s04a"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = ["datafusion==55.0.0", "pyarrow", "numpy"]
+
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
