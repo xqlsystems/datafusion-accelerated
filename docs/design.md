@@ -9,8 +9,8 @@ SPDX-License-Identifier: Apache-2.0
 _author_: Alex Merose
 _co-authors_: ⚡ Claude (datafusion-accelerated), formerly 🔥 Claude (torch-sql), and 🌀 Claude (xarray-sql), via Claude Code
 _reviewers_: 🪭 Claude (einfold) and ∂ Claude (ddx). Their reviews of v1.1 are in [reviews/](reviews/).
-_status_: Draft v1.9, for approval. Nothing is built. Collapsed sections (▸) hold background and detail.
-_last updated_: 2026-11-07
+_status_: v1.10. M0 is being built. Collapsed sections (▸) hold background and detail.
+_last updated_: 2026-11-09
 _supplement_: [supplement.md](supplement.md), with the evidence, the alternatives considered and the reasoning behind each rule. Citations such as "(S1.1)" point there. S6 compares the design with JAX, PyTorch and DataFusion, and S7 covers distributed training.
 _origin_: [xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307)
 
@@ -472,6 +472,23 @@ Rules:
 - **Frontends may assemble the session.** xarray-sql's context adds
   whichever XQL extensions are installed, so that, with ddxdb installed,
   its SQL understands `grad` with no other step.
+- **From Python, the runtime attaches as a query planner**, the one
+  `with_extensions` installs, never as a physical optimizer rule. The
+  planner wraps the session's own and keeps a copy of each plan in Rust,
+  which the runtime resets and runs itself, so Python never holds a plan
+  that must run again. A rule can't serve: the plan it sees belongs to
+  datafusion-python's library, whose operators need a Tokio runtime the
+  FFI doesn't pass on (spike 4a, S4.5).
+- **The runtime's codec carries what it can't serialize by reference.**
+  datafusion-python serializes the logical plan to reach the runtime's
+  planner, so a table it can't serialize, such as one registered from
+  Python's memory, would fail every query in the session. Within one
+  process, the codec carries it by an id instead, owned by the plans that
+  hold it (S4.5).
+- **From Python, settings come in through `SessionConfig.with_extension`**,
+  before the session is built, since `with_extensions` installs only codecs
+  and planners:
+  `SessionContext(SessionConfig().with_extension(AcceleratedConfig())).with_extensions(Accelerator())`.
 - **Workers are sessions too.** Under datafusion-distributed, each worker
   builds its session with the same extensions (§10.5).
 
@@ -542,6 +559,11 @@ Rules:
 - **A table that holds state reads the handle's current buffer** each time
   its plan runs, so that publishing new state never forces a plan to be
   planned again (S3.3).
+- **Runtime tables report statistics, and never exact ones.** Without row
+  counts, DataFusion plans every join partitioned, with a repartition on
+  each side. But a compiled plan outlives the rows it was planned on, and
+  DataFusion answers some queries, such as `COUNT(*)`, from exact
+  statistics without reading a row (spike 4a, S4.5).
 
 ### 5.3 Device plans
 
@@ -1247,9 +1269,11 @@ for i in 0..1_000 {
 
 </details>
 
-- **torch-sql** gives ddx the runtime as its `Backend` at M0, with no other
-  change. From M1, a synced `device="sql"` tensor holds a table handle, and
-  a whole training step is one program.
+- **torch-sql** gives ddx the runtime as its `Backend` at M0. torch-sql
+  accepts any `ddxdb.Backend` its caller passes, so neither project
+  depends on the other: both depend on ddxdb's public protocol (D17).
+  From M1, a synced `device="sql"` tensor holds a table handle, and a
+  whole training step is one program.
 - **xarray-sql** adds the installed XQL extensions to its context (§5.1),
   so that its SQL understands `grad` when ddxdb is installed, and its
   Datasets can be state.
@@ -1588,7 +1612,8 @@ on the cloud or on the Beta cluster, are available half a day a week.
 - *Builds:* `.with_accelerator()` and the `Accelerator` extension object,
   the `accelerated` settings, table handles and providers, `Program` with
   `lower`, `compile` and `run`, the ddx integration, implementing
-  `ddx_ad::Backend` with compiled plans and tables kept in place, the
+  `ddx_ad::Backend` with compiled plans and tables kept in place, tables
+  that read a handle's current buffer (§5.2), the
   counters of R8 as metrics, and the schedule and `explain()` in their
   first form, even while every step runs on DataFusion. They are cheap to
   build first and expensive to add later.
@@ -1598,8 +1623,8 @@ on the cloud or on the Beta cluster, are available half a day a week.
   fails compilation with a reason.
 
 **M1. Resident state.**
-- *Builds:* persistent tables, atomic publication, tables that read a
-  handle's current buffer (§5.2), device memory pools in `RuntimeEnv`,
+- *Builds:* persistent tables, atomic publication, device memory pools in
+  `RuntimeEnv`,
   `CopyExec`, the moves `prefetch`, `evict` and `pin`, and asynchronous
   runs.
 - *Done when:* torch-sql's nanoGPT training step is one compiled program,
@@ -1691,6 +1716,7 @@ are the first work for the GPU half days, since they wait on no decision.
 | 2 | Do rows between operators cost a GPU SQL engine what they cost GPU kernels? | One of demo 2's steps on Sirius | Whether a GPU engine is an alternative to B |
 | 3 | Can a B200 read Arrow buffers in place from Grace memory fast enough? | Read against copy, on the Beta cluster | Whether Grace memory is a tier worth spilling to (§7) |
 | 4 | What does crossing from Python cost? | datafusion-ffi's overhead for the runtime's nodes (S4.1); launching a Triton kernel from a `KernelExec` through Python, and whether the call holds Python's lock | Which Python kernels are worth binding, and whether some must be compiled ahead of time |
+| 4a | Can the runtime's Rust core plan, compile and run steps again against a datafusion-python session, without the xqlsystems fork of datafusion-python? | From Python, attach the runtime with `with_extensions`, plan a step, run it twice with new rows in its input, and record what crosses datafusion-ffi, on datafusion-python 55.0.0 against the core's pinned DataFusion | Whether M0's Python side runs compiled plans, or plans every step on every run until `ExecutionPlan.reset_state` is upstream. **Done:** compiled plans run on the released datafusion-python, through the planner `with_extensions` installs, with no fork and no upstream change, under four rules now in §5.1 and §5.2 ([report](spikes/s04a-python-compiled-plans/README.md)) |
 | 5 | Where does the remaining gap to PyTorch go, in time and in memory? | Start from the contributor's own ablations, which divide the step by kind of work (S1.1). Then trace one warm resident step on the M5 Ultra against PyTorch on MPS, for what they don't cover, peak memory included | What M2, M5 and M6 should fix first |
 | 6 | How much of each step does einfold already cover? | `EXPLAIN ANALYZE` with einfold on, for demo 2, demo 4 and torch-sql's nanoGPT: the share of time inside einfold's nodes, and how often a DataFusion operator sits between two of them (S2.5). The contributor's `DenseProgram` corpus and spike 5's ablations are its inputs. einfold's agent runs einfold's side | How far short B-0 stops, and so what M5 must recover (§6.2) |
 | 7 | Can handle batches carry device data between DataFusion nodes? | Two `KernelExec`s in one plan passing handle batches, through repartitioning and the planner's other rewrites, with a `CopyExec` where rows are needed | Whether §5.3's device plans work as written, or device work must stay inside single nodes. **Done:** they work, under three rules now in §5.3 ([report](spikes/s07-handle-batches/README.md)) |
@@ -1805,24 +1831,40 @@ are the first work for the GPU half days, since they wait on no decision.
   integration, with CUDA, ROCm, Metal, TPUs or a library such as libcudf,
   is a separate crate or package, mixed in as its own extension, so the
   core's goal outlives any of them (R13, §5.8).
+- **D14** (Alex, 2026-11-09, with the technical lead and the doc's primary
+  author). M0 starts. The proposals M0 rests on are decided, as choices
+  that can be revised: P-B (programs, lowered and compiled), P-D (ddx and
+  einfold through integrations), P-J (the engine a program runs on is the
+  reference), P-M (the schedule, with binding overrides) and P-R (one way
+  to attach).
+- **D15** (Alex, 2026-11-09). The core pins DataFusion 55, the newest
+  release datafusion-python supports.
+- **D16** (Alex, 2026-11-09). Tables that read a handle's current buffer
+  move from M1 to M0, since M0's compiled plans need them to read new
+  state without being planned again.
+- **D17** (Alex, 2026-11-09). torch-sql and the runtime don't depend on
+  each other. torch-sql accepts a `ddxdb.Backend` from its caller, and the
+  runtime runs torch-sql's suite as a test dependency. M0's exit runs that
+  suite on DataFusion through the runtime, and on DuckDB unchanged as the
+  reference. Demos 2 and 4's SQL become this repository's test fixtures.
+- **D18** (Alex, 2026-11-09). Spike 4a runs first, to settle whether M0's
+  Python side can run compiled plans without a fork. If it needs
+  `ExecutionPlan.reset_state`, Alex proposes it to datafusion-python.
+  Spike 4a found it doesn't (§12.3).
 
 ### Proposed
 
 <details>
-<summary>Proposals P-A to P-Y, for approval</summary>
+<summary>Proposals still open, for approval</summary>
 
-P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
+P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6, and P-B, P-D,
+P-J, P-M and P-R became D14.
 
 - **P-A.** The runtime is a separate project. einfold stays free of device
   execution, and keeps its CPU operator (xarray-sql#307).
-- **P-B.** The unit of work is a program with explicit state, lowered and
-  compiled as a JAX function is (R3, R5, §5.4).
 - **P-C.** Design B, staged from B-0 (§6.2). It needs an einfold design
   change approved by its maintainer. Spike 1 closed design C for the
   milestones.
-- **P-D.** ddx and einfold come in through integrations, which implement
-  their public interfaces and depend on their published types. Neither
-  depends on the runtime, and the core depends on neither (§5.8).
 - **P-E.** Where a value is held is the runtime's default, recorded in the
   schedule and open to the developer's override (R7, R10). ddx draws step
   boundaries, and the runtime changes them only through ddx's options and
@@ -1830,16 +1872,10 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
 - **P-I.** The runtime chooses save points with einfold's report, and
   passes them to ddx as options. No frontend runs a chain rule of its own
   (§6.4).
-- **P-J.** A program's reference is the engine it runs on, and
-  disagreements between engines are found in tests and filed upstream
-  (S4.4).
 - **P-K.** One label marker serves regions, policies, provenance, hints,
   bindings and metrics (§5.5).
 - **P-L.** Reproducibility is stated per implementation, and a session may
   require it (R9).
-- **P-M.** The schedule is the device plans plus what crosses steps, every
-  choice in it is visible, overrides are binding, and impossible ones fail
-  compilation (R10, §5.6).
 - **P-N.** Developers bind their own kernels to labelled nodes, from
   Python or Rust, with the node's SQL as the specification. einfold's
   nodes are bindings made automatically (§5.7).
@@ -1850,9 +1886,6 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
 - **P-Q.** A device plan is a DataFusion physical plan with `KernelExec`
   and `CopyExec` nodes, passing handle batches between device nodes, under
   the three rules spike 7 found (§5.3).
-- **P-R.** Every extension attaches to DataFusion the same way, the runtime,
-  its integrations and XQL's projects alike: a builder method in Rust, and
-  an extension object for `with_extensions` in Python (§5.1, §5.8).
 - **P-S.** Parallelism is partitioning. Base and state tables declare their
   distribution in SQL (D9), the planner derives intermediates through
   DataFusion's physical properties and a cost model, and collectives are

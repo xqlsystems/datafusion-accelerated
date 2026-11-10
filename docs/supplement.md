@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 # DataFusion Accelerated: supplement
 
 _companion to_: [the design](design.md)
-_last updated_: 2026-11-07
+_last updated_: 2026-11-09
 
 This supplement holds the evidence behind the [design](design.md), the
 alternatives it rejected, and the reasoning behind its rules. The design
@@ -645,7 +645,8 @@ Three costs on the other side are known:
   core would link DataFusion and einfold directly.
 - ddxdb's compiled path from Python (`in_place`) needs an xqlsystems fork
   of datafusion-python today, which the design's R2 rules out until the
-  change is upstream.
+  change is upstream. The runtime's own compiled path doesn't: spike 4a
+  found it can hold and rerun plans in Rust (S4.5).
 - Atomic state in Python needs an engine table that reads a handle's
   current buffer (S3.3).
 
@@ -718,6 +719,78 @@ tests, as torch-sql's suite does by running every op on both engines. The
 alternative, a single reference engine for all programs, would make every
 run on the other engine a comparison, and the reference would still have
 bugs of its own, such as DataFusion's `MAX` skipping NaN.
+
+### S4.5 Compiled plans from Python
+
+A compiled step runs its physical plan again on each run. From Python, that
+seemed to need `ExecutionPlan.reset_state`, which only the xqlsystems fork
+of datafusion-python has (S4.1). Spike 4a tested whether the runtime could
+hold the plan itself instead
+([report](spikes/s04a-python-compiled-plans/README.md)). It ran on
+datafusion-python 55.0.0 from PyPI, which is built on DataFusion 55.1.0,
+with the spike built on DataFusion 55.2.0, on an Intel i7-8700. The step
+was a layer norm and causal self-attention from demo 2, at 2 sequences of
+16 positions and 32 channels.
+
+**The planner works, and the rule doesn't.** datafusion-python offers an
+extension two places to see a physical plan:
+- **A query planner, installed by `with_extensions`**, which wraps the
+  session's own. The logical plan crosses into the runtime's library as
+  bytes, and the physical plan comes back as bytes, so the runtime decodes
+  a plan made of its own operators. It keeps that copy, resets it with
+  DataFusion's `reset_plan_states`, and runs it on its own Tokio runtime.
+  Every compiled run matched datafusion-python's result, including after
+  the batch changed its rows and its size, and no run called the planner.
+- **A physical optimizer rule**, added with `add_physical_optimizer_rule`,
+  which sees the plan as proxies into datafusion-python's library. A rule
+  can keep that plan, but running it later aborted the process: the
+  library's operators spawn tasks on its own Tokio runtime, and
+  datafusion-ffi's `ForeignPhysicalOptimizerRule` exports the plan with no
+  runtime handle (`FFI_ExecutionPlan::new(plan, None)` in datafusion-ffi
+  55.2).
+
+**Every table must cross the planner.** To reach a foreign planner,
+datafusion-python serializes the logical plan, and a table registered from
+Python's memory has no serialization. With the planner installed and
+nothing else, every query over such a table failed, compiled or not. The
+runtime's codec fixes that by carrying such a table by an id, valid within
+the process. On the way back, DataFusion's own serialization carried the
+in-memory tables' scans with their rows, so a compiled plan keeps the rows
+those tables held when it was compiled. State must be a runtime table,
+read at execution (design D16), for a compiled plan to see new values.
+
+**Statistics decide the joins, and exact ones give wrong answers.** A
+table that reports no statistics gets partitioned hash joins: all 30 of the
+step's joins, with 54 hash repartitions, against 30 `CollectLeft` joins
+over datafusion-python's in-memory tables. A runtime table that reports its
+row count gets the same joins as the in-memory ones. But a compiled
+`COUNT(*)` over a table with exact statistics returned the row count of
+compile time after the table grew, since DataFusion answers it from the
+statistics alone. Inexact statistics gave the right count.
+
+**What it cost**, as medians of 100 runs:
+
+| path | ms per run |
+|---|---|
+| compiled through the runtime, runtime tables with inexact statistics | 21.5 |
+| compiled through the runtime, the weights carried by reference | 18.9 |
+| compiled through the runtime, runtime tables without statistics | 37.4 |
+| planned and run each time, datafusion-python alone | 41.0 to 48.9 |
+| planning only, datafusion-python alone | 25.8 to 28.8 |
+| planning only, through the runtime's planner | 114 to 131 |
+
+Planning was more than half of each uncompiled run, partly because
+DataFusion plans a CTE again at every read (S1.3): the plan holds 5
+`power`s where the SQL writes one. Planning through the runtime's planner
+costs four to five times as much, since each plan crosses the FFI four
+times, twice as a logical plan and twice as a physical one. Compiling pays it once.
+
+Two costs remain inside a compiled plan. Its scalar functions are proxies
+that call back into datafusion-python: the same plan in a session of the
+runtime's own, with no FFI, ran in 33.0 ms against 40 to 45 ms. And a task
+context built across the FFI carries a `RuntimeEnv` of the runtime's
+library, not the session's, so reservations the runtime makes aren't
+counted in the session's memory pool.
 
 ---
 
