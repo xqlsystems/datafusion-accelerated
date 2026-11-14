@@ -6,6 +6,7 @@ path = [
   ".python-version",
   "uv.lock",
   "**/Cargo.lock",
+  "flake.lock",
   "src/datafusion_accelerated/py.typed",
   "docs/spikes/*/results.md",
 ]

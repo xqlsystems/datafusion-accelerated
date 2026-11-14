@@ -12,3 +12,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Rust build output
+/target/

@@ -9,13 +9,55 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel a run when a newer push to the same ref supersedes it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   reuse:
     name: REUSE compliance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: fsfe/reuse-action@676e2d560c9a403aa252096d99fcab3e1132b0f5 # v6.0.0
+
+  rust:
+    name: Rust (${{ matrix.os }}, ${{ matrix.rust }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ARM Linux from the start, since the first release ships ARM wheels
+        # (design §12.1).
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        # "1.94" is the minimum supported version, rust-version in Cargo.toml.
+        rust: [stable, "1.94"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.rust }}
+      - name: rustfmt
+        if: matrix.rust == 'stable'
+        run: cargo fmt --all --check
+      - name: clippy
+        if: matrix.rust == 'stable'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: docs
+        if: matrix.rust == 'stable'
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: tests
+        run: cargo test --workspace --no-fail-fast
