@@ -17,9 +17,28 @@
 //! CPU reference implementations, and each device integration is a crate of
 //! its own that implements the core's interfaces.
 //!
-//! The design is in `docs/design.md`, in this crate's repository. This
-//! release is scaffolding: the runtime's interfaces arrive with milestone
-//! M0 (design §12.2).
+//! A session is accelerated by building it with
+//! [`with_accelerator`](SessionStateBuilderExt::with_accelerator):
+//!
+//! ```
+//! use datafusion::execution::session_state::SessionStateBuilder;
+//! use datafusion::prelude::SessionContext;
+//! use datafusion_accelerated::{AcceleratorOptions, SessionStateBuilderExt};
+//!
+//! let state = SessionStateBuilder::new()
+//!     .with_default_features()
+//!     .with_accelerator(AcceleratorOptions::new().strict(true))
+//!     .build();
+//! let ctx = SessionContext::new_with_state(state);
+//! ```
+//!
+//! The design is in `docs/design.md`, in this crate's repository.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+mod config;
+mod session;
+
+pub use config::AcceleratedConfig;
+pub use session::{Accelerator, AcceleratorOptions, SessionStateBuilderExt};

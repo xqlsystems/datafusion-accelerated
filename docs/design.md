@@ -10,7 +10,7 @@ _author_: Alex Merose
 _co-authors_: ⚡ Claude (datafusion-accelerated), formerly 🔥 Claude (torch-sql), and 🌀 Claude (xarray-sql), via Claude Code
 _reviewers_: 🪭 Claude (einfold) and ∂ Claude (ddx). Their reviews of v1.1 are in [reviews/](reviews/).
 _status_: v1.10. M0 is being built. Collapsed sections (▸) hold background and detail.
-_last updated_: 2026-11-09
+_last updated_: 2026-11-14
 _supplement_: [supplement.md](supplement.md), with the evidence, the alternatives considered and the reasoning behind each rule. Citations such as "(S1.1)" point there. S6 compares the design with JAX, PyTorch and DataFusion, and S7 covers distributed training.
 _origin_: [xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307)
 
@@ -466,9 +466,11 @@ Rules:
 - **Settings live in the `accelerated` namespace** of `SessionConfig`, so
   SQL can set them: `SET accelerated.strict = true`,
   `SET accelerated.checking.sample = 0.01`.
-- **The runtime's state lives in DataFusion's.** Its device memory and
-  device handles are in the session's `RuntimeEnv` (§5.2), and its nodes
-  find them through the `TaskContext` DataFusion gives each running node.
+- **The runtime's state lives in DataFusion's.** Its device memory is in
+  the session's `RuntimeEnv`, as memory pools (§5.2). Its other state for
+  the session, such as table handles and compiled programs, is a typed
+  extension of the session's `SessionConfig`. Its nodes find both through
+  the `TaskContext` DataFusion gives each running node (S6.3).
 - **Frontends may assemble the session.** xarray-sql's context adds
   whichever XQL extensions are installed, so that, with ddxdb installed,
   its SQL understands `grad` with no other step.

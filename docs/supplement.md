@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 # DataFusion Accelerated: supplement
 
 _companion to_: [the design](design.md)
-_last updated_: 2026-11-09
+_last updated_: 2026-11-14
 
 This supplement holds the evidence behind the [design](design.md), the
 alternatives it rejected, and the reasoning behind its rules. The design
@@ -1096,6 +1096,7 @@ question 11).
 | Attaching | `SessionStateBuilder`; `with_extensions` | `.with_accelerator`; `Accelerator` |
 | Hardware and libraries | none | integrations, each its own crate or package: `.with_accelerated_cuda()`, `Cuda()` |
 | Settings | `SessionConfig` namespaces | `accelerated.*` |
+| Per-session state | `SessionConfig`'s typed extensions | `Accelerator`: handles, programs |
 | Memory tiers | `RuntimeEnv`: `MemoryPool`, `DiskManager` | device pools, beside DataFusion's |
 | Tables | table providers | runtime tables, readable as rows or compact arrays |
 | Device placement | `PhysicalOptimizerRule`s | the runtime's rule, after einfold's |
@@ -1108,6 +1109,22 @@ question 11).
 | Programs and state | none | `Program`, `lower`, `compile`, `run` |
 
 The last row is the runtime's own layer, and the only one.
+
+A session's state can't live in its `RuntimeEnv`. In DataFusion 55.2,
+`RuntimeEnv` has fixed fields, a memory pool, a disk manager, a cache
+manager and an object store registry, and no place for an extension.
+`SessionConfig` has one: a map of objects keyed by their Rust type
+(`with_extension`, `get_extension`), which DataFusion documents for
+extensions' own state, such as caches. Each `TaskContext` carries the
+session's config, and the map holds its objects by `Arc`, so every query
+of the session shares one runtime. Device memory still goes in
+`RuntimeEnv`, as memory pools.
+
+From Python, the session belongs to datafusion-python's library, and the
+runtime can't reach its map: datafusion-ffi's `FFI_SessionConfig` carries
+a session's settings across the FFI, not its typed extensions. There, the session's state is held
+by the `Accelerator` extension object and the planner it installs, as in
+spike 4a (S4.5).
 
 ### S6.4 datafusion-distributed as the precedent
 
