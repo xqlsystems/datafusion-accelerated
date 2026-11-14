@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "datafusion-accelerated-mlx"
+version = "0.0.1"
+description = "Experimental: compact-array execution of DataFusion plans, with MLX on Apple's GPUs. Retires stage by stage as DataFusion Accelerated's milestones land."
+readme = "README.md"
+license = "Apache-2.0"
+authors = [
+    { name = "Alexander Sky Merose", email = "al@merose.com" },
+    { name = "Ray Cromwell" },
+]
+requires-python = ">=3.12"
+dependencies = [
+    # DenseProgram walks datafusion-python's logical plans.
+    "datafusion==55.0.0",
+    "numpy",
+    "pyarrow",
+]
+
+[project.optional-dependencies]
+# An exact erf; without it, DenseProgram falls back to math.erf.
+scipy = ["scipy"]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    # Two tests read xarray Datasets.
+    "xarray",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.30,<0.10.0"]
+build-backend = "uv_build"
