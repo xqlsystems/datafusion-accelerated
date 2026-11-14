@@ -10,3 +10,7 @@ it. Each part retires with the milestone named in the package's README.
 Nothing outside this repository's ``experimental/`` directory and XQL's
 demos may import it.
 """
+
+from datafusion_accelerated_mlx.dense_program import DenseProgram
+
+__all__ = ["DenseProgram"]
