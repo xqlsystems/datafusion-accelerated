@@ -17,6 +17,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 datafusion.workspace = true
 
 [dev-dependencies]

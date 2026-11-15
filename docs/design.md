@@ -561,6 +561,12 @@ Rules:
 - **A table that holds state reads the handle's current buffer** each time
   its plan runs, so that publishing new state never forces a plan to be
   planned again (S3.3).
+- **Each run reads one snapshot of the runtime's tables** (D20). The
+  first time a run reads a handle, it pins the current version of every
+  handle, and it reads those versions to its end, whatever is replaced or
+  released meanwhile. A run is the execution of one plan with one
+  `TaskContext`. A version stays in memory while a run that pinned it
+  lasts (S3.3).
 - **Runtime tables report statistics, and never exact ones.** Without row
   counts, DataFusion plans every join partitioned, with a repartition on
   each side. But a compiled plan outlives the rows it was planned on, and
@@ -1875,6 +1881,9 @@ are the first work for the GPU half days, since they wait on no decision.
   Spike 4a found it doesn't (§12.3).
 - **D19** (Alex, 2026-11-14). The runtime's Rust follows Google's Rust
   style guide, as ddx's does (§12.1).
+- **D20** (Alex, 2026-11-14, delegated to ⚡ Claude to decide from what
+  users expect). A run reads one snapshot of the runtime's tables, even
+  when another thread replaces one during it (§5.2).
 
 ### Proposed
 

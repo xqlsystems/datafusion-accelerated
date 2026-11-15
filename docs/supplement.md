@@ -498,6 +498,25 @@ the promise broken, and every plan that reads the state planned again.
 Hence the design's rule that a table holding state reads the handle's
 current buffer when its plan runs, whichever path runs it.
 
+Reading at run time raises the question of what a run sees when another
+thread replaces a table during it. Without isolation, a plan that scans a
+table twice, as DataFusion's plan of a CTE read twice does
+(xarray-sql#267), could join one version of it with another, and a step
+could read one state table before an update and another after it. The
+runtime's users expect neither: SQL gives each query one snapshot, and a
+training step reads all of the previous step's state. So each run pins a
+snapshot the first time it reads a handle (design D20). The run is
+identified by its `TaskContext`, since DataFusion passes one context to
+every node of an execution, and the runtime builds a fresh one for each
+run of a compiled program. Replacing a table makes a new version map and
+leaves the pinned one intact, so a replace never waits for a run. The
+pin goes when the run's context is dropped.
+
+The snapshot is taken at the first read, not when the run starts, since a
+plan run by DataFusion's `collect` gives the runtime no earlier hook.
+M1's atomic publication of several tables at once builds on the same
+version map.
+
 ### S3.4 Step boundaries and shared subplans
 
 ddx already draws its programs' step boundaries, for four reasons (S1.4).

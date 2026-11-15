@@ -37,9 +37,16 @@
 mod accelerated_config;
 mod accelerator;
 mod accelerator_options;
+mod handle_scan_exec;
+mod handle_table;
+mod instance;
 mod session_state_builder_ext;
+mod table_handle;
+mod table_store;
 
 pub use accelerated_config::AcceleratedConfig;
 pub use accelerator::Accelerator;
 pub use accelerator_options::AcceleratorOptions;
+pub use instance::{Instance, Layout, Owner, Tier};
 pub use session_state_builder_ext::SessionStateBuilderExt;
+pub use table_handle::TableHandle;

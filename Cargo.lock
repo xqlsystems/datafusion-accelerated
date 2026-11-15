@@ -694,6 +694,7 @@ dependencies = [
 name = "datafusion-accelerated"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "datafusion",
  "tokio",
 ]
