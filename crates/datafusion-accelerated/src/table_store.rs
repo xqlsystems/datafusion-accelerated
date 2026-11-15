@@ -5,12 +5,15 @@
 //! The rows of every table a session's runtime owns, by version.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::execution::TaskContext;
 
-/// A table handle's identity within its session's runtime.
+use crate::Error;
+
+/// A table handle's identity, unique in the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct HandleId(u64);
 
@@ -18,105 +21,111 @@ pub(crate) struct HandleId(u64);
 /// new map, so a run that holds the old one keeps its rows.
 type Versions = HashMap<HandleId, Arc<[RecordBatch]>>;
 
-/// The tables of one session's runtime.
+/// Handle and run ids come from one counter for the process, so an id from
+/// another session is never mistaken for one of this session's.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_id() -> u64 {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The tables of one session's runtime, and the snapshots its runs read.
 ///
-/// Each run reads one snapshot of them. A run is identified by the
-/// `TaskContext` its plan executes with, since DataFusion passes one context
-/// to every node of an execution. The first scan of a handle in a run pins
-/// the snapshot current at that moment, and every later scan in the run
-/// reads the same one, whatever is replaced meanwhile.
-#[derive(Debug, Default)]
+/// A run pins the snapshot current when it begins, and every scan in the
+/// run reads it, whatever is replaced meanwhile (D20). The pin is dropped
+/// when the run ends.
+#[derive(Default)]
 pub(crate) struct TableStore {
     state: Mutex<StoreState>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct StoreState {
-    next_id: u64,
     current: Arc<Versions>,
-    runs: Vec<RunPin>,
-}
-
-/// The snapshot a run pinned, held until the run's `TaskContext` is dropped.
-#[derive(Debug)]
-struct RunPin {
-    task: Weak<TaskContext>,
-    versions: Arc<Versions>,
+    runs: HashMap<u64, Arc<Versions>>,
 }
 
 impl TableStore {
     /// Adds a table, and returns its id.
     pub(crate) fn insert(&self, batches: Vec<RecordBatch>) -> HandleId {
-        let mut state = self.lock();
-        let id = HandleId(state.next_id);
-        state.next_id += 1;
-        Arc::make_mut(&mut state.current).insert(id, batches.into());
+        let id = HandleId(next_id());
+        Arc::make_mut(&mut self.lock().current).insert(id, batches.into());
         id
     }
 
-    /// Replaces a table's rows. Returns false if the table was released.
-    pub(crate) fn replace(&self, id: HandleId, batches: Vec<RecordBatch>) -> bool {
-        let mut state = self.lock();
-        let versions = Arc::make_mut(&mut state.current);
-        match versions.get_mut(&id) {
-            Some(rows) => {
-                *rows = batches.into();
-                true
-            }
-            None => false,
-        }
+    /// Replaces a table's rows.
+    pub(crate) fn replace(&self, id: HandleId, batches: Vec<RecordBatch>) {
+        Arc::make_mut(&mut self.lock().current).insert(id, batches.into());
     }
 
-    /// Releases a table. Runs that pinned it keep its rows until they end.
+    /// Drops a table, when its last handle is dropped. Runs that pinned it
+    /// keep its rows until they end.
     pub(crate) fn remove(&self, id: HandleId) {
-        let mut state = self.lock();
-        Arc::make_mut(&mut state.current).remove(&id);
+        Arc::make_mut(&mut self.lock().current).remove(&id);
     }
 
-    /// A table's current rows, outside any run.
-    pub(crate) fn current(&self, id: HandleId) -> Option<Arc<[RecordBatch]>> {
-        self.lock().current.get(&id).cloned()
+    /// A table's current rows.
+    pub(crate) fn current(&self, id: HandleId) -> Arc<[RecordBatch]> {
+        current(&self.lock(), id)
     }
 
-    /// A table's rows as the run of `task` sees them.
-    pub(crate) fn for_run(
-        &self,
-        task: &Arc<TaskContext>,
-        id: HandleId,
-    ) -> Option<Arc<[RecordBatch]>> {
+    /// Begins a run: pins the current snapshot, and returns the run's id.
+    pub(crate) fn begin_run(&self) -> u64 {
+        let run = next_id();
         let mut state = self.lock();
-        // A pin whose context is gone belongs to a finished run. Dropping
-        // those first also means a live pin at the same address as `task`
-        // is `task`'s own, since a live allocation's address is unique.
-        state.runs.retain(|pin| pin.task.strong_count() > 0);
-        let position = state
-            .runs
-            .iter()
-            .position(|pin| std::ptr::eq(pin.task.as_ptr(), Arc::as_ptr(task)));
-        let index = match position {
-            Some(index) => index,
-            None => {
-                let versions = Arc::clone(&state.current);
-                state.runs.push(RunPin {
-                    task: Arc::downgrade(task),
-                    versions,
-                });
-                state.runs.len() - 1
-            }
+        let versions = Arc::clone(&state.current);
+        state.runs.insert(run, versions);
+        run
+    }
+
+    /// Ends a run, and drops its pin.
+    pub(crate) fn end_run(&self, run: u64) {
+        self.lock().runs.remove(&run);
+    }
+
+    /// A table's rows as run `run` sees them.
+    pub(crate) fn for_run(&self, run: u64, id: HandleId) -> Result<Arc<[RecordBatch]>, Error> {
+        let mut state = self.lock();
+        let Some(versions) = state.runs.get(&run) else {
+            return Err(Error::RunEnded { run });
         };
-        if let Some(rows) = state.runs[index].versions.get(&id) {
-            return Some(Arc::clone(rows));
+        if let Some(rows) = versions.get(&id) {
+            return Ok(Arc::clone(rows));
         }
-        // A table created after the run pinned its snapshot: the run reads
-        // its rows as they are now, and keeps them for the rest of the run.
-        let rows = Arc::clone(state.current.get(&id)?);
-        Arc::make_mut(&mut state.runs[index].versions).insert(id, Arc::clone(&rows));
-        Some(rows)
+        // A table created after the run began: the run reads its rows as
+        // they are now, and keeps them for the rest of the run.
+        let rows = current(&state, id);
+        if let Some(versions) = state.runs.get_mut(&run) {
+            Arc::make_mut(versions).insert(id, Arc::clone(&rows));
+        }
+        Ok(rows)
     }
 
     fn lock(&self) -> MutexGuard<'_, StoreState> {
-        self.state
-            .lock()
-            .expect("a thread panicked while it held the runtime's table store")
+        // Every change to the state is one assignment, so a thread that
+        // panicked while it held the lock left the state whole.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+fn current(state: &StoreState, id: HandleId) -> Arc<[RecordBatch]> {
+    // A table's rows are removed only when its last handle is dropped, and
+    // a caller here holds a handle.
+    Arc::clone(
+        state
+            .current
+            .get(&id)
+            .expect("a live handle's rows are in its store"),
+    )
+}
+
+// By hand, so that printing a plan doesn't print every table's rows.
+impl fmt::Debug for TableStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.lock();
+        f.debug_struct("TableStore")
+            .field("tables", &state.current.len())
+            .field("runs", &state.runs.len())
+            .finish()
     }
 }

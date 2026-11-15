@@ -7,7 +7,7 @@
 use datafusion::error::Result;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_accelerated::{Accelerator, AcceleratorOptions, SessionStateBuilderExt};
+use datafusion_accelerated::{Accelerator, AcceleratorExt, AcceleratorOptions, Error};
 
 fn accelerated(options: AcceleratorOptions) -> SessionContext {
     SessionContext::new_with_state(
@@ -46,10 +46,14 @@ fn a_session_built_with_the_runtime_has_it() {
 #[test]
 fn a_plain_session_says_how_to_attach_it() {
     let ctx = SessionContext::new();
-    let message = Accelerator::of(&ctx.state()).unwrap_err().to_string();
+    let err = Accelerator::of(&ctx.state()).unwrap_err();
     assert!(
-        message.contains("with_accelerator()"),
-        "the error should say how to attach: {message}"
+        matches!(Error::find(&err), Some(Error::NotAttached)),
+        "the error should be typed: {err}"
+    );
+    assert!(
+        err.to_string().contains("with_accelerator()"),
+        "the error should say how to attach: {err}"
     );
     assert!(
         Accelerator::of_task(&ctx.task_ctx()).is_err(),
@@ -70,6 +74,37 @@ fn with_config_after_with_accelerator_drops_it() {
     assert!(
         Accelerator::of(&state).is_err(),
         "with_config() replaces the config, and the runtime with it"
+    );
+}
+
+#[test]
+fn a_config_with_the_runtime_survives_with_config() {
+    let config = SessionConfig::new()
+        .with_target_partitions(3)
+        .with_accelerator(AcceleratorOptions::new().strict(true));
+    let state = SessionStateBuilder::new()
+        .with_accelerator(AcceleratorOptions::new())
+        .with_config(config)
+        .build();
+    assert!(
+        Accelerator::of(&state).is_ok(),
+        "the runtime is in the config that with_config() installs"
+    );
+    assert!(
+        Accelerator::settings(&state).unwrap().strict,
+        "with the config's options"
+    );
+}
+
+#[test]
+fn a_built_state_can_take_the_runtime() {
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .build()
+        .with_accelerator(AcceleratorOptions::new());
+    assert!(
+        Accelerator::of(&state).is_ok(),
+        "a SessionState takes the runtime as its builder does"
     );
 }
 
@@ -126,6 +161,18 @@ async fn an_unknown_setting_is_an_error() {
         err.to_string().contains("nonsense"),
         "the error should name the setting: {err}"
     );
+}
+
+#[tokio::test]
+async fn a_run_id_can_be_set() -> Result<()> {
+    let ctx = accelerated(AcceleratorOptions::new());
+    set(&ctx, "SET accelerated.run = 7").await?;
+    assert_eq!(
+        Accelerator::settings(&ctx.state())?.run,
+        Some(7),
+        "the run's id is a setting, as the FFI and workers carry it"
+    );
+    Ok(())
 }
 
 #[tokio::test]

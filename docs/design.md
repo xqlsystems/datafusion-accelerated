@@ -471,6 +471,12 @@ Rules:
   the session, such as table handles and compiled programs, is a typed
   extension of the session's `SessionConfig`. Its nodes find both through
   the `TaskContext` DataFusion gives each running node (S6.3).
+- **Each extension's trait is named after it**, as datafusion-distributed's
+  `DistributedExt` is, so that two extensions' traits never collide. The
+  runtime's is `AcceleratorExt`, and it is implemented for `SessionConfig`,
+  `SessionStateBuilder` and `SessionState`, the types a session is
+  assembled from. Attached to a `SessionConfig`, the runtime survives a
+  later `with_config()` on the builder.
 - **Frontends may assemble the session.** xarray-sql's context adds
   whichever XQL extensions are installed, so that, with ddxdb installed,
   its SQL understands `grad` with no other step.
@@ -500,7 +506,9 @@ The runtime extends `RuntimeEnv`'s memory hierarchy. DataFusion already has
 two tiers: host memory, through its `MemoryPool`, and disk, through its
 `DiskManager`. The runtime adds the device tiers. Tiers are named by device family:
 by Arrow's device type where one exists (§2.1), by a name the device
-integration defines where none does, and `storage` for files
+integration defines where none does, and `storage` for files. A device
+tier also carries its device's id, as the Arrow C Device Data Interface's
+`ArrowDeviceArray` does
 ([#20](https://github.com/xqlsystems/datafusion-accelerated/issues/20)).
 
 | Tier | Device type | Accounting |
@@ -522,13 +530,18 @@ Rules:
   Arrow nor DLPack has a TPU device type, so device data on a TPU stays
   behind PJRT's handles.
 - **A table handle** refers to a table the runtime owns, as a buffer handle
-  refers to an allocation. It carries the table's schema, its lifetime (one
-  run, or until the caller releases it), and one or more *instances*. Each
+  refers to an allocation. It carries the table's schema and one or more
+  *instances*. Its rows live while the session's catalog, a plan or a
+  handle holds it, so `DROP TABLE` frees them once no plan or handle does. Each
   instance has a tier; a layout, either Arrow rows or a compact array; and
   an owner, either DataFusion (as one of its tables) or the runtime.
 - **Runtime tables are DataFusion table providers**, read as Arrow batches
   by DataFusion's operators, and as compact arrays by device nodes that
   scan them directly (§5.3).
+- **The session's catalog is the only map from names to runtime tables.**
+  Each is a provider in the session's default schema, so its name is
+  normalized as SQL normalizes names, and `DROP TABLE`, `SHOW TABLES` and
+  `information_schema` treat it as any other table (S3.3).
 - **A table's layout is chosen by what it would store** (S2.7). A
   compact array stores every cell of its block, so an absent cell costs
   its storage and its arithmetic, as a masked value. Only rows make
@@ -561,12 +574,17 @@ Rules:
 - **A table that holds state reads the handle's current buffer** each time
   its plan runs, so that publishing new state never forces a plan to be
   planned again (S3.3).
-- **Each run reads one snapshot of the runtime's tables** (D20). The
-  first time a run reads a handle, it pins the current version of every
-  handle, and it reads those versions to its end, whatever is replaced or
-  released meanwhile. A run is the execution of one plan with one
-  `TaskContext`. A version stays in memory while a run that pinned it
-  lasts (S3.3).
+- **Each run reads one snapshot of the runtime's tables** (D20). A run is
+  explicit: `Accelerator::begin_run`, or `Program::run`, begins one and
+  pins the current version of every handle, and the run's plans read
+  those versions to its end, whatever is replaced or dropped meanwhile.
+  The run's id travels in the `accelerated.run` setting, which crosses
+  datafusion-ffi and reaches datafusion-distributed's workers, as settings
+  do. A plan executed outside a run reads each table's current rows when
+  its scan starts. A plan given the id of a run that has ended fails,
+  never reads other rows. A run pins every table, not only those it reads,
+  so a table replaced during a long run keeps its old version in memory
+  until the run ends (S3.3).
 - **Runtime tables report statistics, and never exact ones.** Without row
   counts, DataFusion plans every join partitioned, with a repartition on
   each side. But a compiled plan outlives the rows it was planned on, and
@@ -1482,7 +1500,11 @@ exchange uses, and a developer may override either (§5.6).
 
 More rules:
 - **Workers are sessions too**, built with the same extensions, devices
-  and kernels as the coordinating session (§5.1). The runtime's codec
+  and kernels as the coordinating session (§5.1). The coordinator and each
+  worker register `AcceleratedConfig` with datafusion-distributed's
+  `with_distributed_option_extension` after `with_accelerator`, since both
+  insert it and the later call's copy wins. That is how a run's id
+  (`accelerated.run`, §5.2) reaches the workers. The runtime's codec
   ships a `KernelExec` as its kernel's name and tuning parameters, and the
   worker finds the kernel in its own session.
 - **A distributed device plan** holds datafusion-distributed's network
@@ -1652,7 +1674,8 @@ on the cloud or on the Beta cluster, are available half a day a week.
 
 **M1. Resident state.**
 - *Builds:* persistent tables, atomic publication, device memory pools in
-  `RuntimeEnv`,
+  `RuntimeEnv`, the runtime's host tables counted in the session's
+  `MemoryPool`,
   `CopyExec`, the moves `prefetch`, `evict` and `pin`, and asynchronous
   runs.
 - *Done when:* torch-sql's nanoGPT training step is one compiled program,
@@ -1814,6 +1837,15 @@ are the first work for the GPU half days, since they wait on no decision.
     from whole compiled steps and values shared across steps (§6.2). The
     alternative is to hold the GPU milestone until B-1 lands. Alex decides
     ([#32](https://github.com/xqlsystems/datafusion-accelerated/issues/32)).
+15. **Handles' edges as Arrow streams.** Whether a handle's `replace`
+    takes, and its `read` returns, a stream rather than batches already in
+    host memory: a `RecordBatchReader` in Rust, `ArrowArrayStream` or
+    `ArrowDeviceArrayStream` across C, and the Arrow PyCapsule protocol's
+    `__arrow_c_stream__` in Python. Device tiers would then keep the same
+    signature, and other engines could read a handle directly. Raised in
+    the adversarial review of M0
+    ([#40](https://github.com/xqlsystems/datafusion-accelerated/pull/40#issuecomment-6887915671)),
+    to settle before M1.
 
 ---
 
@@ -1883,7 +1915,9 @@ are the first work for the GPU half days, since they wait on no decision.
   style guide, as ddx's does (§12.1).
 - **D20** (Alex, 2026-11-14, delegated to ⚡ Claude to decide from what
   users expect). A run reads one snapshot of the runtime's tables, even
-  when another thread replaces one during it (§5.2).
+  when another thread replaces one during it (§5.2). Amended the same day
+  after the adversarial review of #40: a run is explicit, and identified
+  by the `accelerated.run` setting, not by its `TaskContext`.
 
 ### Proposed
 

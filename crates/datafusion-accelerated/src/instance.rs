@@ -4,12 +4,16 @@
 
 //! Where a table's rows are, and how they are held (design §5.2).
 
-/// A memory tier, named by device family. M0 has host memory only.
+/// A memory tier, named by Arrow's device type where one exists (design
+/// §5.2). M0 has host memory only. Device tiers will be variants that carry
+/// a device id, as the Arrow C Device Data Interface's `ArrowDeviceArray`
+/// does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Tier {
-    /// Host memory, accounted by DataFusion's `MemoryPool`.
-    Host,
+    /// Host memory, Arrow's `ARROW_DEVICE_CPU`. In M0 the runtime's tables
+    /// aren't yet counted in the session's `MemoryPool`; M1 counts them.
+    Cpu,
 }
 
 /// How an instance holds its rows. M0 has Arrow rows only.

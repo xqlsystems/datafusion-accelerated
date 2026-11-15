@@ -18,12 +18,12 @@
 //! its own that implements the core's interfaces.
 //!
 //! A session is accelerated by building it with
-//! [`with_accelerator`](SessionStateBuilderExt::with_accelerator):
+//! [`with_accelerator`](AcceleratorExt::with_accelerator):
 //!
 //! ```
 //! use datafusion::execution::session_state::SessionStateBuilder;
 //! use datafusion::prelude::SessionContext;
-//! use datafusion_accelerated::{AcceleratorOptions, SessionStateBuilderExt};
+//! use datafusion_accelerated::{AcceleratorExt, AcceleratorOptions};
 //!
 //! let state = SessionStateBuilder::new()
 //!     .with_default_features()
@@ -36,17 +36,21 @@
 
 mod accelerated_config;
 mod accelerator;
+mod accelerator_ext;
 mod accelerator_options;
+mod error;
 mod handle_scan_exec;
 mod handle_table;
 mod instance;
-mod session_state_builder_ext;
+mod run;
 mod table_handle;
 mod table_store;
 
 pub use accelerated_config::AcceleratedConfig;
 pub use accelerator::Accelerator;
+pub use accelerator_ext::AcceleratorExt;
 pub use accelerator_options::AcceleratorOptions;
+pub use error::Error;
 pub use instance::{Instance, Layout, Owner, Tier};
-pub use session_state_builder_ext::SessionStateBuilderExt;
+pub use run::Run;
 pub use table_handle::TableHandle;

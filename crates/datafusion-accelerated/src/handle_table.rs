@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::arrow::array::Array;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
@@ -29,6 +30,10 @@ impl HandleTable {
     pub(crate) fn new(handle: TableHandle) -> Self {
         Self { handle }
     }
+
+    pub(crate) fn handle(&self) -> &TableHandle {
+        &self.handle
+    }
 }
 
 #[async_trait]
@@ -42,8 +47,7 @@ impl TableProvider for HandleTable {
     }
 
     fn statistics(&self) -> Option<Statistics> {
-        let rows = self.handle.read().ok()?;
-        Some(statistics(&rows, &self.handle.schema()))
+        Some(statistics(&self.handle.read(), &self.handle.schema()))
     }
 
     async fn scan(
@@ -67,8 +71,24 @@ impl TableProvider for HandleTable {
 pub(crate) fn statistics(rows: &[RecordBatch], schema: &SchemaRef) -> Statistics {
     let mut statistics = Statistics::new_unknown(schema);
     let count: usize = rows.iter().map(RecordBatch::num_rows).sum();
-    let bytes: usize = rows.iter().map(RecordBatch::get_array_memory_size).sum();
+    let bytes: usize = rows.iter().map(sliced_size).sum();
     statistics.num_rows = Precision::Inexact(count);
     statistics.total_byte_size = Precision::Inexact(bytes);
     statistics
+}
+
+/// The bytes of a batch's slices of its buffers. A batch's
+/// `get_array_memory_size` counts each buffer whole, so slices of one buffer
+/// would count it once each.
+fn sliced_size(batch: &RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .map(|column| {
+            column
+                .to_data()
+                .get_slice_memory_size()
+                .unwrap_or_else(|_| column.get_array_memory_size())
+        })
+        .sum()
 }

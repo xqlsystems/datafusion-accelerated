@@ -4,19 +4,18 @@
 
 //! The runtime's state for one session.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::catalog::Session;
-use datafusion::common::{DataFusionError, Result};
+use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::{Result, TableReference};
 use datafusion::execution::TaskContext;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::handle_table::HandleTable;
 use crate::table_store::TableStore;
-use crate::{AcceleratedConfig, AcceleratorOptions, TableHandle};
+use crate::{AcceleratedConfig, Error, Run, TableHandle};
 
 /// The runtime's state for one session.
 ///
@@ -24,33 +23,27 @@ use crate::{AcceleratedConfig, AcceleratorOptions, TableHandle};
 /// (`SessionConfig::with_extension`), so the runtime's nodes find it
 /// through the `TaskContext` that DataFusion gives each of them. That's why
 /// it's shared through an `Arc`: DataFusion's extension map holds it so.
+///
+/// The session's catalog, not the runtime, knows the runtime's tables by
+/// name: each is a table provider in it. So SQL, `DROP TABLE` and
+/// `SHOW TABLES` treat them as any other table.
 #[derive(Debug)]
 pub struct Accelerator {
-    options: AcceleratorOptions,
-    // Shared with every handle and every scan of one.
+    // Shared with every handle and every run.
     store: Arc<TableStore>,
-    tables: Mutex<HashMap<String, TableHandle>>,
 }
 
 impl Accelerator {
-    pub(crate) fn new(options: AcceleratorOptions) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            options,
             store: Arc::default(),
-            tables: Mutex::default(),
         }
-    }
-
-    /// The options the session was built with.
-    #[must_use]
-    pub fn options(&self) -> &AcceleratorOptions {
-        &self.options
     }
 
     /// The runtime of a session.
     ///
     /// Fails if the session was built without
-    /// [`with_accelerator`](crate::SessionStateBuilderExt::with_accelerator).
+    /// [`with_accelerator`](crate::AcceleratorExt::with_accelerator).
     pub fn of(session: &dyn Session) -> Result<Arc<Accelerator>> {
         Self::of_config(session.config())
     }
@@ -63,91 +56,73 @@ impl Accelerator {
     /// The session's current `accelerated` settings, including any `SET`.
     pub fn settings(session: &dyn Session) -> Result<AcceleratedConfig> {
         Self::of(session)?;
-        session
-            .config()
-            .options()
-            .extensions
-            .get::<AcceleratedConfig>()
-            .cloned()
-            .ok_or_else(not_attached)
+        Ok(settings_of(session.config())?.clone())
     }
 
     /// Creates a table the runtime owns, with `batches` as its rows, and
-    /// registers it with `ctx` under `name`.
+    /// registers it in `ctx` under `name`, which DataFusion normalizes as
+    /// SQL does: `W` is `w`, and `"W"` is `W`.
     ///
-    /// Fails if the session has a table by that name, or a batch's schema
-    /// isn't `schema`.
-    ///
-    /// # Panics
-    ///
-    /// If another thread panicked while it held the runtime's tables.
+    /// Fails if `ctx` wasn't built with the runtime, the session has a table
+    /// by that name, or a batch's schema isn't contained in `schema`.
     pub fn create_table(
-        &self,
         ctx: &SessionContext,
         name: &str,
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
     ) -> Result<TableHandle> {
-        let mut tables = self.tables();
-        if tables.contains_key(name) || ctx.table_exist(name)? {
-            return Err(DataFusionError::Plan(format!(
-                "the session already has a table named {name}"
-            )));
+        let store = Arc::clone(&Self::of_config(ctx.state_ref().read().config())?.store);
+        let reference = TableReference::from(name);
+        let name = reference.to_quoted_string();
+        if ctx.table_exist(reference.clone())? {
+            return Err(Error::NameTaken { name }.into());
         }
-        let handle = TableHandle::new(Arc::clone(&self.store), name.to_string(), schema, batches)?;
-        ctx.register_table(name, Arc::new(HandleTable::new(handle.clone())))?;
-        tables.insert(name.to_string(), handle.clone());
+        let handle = TableHandle::new(store, name, schema, batches)?;
+        ctx.register_table(reference, Arc::new(HandleTable::new(handle.clone())))?;
         Ok(handle)
     }
 
-    /// The table the runtime owns under `name`, if there is one.
-    ///
-    /// # Panics
-    ///
-    /// If another thread panicked while it held the runtime's tables.
-    #[must_use]
-    pub fn table(&self, name: &str) -> Option<TableHandle> {
-        self.tables().get(name).cloned()
+    /// The table the runtime owns under `name` in `ctx`, if there is one.
+    pub async fn table(ctx: &SessionContext, name: &str) -> Result<Option<TableHandle>> {
+        let reference = TableReference::from(name);
+        if !ctx.table_exist(reference.clone())? {
+            return Ok(None);
+        }
+        let provider: Arc<dyn TableProvider> = ctx.table_provider(reference).await?;
+        Ok(provider
+            .downcast_ref::<HandleTable>()
+            .map(|table| table.handle().clone()))
     }
 
-    /// Deregisters a table from `ctx` and drops its rows. Runs that already
-    /// read it keep the rows they read until they end.
-    ///
-    /// Fails if the runtime owns no table by that name.
-    ///
-    /// # Panics
-    ///
-    /// If another thread panicked while it held the runtime's tables.
-    pub fn release(&self, ctx: &SessionContext, name: &str) -> Result<()> {
-        let Some(handle) = self.tables().remove(name) else {
-            return Err(DataFusionError::Plan(format!(
-                "the runtime owns no table named {name}"
-            )));
-        };
-        ctx.deregister_table(name)?;
-        handle.release();
-        Ok(())
-    }
-
-    fn tables(&self) -> MutexGuard<'_, HashMap<String, TableHandle>> {
-        self.tables
-            .lock()
-            .expect("a thread panicked while it held the runtime's tables")
+    /// Begins a run of `ctx`'s plans, which read one snapshot of the
+    /// runtime's tables until the run is dropped (D20).
+    pub fn begin_run(ctx: &SessionContext) -> Result<Run> {
+        let mut state = ctx.state();
+        let store = Arc::clone(&Self::of(&state)?.store);
+        let id = store.begin_run();
+        let config = state.config_mut();
+        config
+            .options_mut()
+            .extensions
+            .get_mut::<AcceleratedConfig>()
+            .ok_or(Error::NotAttached)?
+            .run = Some(id);
+        let task = Arc::new(TaskContext::from(&state));
+        Ok(Run::new(id, task, store))
     }
 
     fn of_config(config: &SessionConfig) -> Result<Arc<Accelerator>> {
-        config
+        Ok(config
             .get_extension::<Accelerator>()
-            .ok_or_else(not_attached)
+            .ok_or(Error::NotAttached)?)
     }
 }
 
-fn not_attached() -> DataFusionError {
-    DataFusionError::Configuration(
-        "this session has no DataFusion Accelerated runtime: build it with \
-         SessionStateBuilder::with_accelerator(), and call with_config() \
-         before with_accelerator(), since with_config() replaces the \
-         configuration"
-            .to_string(),
-    )
+/// The `accelerated` settings of a session's configuration.
+pub(crate) fn settings_of(config: &SessionConfig) -> Result<&AcceleratedConfig, Error> {
+    config
+        .options()
+        .extensions
+        .get::<AcceleratedConfig>()
+        .ok_or(Error::NotAttached)
 }

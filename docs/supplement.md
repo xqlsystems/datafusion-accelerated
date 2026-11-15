@@ -505,17 +505,41 @@ table twice, as DataFusion's plan of a CTE read twice does
 could read one state table before an update and another after it. The
 runtime's users expect neither: SQL gives each query one snapshot, and a
 training step reads all of the previous step's state. So each run pins a
-snapshot the first time it reads a handle (design D20). The run is
-identified by its `TaskContext`, since DataFusion passes one context to
-every node of an execution, and the runtime builds a fresh one for each
-run of a compiled program. Replacing a table makes a new version map and
-leaves the pinned one intact, so a replace never waits for a run. The
-pin goes when the run's context is dropped.
+snapshot (design D20). Replacing a table makes a new version map and
+leaves the pinned one intact, so a replace never waits for a run.
 
-The snapshot is taken at the first read, not when the run starts, since a
-plan run by DataFusion's `collect` gives the runtime no earlier hook.
-M1's atomic publication of several tables at once builds on the same
-version map.
+A first version identified a run by the address of its `TaskContext`,
+since DataFusion passes one context to every node of an execution. The
+adversarial review of #40
+([comment](https://github.com/xqlsystems/datafusion-accelerated/pull/40#issuecomment-6887694007))
+showed that DataFusion promises no such thing, and that it failed both
+ways. A caller who kept one context and ran a plan with it on every
+training step read the first step's rows forever, with no error. And
+datafusion-ffi 55.2.0 builds a new context for every `execute` that
+crosses it (`src/execution/task_ctx.rs:184`), so a plan run from Python
+pinned a snapshot per scan. Under datafusion-distributed, a stage runs in
+another process, where no address of the coordinator's means anything.
+So a run is now a value: `begin_run` pins the snapshot and gives the run
+an id, and the id travels in the `accelerated.run` setting. Settings are
+what both boundaries carry. datafusion-ffi rebuilds a config from its
+`ConfigOptions` alone (`src/session/config.rs:132`), dropping typed
+extensions, and datafusion-distributed sends a `ConfigExtension` to its
+workers as strings. The pin is dropped when the run is, so nothing waits
+for a later scan to free it. A plan outside a run reads the current rows,
+which is what a caller who reuses a context expects of a table that
+changed. M1's atomic publication of several tables at once builds on the
+same version map.
+
+The same review found the runtime's map from names to tables drifting
+from the session's catalog: the session normalizes `W` to `w` and the
+runtime didn't, and `DROP TABLE` removed the provider while the runtime
+kept the name and the rows. So the catalog is now the only such map, and
+a table's rows live as long as something holds the table: the catalog, a
+plan or a handle. The review also proposed a schema of the runtime's own,
+`accelerated`, as iceberg-rust's DataFusion catalog has. That would
+prevent collisions with users' tables, but every frontend would then
+qualify every name, and torch-sql and xarray-sql write plain ones. A
+collision is already an error (`Error::NameTaken`).
 
 ### S3.4 Step boundaries and shared subplans
 

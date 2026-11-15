@@ -10,20 +10,24 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{Result, Statistics, exec_err};
+use datafusion::common::{Result, Statistics, exec_err, internal_err};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::memory::MemoryStream;
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 
+use crate::accelerator::settings_of;
 use crate::handle_table;
 use crate::table_handle::TableHandle;
 
 /// The scan of a table handle. Planning records the handle, not its rows:
-/// each run reads the rows of its snapshot when it executes.
+/// each execution reads them, from its run's snapshot when the context's
+/// `accelerated.run` names one (D20), and the table's current rows
+/// otherwise.
 ///
 /// It has one partition, since a plan's partitions are fixed when it's
 /// planned and a table's batches aren't. DataFusion repartitions above it
@@ -34,6 +38,7 @@ pub(crate) struct HandleScanExec {
     projection: Option<Vec<usize>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl HandleScanExec {
@@ -53,6 +58,7 @@ impl HandleScanExec {
             projection,
             schema,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 }
@@ -89,14 +95,31 @@ impl ExecutionPlan for HandleScanExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return internal_err!(
+                "HandleScanExec is a leaf, and was given {} children",
+                children.len()
+            );
+        }
         Ok(self)
     }
 
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        // Each run's metrics are its own.
+        Ok(Arc::new(Self::try_new(
+            self.handle.clone(),
+            self.projection.clone(),
+        )?))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
-        let rows = self.handle.read()?;
-        let rows = self.project(&rows)?;
+        let rows = self.project(&self.handle.read())?;
         Ok(Arc::new(handle_table::statistics(&rows, &self.schema)))
     }
 
@@ -108,8 +131,16 @@ impl ExecutionPlan for HandleScanExec {
         if partition != 0 {
             return exec_err!("HandleScanExec has one partition, not {partition}");
         }
-        let rows = self.handle.read_for_run(&context)?;
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let timer = baseline.elapsed_compute().timer();
+        let run = settings_of(context.session_config())
+            .ok()
+            .and_then(|settings| settings.run);
+        let rows = self.handle.read_in(run)?;
         let batches = self.project(&rows)?;
+        timer.done();
+        baseline.record_output(batches.iter().map(RecordBatch::num_rows).sum());
+        baseline.done();
         let stream = MemoryStream::try_new(batches, Arc::clone(&self.schema), None)?;
         Ok(Box::pin(stream))
     }
