@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 # DataFusion Accelerated: supplement
 
 _companion to_: [the design](design.md)
-_last updated_: 2026-11-14
+_last updated_: 2026-11-15
 
 This supplement holds the evidence behind the [design](design.md), the
 alternatives it rejected, and the reasoning behind its rules. The design
@@ -1476,7 +1476,12 @@ switch, there are no in-switch reductions; rings and trees do instead.
    ([#21](https://github.com/xqlsystems/datafusion-accelerated/issues/21)).
 3. **Tiers were named by Arrow device types**, and a TPU has none. They are
    now named by device family, and a TPU's tables cross into DataFusion only
-   through the host.
+   through the host. In code, a tier keeps Arrow's open integer device
+   type and device id, with negative codes left to integrations, so a TPU's
+   integration names its family in its own crate. A closed enum of families
+   would have needed a core release naming each vendor (R13), as the second
+   adversarial review of #40 pointed out
+   ([comment](https://github.com/xqlsystems/datafusion-accelerated/pull/40#issuecomment-6900007496)).
 4. **The topology was a list of tiers.** It is now a graph, covering
    switched domains, full meshes and tori, taken from each platform's own
    discovery, with placement as an embedding of the partition grid into it

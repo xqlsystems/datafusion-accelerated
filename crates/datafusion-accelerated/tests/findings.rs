@@ -190,7 +190,7 @@ async fn dropping_after_the_last_run_drops_the_rows() -> Result<()> {
 /// src/config/mod.rs:71).
 fn from_python(run: Option<u64>, task: &TaskContext) -> Arc<TaskContext> {
     let mut settings = AcceleratedConfig::default();
-    settings.run = run;
+    settings.run = run.unwrap_or(0);
     let mut foreign = FFI_ExtensionOptions::default();
     foreign.add_config(&settings).expect("the settings convert");
     let mut python = ConfigOptions::default();

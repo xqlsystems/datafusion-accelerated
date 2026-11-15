@@ -7,7 +7,11 @@
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::execution::TaskContext;
+use datafusion::common::Result;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::StreamExt;
 
 use crate::table_store::TableStore;
 
@@ -18,22 +22,38 @@ use crate::table_store::TableStore;
 /// pins the snapshot. Its [`task_ctx`](Run::task_ctx) carries its id in the
 /// `accelerated.run` setting, by which scans find the snapshot. Dropping the
 /// run ends it and drops the pin, after which a plan given its context fails
-/// instead of reading other rows.
+/// instead of reading other rows. A stream from
+/// [`execute_stream`](Run::execute_stream) keeps the run going until the
+/// stream is dropped.
 pub struct Run {
-    id: u64,
+    pin: Arc<Pin>,
     task: Arc<TaskContext>,
+}
+
+/// The run's pin on its snapshot, dropped with the run and its streams.
+struct Pin {
+    id: u64,
     store: Arc<TableStore>,
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        self.store.end_run(self.id);
+    }
 }
 
 impl Run {
     pub(crate) fn new(id: u64, task: Arc<TaskContext>, store: Arc<TableStore>) -> Self {
-        Self { id, task, store }
+        Self {
+            pin: Arc::new(Pin { id, store }),
+            task,
+        }
     }
 
     /// The run's id, as the `accelerated.run` setting holds it.
     #[must_use]
     pub fn id(&self) -> u64 {
-        self.id
+        self.pin.id
     }
 
     /// The context to execute the run's plans with.
@@ -41,16 +61,29 @@ impl Run {
     pub fn task_ctx(&self) -> Arc<TaskContext> {
         Arc::clone(&self.task)
     }
-}
 
-impl Drop for Run {
-    fn drop(&mut self) {
-        self.store.end_run(self.id);
+    /// Executes `plan` in the run, as one stream of all its partitions. The
+    /// stream holds the run, so it can be returned from where the run was
+    /// begun.
+    pub fn execute_stream(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> Result<SendableRecordBatchStream> {
+        let stream = datafusion::physical_plan::execute_stream(plan, self.task_ctx())?;
+        let schema = stream.schema();
+        let pin = Arc::clone(&self.pin);
+        let stream = stream.map(move |batch| {
+            // The closure owns the pin, so the run lasts as long as the
+            // stream.
+            let _ = &pin;
+            batch
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
 impl fmt::Debug for Run {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Run").field("id", &self.id).finish()
+        f.debug_struct("Run").field("id", &self.pin.id).finish()
     }
 }

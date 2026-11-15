@@ -51,6 +51,6 @@ pub use accelerator::Accelerator;
 pub use accelerator_ext::AcceleratorExt;
 pub use accelerator_options::AcceleratorOptions;
 pub use error::Error;
-pub use instance::{Instance, Layout, Owner, Tier};
+pub use instance::{DeviceType, Instance, Layout, Owner, Tier};
 pub use run::Run;
 pub use table_handle::TableHandle;

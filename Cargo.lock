@@ -711,6 +711,7 @@ dependencies = [
  "async-trait",
  "datafusion",
  "datafusion-ffi",
+ "futures",
  "tokio",
 ]
 

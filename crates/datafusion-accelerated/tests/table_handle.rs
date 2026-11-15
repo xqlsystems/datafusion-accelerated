@@ -16,7 +16,7 @@ use datafusion::physical_plan::execution_plan::reset_plan_states;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_accelerated::{
-    Accelerator, AcceleratorExt, AcceleratorOptions, Error, Layout, Owner, Tier,
+    Accelerator, AcceleratorExt, AcceleratorOptions, DeviceType, Error, Layout, Owner, Tier,
 };
 
 fn session() -> SessionContext {
@@ -403,6 +403,71 @@ async fn debug_doesnt_print_the_rows() -> Result<()> {
         text.len()
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn a_runs_stream_keeps_the_run() -> Result<()> {
+    let ctx = session();
+    Accelerator::create_table(&ctx, "t", schema(), vec![batch(0..4, 1)])?;
+    let sum = plan(&ctx, "SELECT SUM(v) FROM t").await?;
+    let stream = {
+        let run = Accelerator::begin_run(&ctx)?;
+        run.execute_stream(sum)?
+    };
+    let batches = datafusion::physical_plan::common::collect(stream).await?;
+    assert_eq!(
+        value(&batches),
+        6,
+        "the stream outlives the Run value, and its run with it"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_stale_run_setting_fails_until_cleared() -> Result<()> {
+    let ctx = session();
+    Accelerator::create_table(&ctx, "t", schema(), vec![batch(0..4, 1)])?;
+    let id = Accelerator::begin_run(&ctx)?.id();
+    ctx.sql(&format!("SET accelerated.run = {id}"))
+        .await?
+        .collect()
+        .await?;
+    let err = ctx
+        .sql("SELECT SUM(v) FROM t")
+        .await?
+        .collect()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(Error::find(&err), Some(Error::RunEnded { .. })),
+        "the run has ended: {err}"
+    );
+    ctx.sql("SET accelerated.run = 0").await?.collect().await?;
+    let batches = ctx.sql("SELECT SUM(v) FROM t").await?.collect().await?;
+    assert_eq!(value(&batches), 6, "0 returns to the current rows");
+    Ok(())
+}
+
+#[test]
+fn a_device_tier_carries_arrows_device_type_and_id() {
+    let tier = Tier::Device {
+        device_type: DeviceType::CUDA,
+        device_id: 1,
+    };
+    assert_ne!(
+        tier,
+        Tier::Device {
+            device_type: DeviceType::CUDA,
+            device_id: 0,
+        },
+        "two GPUs of one family are two tiers"
+    );
+    assert_eq!(DeviceType::CUDA.code(), 2, "Arrow's ARROW_DEVICE_CUDA");
+    assert_eq!(
+        DeviceType::new(-1).code(),
+        -1,
+        "an integration names a family Arrow doesn't list"
+    );
 }
 
 #[test]

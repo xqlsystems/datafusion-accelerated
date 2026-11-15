@@ -29,6 +29,7 @@ datafusion = "=55.2.0"
 datafusion-ffi = "=55.2.0"
 datafusion-proto = "=55.2.0"
 async-trait = "0.1"
+futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 # The Google Rust style guide's rules that clippy and rustc can check

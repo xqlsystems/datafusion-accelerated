@@ -107,7 +107,7 @@ impl Accelerator {
             .extensions
             .get_mut::<AcceleratedConfig>()
             .ok_or(Error::NotAttached)?
-            .run = Some(id);
+            .run = id;
         let task = Arc::new(TaskContext::from(&state));
         Ok(Run::new(id, task, store))
     }
@@ -138,7 +138,7 @@ pub(crate) fn settings_of(config: &SessionConfig) -> Result<&AcceleratedConfig, 
 /// settings this doesn't know fails closed.
 pub(crate) fn run_of(config: &SessionConfig) -> Result<Option<u64>, Error> {
     if let Ok(settings) = settings_of(config) {
-        return Ok(settings.run);
+        return Ok(run_id(settings.run));
     }
     let key = format!("{}.run", AcceleratedConfig::PREFIX);
     let Some(entry) = config
@@ -153,10 +153,15 @@ pub(crate) fn run_of(config: &SessionConfig) -> Result<Option<u64>, Error> {
         None | Some("") => Ok(None),
         Some(value) => value
             .parse()
-            .map(Some)
+            .map(run_id)
             .map_err(|_| Error::UnreadableSetting {
                 key,
                 value: value.to_string(),
             }),
     }
+}
+
+/// The run `accelerated.run`'s value names: none for `0`.
+fn run_id(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
 }

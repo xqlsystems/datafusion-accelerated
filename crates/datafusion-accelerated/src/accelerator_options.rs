@@ -32,7 +32,7 @@ impl AcceleratorOptions {
     pub(crate) fn settings(&self) -> AcceleratedConfig {
         AcceleratedConfig {
             strict: self.strict,
-            run: None,
+            run: 0,
         }
     }
 }

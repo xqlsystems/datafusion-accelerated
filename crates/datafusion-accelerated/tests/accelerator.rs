@@ -169,7 +169,7 @@ async fn a_run_id_can_be_set() -> Result<()> {
     set(&ctx, "SET accelerated.run = 7").await?;
     assert_eq!(
         Accelerator::settings(&ctx.state())?.run,
-        Some(7),
+        7,
         "the run's id is a setting, as the FFI and workers carry it"
     );
     Ok(())

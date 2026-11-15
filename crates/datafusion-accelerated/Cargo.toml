@@ -19,6 +19,7 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 datafusion.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 datafusion-ffi.workspace = true

@@ -18,12 +18,19 @@ extensions_options! {
         /// DataFusion's own operators (principle R8).
         pub strict: bool, default = false
 
-        /// The run whose snapshot of the runtime's tables a plan reads
-        /// (D20). [`Run::task_ctx`](crate::Run::task_ctx) sets it. As a
-        /// setting, it crosses datafusion-ffi and reaches
-        /// datafusion-distributed's workers. Without it, each scan of a
-        /// runtime table reads the table's current rows.
-        pub run: Option<u64>, default = None
+        /// Internal: the run whose snapshot of the runtime's tables a plan
+        /// reads (D20). [`Run::task_ctx`](crate::Run::task_ctx) sets it,
+        /// and it's a setting only so that it crosses datafusion-ffi.
+        /// Without it, each scan of a runtime table reads the table's
+        /// current rows. A run's id names its snapshot only in the process
+        /// that began it.
+        ///
+        /// `0`, the default, is no run, since no run has that id. Set by
+        /// hand with `SET`, it makes the session's queries read that run's
+        /// snapshot while the run lasts, and fail with `RunEnded` after it,
+        /// until `SET accelerated.run = 0`. (DataFusion 55's `RESET`
+        /// resets only `datafusion.*` settings.)
+        pub run: u64, default = 0
     }
 }
 

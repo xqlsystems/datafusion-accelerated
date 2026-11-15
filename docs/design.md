@@ -10,7 +10,7 @@ _author_: Alex Merose
 _co-authors_: ⚡ Claude (datafusion-accelerated), formerly 🔥 Claude (torch-sql), and 🌀 Claude (xarray-sql), via Claude Code
 _reviewers_: 🪭 Claude (einfold) and ∂ Claude (ddx). Their reviews of v1.1 are in [reviews/](reviews/).
 _status_: v1.10. M0 is being built. Collapsed sections (▸) hold background and detail.
-_last updated_: 2026-11-14
+_last updated_: 2026-11-15
 _supplement_: [supplement.md](supplement.md), with the evidence, the alternatives considered and the reasoning behind each rule. Citations such as "(S1.1)" point there. S6 compares the design with JAX, PyTorch and DataFusion, and S7 covers distributed training.
 _origin_: [xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307)
 
@@ -508,7 +508,11 @@ two tiers: host memory, through its `MemoryPool`, and disk, through its
 by Arrow's device type where one exists (§2.1), by a name the device
 integration defines where none does, and `storage` for files. A device
 tier also carries its device's id, as the Arrow C Device Data Interface's
-`ArrowDeviceArray` does
+`ArrowDeviceArray` does. The device type is an open integer, as Arrow's
+is, so an integration in its own crate (§5.8) names its devices without a
+change to the core (R13): Arrow's codes are positive, and a family Arrow
+doesn't list, such as a TPU, takes a negative code its integration
+defines
 ([#20](https://github.com/xqlsystems/datafusion-accelerated/issues/20)).
 
 | Tier | Device type | Accounting |
@@ -579,8 +583,14 @@ Rules:
   pins the current version of every handle, and the run's plans read
   those versions to its end, whatever is replaced or dropped meanwhile.
   The run's id travels in the `accelerated.run` setting, which crosses
-  datafusion-ffi and reaches datafusion-distributed's workers, as settings
-  do. The scan reads the id in whichever form the settings arrive: as
+  datafusion-ffi as settings do. The setting is internal: set by hand, it
+  makes the session's queries read that run's snapshot while the run
+  lasts, and fail after it until it is set back to `0`. An id names a
+  snapshot only in the process that began the run, so on a
+  datafusion-distributed worker it fails with `RunEnded` until snapshots
+  are named by table versions (the `Program` sketch on #40).
+  `Run::execute_stream` returns a stream that holds the run, so a
+  function can return the stream of a run it began. The scan reads the id in whichever form the settings arrive: as
   the runtime's own `AcceleratedConfig`, or as datafusion-ffi's
   `FFI_ExtensionOptions` when datafusion-python executes the plan. A value
   it can't read is an error, never "no run". A plan executed outside a run
@@ -1509,8 +1519,9 @@ More rules:
   and kernels as the coordinating session (§5.1). The coordinator and each
   worker register `AcceleratedConfig` with datafusion-distributed's
   `with_distributed_option_extension` after `with_accelerator`, since both
-  insert it and the later call's copy wins. That is how a run's id
-  (`accelerated.run`, §5.2) reaches the workers. The runtime's codec
+  insert it and the later call's copy wins. That is how settings reach
+  the workers. A run's id (`accelerated.run`, §5.2) reaches them too, but
+  names a snapshot only on the coordinator. The runtime's codec
   ships a `KernelExec` as its kernel's name and tuning parameters, and the
   worker finds the kernel in its own session.
 - **A distributed device plan** holds datafusion-distributed's network
