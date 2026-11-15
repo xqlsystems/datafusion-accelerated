@@ -20,7 +20,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 
-use crate::accelerator::settings_of;
+use crate::accelerator::run_of;
 use crate::handle_table;
 use crate::table_handle::TableHandle;
 
@@ -133,9 +133,7 @@ impl ExecutionPlan for HandleScanExec {
         }
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let timer = baseline.elapsed_compute().timer();
-        let run = settings_of(context.session_config())
-            .ok()
-            .and_then(|settings| settings.run);
+        let run = run_of(context.session_config())?;
         let rows = self.handle.read_in(run)?;
         let batches = self.project(&rows)?;
         timer.done();

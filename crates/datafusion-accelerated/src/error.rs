@@ -31,6 +31,21 @@ pub enum Error {
         /// The batch's schema.
         found: SchemaRef,
     },
+    /// A runtime setting has a value the runtime can't read.
+    UnreadableSetting {
+        /// The setting's key, such as `accelerated.run`.
+        key: String,
+        /// Its value, as text.
+        value: String,
+    },
+    /// A run read a table created after the run began, which isn't in the
+    /// run's snapshot (D20).
+    CreatedAfterRun {
+        /// The table's name, as SQL writes it.
+        table: String,
+        /// The run's id.
+        run: u64,
+    },
     /// A plan ran with the id of a run that has ended, or that belongs to
     /// another session or process (D20).
     RunEnded {
@@ -68,6 +83,17 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "a batch for the table {table} has the schema {found}, not the table's {expected}"
+            ),
+            Error::UnreadableSetting { key, value } => {
+                write!(
+                    f,
+                    "the setting {key} has the value {value:?}, which isn't valid"
+                )
+            }
+            Error::CreatedAfterRun { table, run } => write!(
+                f,
+                "the table {table} was created after run {run} began, so it isn't in the \
+                 run's snapshot"
             ),
             Error::RunEnded { run } => write!(
                 f,

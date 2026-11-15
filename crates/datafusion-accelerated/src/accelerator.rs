@@ -9,6 +9,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::config::ConfigExtension;
 use datafusion::common::{Result, TableReference};
 use datafusion::execution::TaskContext;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -125,4 +126,37 @@ pub(crate) fn settings_of(config: &SessionConfig) -> Result<&AcceleratedConfig, 
         .extensions
         .get::<AcceleratedConfig>()
         .ok_or(Error::NotAttached)
+}
+
+/// The run a plan executing with `config` belongs to, if any (D20).
+///
+/// A session built in Rust holds the settings as an `AcceleratedConfig`.
+/// A plan that datafusion-python executes gets them across datafusion-ffi
+/// as an `FFI_ExtensionOptions` instead, whose entries carry their
+/// namespace, so the run is read from the `accelerated.run` entry. A value
+/// there that isn't a run id is an error, never "no run", so a form of the
+/// settings this doesn't know fails closed.
+pub(crate) fn run_of(config: &SessionConfig) -> Result<Option<u64>, Error> {
+    if let Ok(settings) = settings_of(config) {
+        return Ok(settings.run);
+    }
+    let key = format!("{}.run", AcceleratedConfig::PREFIX);
+    let Some(entry) = config
+        .options()
+        .entries()
+        .into_iter()
+        .find(|entry| entry.key == key)
+    else {
+        return Ok(None);
+    };
+    match entry.value.as_deref() {
+        None | Some("") => Ok(None),
+        Some(value) => value
+            .parse()
+            .map(Some)
+            .map_err(|_| Error::UnreadableSetting {
+                key,
+                value: value.to_string(),
+            }),
+    }
 }

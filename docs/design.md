@@ -580,9 +580,15 @@ Rules:
   those versions to its end, whatever is replaced or dropped meanwhile.
   The run's id travels in the `accelerated.run` setting, which crosses
   datafusion-ffi and reaches datafusion-distributed's workers, as settings
-  do. A plan executed outside a run reads each table's current rows when
-  its scan starts. A plan given the id of a run that has ended fails,
-  never reads other rows. A run pins every table, not only those it reads,
+  do. The scan reads the id in whichever form the settings arrive: as
+  the runtime's own `AcceleratedConfig`, or as datafusion-ffi's
+  `FFI_ExtensionOptions` when datafusion-python executes the plan. A value
+  it can't read is an error, never "no run". A plan executed outside a run
+  reads each table's current rows when its scan starts. A plan given the
+  id of a run that has ended fails, never reads other rows. A table
+  created after a run began isn't in its snapshot, and reading it in that
+  run is an error, since its rows and the snapshot's are from different
+  moments. A run pins every table, not only those it reads,
   so a table replaced during a long run keeps its old version in memory
   until the run ends (S3.3).
 - **Runtime tables report statistics, and never exact ones.** Without row

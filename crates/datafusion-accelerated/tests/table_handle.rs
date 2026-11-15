@@ -217,18 +217,26 @@ async fn a_plan_given_an_ended_run_fails() -> Result<()> {
 }
 
 #[tokio::test]
-async fn a_run_reads_a_table_created_during_it_from_its_first_scan() -> Result<()> {
+async fn a_run_cant_read_a_table_created_during_it() -> Result<()> {
     let ctx = session();
-    let run = Accelerator::begin_run(&ctx)?;
     let t = Accelerator::create_table(&ctx, "t", schema(), vec![batch(0..2, 1)])?;
-    let both = plan(&ctx, "SELECT v FROM t UNION ALL SELECT v FROM t").await?;
-    let first = collect_partition(&both, 0, &run.task_ctx()).await?;
+    let run = Accelerator::begin_run(&ctx)?;
+    // u is made from the new t, so reading the old t with u would read a
+    // state that never existed.
     t.replace(vec![batch(0..2, 10)])?;
-    let second = collect_partition(&both, 1, &run.task_ctx()).await?;
+    Accelerator::create_table(&ctx, "u", schema(), vec![batch(0..2, 10)])?;
+    let both = plan(&ctx, "SELECT v FROM t UNION ALL SELECT v FROM u").await?;
     assert_eq!(
-        (first, second),
-        (vec![0, 1], vec![0, 1]),
-        "the run keeps the rows its first scan of t read"
+        collect_partition(&both, 0, &run.task_ctx()).await?,
+        vec![0, 1],
+        "t is read as the run began"
+    );
+    let err = collect_partition(&both, 1, &run.task_ctx())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(Error::find(&err), Some(Error::CreatedAfterRun { table, .. }) if table == "u"),
+        "u isn't in the run's snapshot: {err}"
     );
     Ok(())
 }

@@ -21,4 +21,5 @@ async-trait.workspace = true
 datafusion.workspace = true
 
 [dev-dependencies]
+datafusion-ffi.workspace = true
 tokio.workspace = true

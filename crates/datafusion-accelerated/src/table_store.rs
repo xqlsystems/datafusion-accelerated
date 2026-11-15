@@ -32,8 +32,8 @@ fn next_id() -> u64 {
 /// The tables of one session's runtime, and the snapshots its runs read.
 ///
 /// A run pins the snapshot current when it begins, and every scan in the
-/// run reads it, whatever is replaced meanwhile (D20). The pin is dropped
-/// when the run ends.
+/// run reads it, whatever is replaced meanwhile (D20). A table created
+/// after the run began isn't in it. The pin is dropped when the run ends.
 #[derive(Default)]
 pub(crate) struct TableStore {
     state: Mutex<StoreState>,
@@ -66,7 +66,14 @@ impl TableStore {
 
     /// A table's current rows.
     pub(crate) fn current(&self, id: HandleId) -> Arc<[RecordBatch]> {
-        current(&self.lock(), id)
+        // A table's rows are removed only when its last handle is dropped,
+        // and a caller here holds a handle.
+        Arc::clone(
+            self.lock()
+                .current
+                .get(&id)
+                .expect("a live handle's rows are in its store"),
+        )
     }
 
     /// Begins a run: pins the current snapshot, and returns the run's id.
@@ -83,22 +90,17 @@ impl TableStore {
         self.lock().runs.remove(&run);
     }
 
-    /// A table's rows as run `run` sees them.
-    pub(crate) fn for_run(&self, run: u64, id: HandleId) -> Result<Arc<[RecordBatch]>, Error> {
-        let mut state = self.lock();
-        let Some(versions) = state.runs.get(&run) else {
-            return Err(Error::RunEnded { run });
-        };
-        if let Some(rows) = versions.get(&id) {
-            return Ok(Arc::clone(rows));
-        }
-        // A table created after the run began: the run reads its rows as
-        // they are now, and keeps them for the rest of the run.
-        let rows = current(&state, id);
-        if let Some(versions) = state.runs.get_mut(&run) {
-            Arc::make_mut(versions).insert(id, Arc::clone(&rows));
-        }
-        Ok(rows)
+    /// A table's rows as run `run` sees them, or `None` if the table was
+    /// created after the run began. Reading such a table's current rows
+    /// would mix two instants in one run, so the caller fails instead.
+    pub(crate) fn for_run(
+        &self,
+        run: u64,
+        id: HandleId,
+    ) -> Result<Option<Arc<[RecordBatch]>>, Error> {
+        let state = self.lock();
+        let versions = state.runs.get(&run).ok_or(Error::RunEnded { run })?;
+        Ok(versions.get(&id).cloned())
     }
 
     fn lock(&self) -> MutexGuard<'_, StoreState> {
@@ -106,17 +108,6 @@ impl TableStore {
         // panicked while it held the lock left the state whole.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
-
-fn current(state: &StoreState, id: HandleId) -> Arc<[RecordBatch]> {
-    // A table's rows are removed only when its last handle is dropped, and
-    // a caller here holds a handle.
-    Arc::clone(
-        state
-            .current
-            .get(&id)
-            .expect("a live handle's rows are in its store"),
-    )
 }
 
 // By hand, so that printing a plan doesn't print every table's rows.

@@ -104,7 +104,14 @@ impl TableHandle {
     /// run.
     pub(crate) fn read_in(&self, run: Option<u64>) -> Result<Arc<[RecordBatch]>> {
         match run {
-            Some(run) => Ok(self.inner.store.for_run(run, self.inner.id)?),
+            Some(run) => match self.inner.store.for_run(run, self.inner.id)? {
+                Some(rows) => Ok(rows),
+                None => Err(Error::CreatedAfterRun {
+                    table: self.inner.name.clone(),
+                    run,
+                }
+                .into()),
+            },
             None => Ok(self.read()),
         }
     }

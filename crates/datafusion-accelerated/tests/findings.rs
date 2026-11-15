@@ -12,13 +12,18 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, ArrayRef, Int64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::execution_plan::reset_plan_states;
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_accelerated::{Accelerator, AcceleratorExt, AcceleratorOptions};
+use datafusion_accelerated::{
+    AcceleratedConfig, Accelerator, AcceleratorExt, AcceleratorOptions, Error,
+};
+use datafusion_ffi::config::FFI_ConfigOptions;
+use datafusion_ffi::config::extension_options::FFI_ExtensionOptions;
 
 fn session() -> SessionContext {
     let state = SessionStateBuilder::new()
@@ -83,12 +88,12 @@ async fn a_reused_task_context_still_reads_each_replace() -> Result<()> {
 /// datafusion-ffi 55.2.0 src/execution/task_ctx.rs:184, which ends in
 /// `Arc::new(TaskContext::new(..))`), and drops it when `execute` returns.
 /// This reproduces that: each partition of one logical run executes with
-/// its own context, as a plan over a handle table does when datafusion-python
-/// runs it. Each scan pinned its own snapshot, so D20 didn't hold. The run's
-/// id now travels in the `accelerated.run` setting, which the FFI carries
-/// as it carries every setting.
+/// its own context. Each scan pinned its own snapshot, so D20 didn't hold.
+/// The run's id now travels in the `accelerated.run` setting. Here the
+/// settings stay native; `a_run_from_python_reads_one_snapshot` gives them
+/// the form datafusion-ffi gives them.
 #[tokio::test]
-async fn one_run_across_the_ffi_reads_one_snapshot() -> Result<()> {
+async fn one_run_with_a_context_per_execute_reads_one_snapshot() -> Result<()> {
     let ctx = session();
     let t = Accelerator::create_table(&ctx, "t", schema(), vec![batch(&[1])])?;
     let both = plan(&ctx, "SELECT v FROM t UNION ALL SELECT v FROM t").await?;
@@ -173,6 +178,69 @@ async fn dropping_after_the_last_run_drops_the_rows() -> Result<()> {
         Arc::strong_count(&values),
         1,
         "no run is live and the table is dropped, so nothing should hold its rows"
+    );
+    Ok(())
+}
+
+/// The context of a plan that datafusion-python executes, from the second
+/// review's probe. datafusion-python knows the runtime's settings only as
+/// an `FFI_ExtensionOptions`, as spike 4a registers them, so they cross as
+/// strings and come back as one `FFI_ExtensionOptions`, not an
+/// `AcceleratedConfig` (datafusion-ffi 55.2.0 src/session/config.rs:132,
+/// src/config/mod.rs:71).
+fn from_python(run: Option<u64>, task: &TaskContext) -> Arc<TaskContext> {
+    let mut settings = AcceleratedConfig::default();
+    settings.run = run;
+    let mut foreign = FFI_ExtensionOptions::default();
+    foreign.add_config(&settings).expect("the settings convert");
+    let mut python = ConfigOptions::default();
+    python.extensions.insert(foreign);
+    let options = ConfigOptions::try_from(FFI_ConfigOptions::from(&python))
+        .expect("the options cross the FFI");
+    Arc::new(TaskContext::new(
+        None,
+        "python".into(),
+        SessionConfig::from(options),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        task.runtime_env(),
+    ))
+}
+
+/// The scan asked for the native `AcceleratedConfig`, found none, and read
+/// "no run": one run's two scans read two snapshots, and an ended run read
+/// the current rows with no error.
+#[tokio::test]
+async fn a_run_from_python_reads_one_snapshot() -> Result<()> {
+    let ctx = session();
+    let t = Accelerator::create_table(&ctx, "t", schema(), vec![batch(&[1])])?;
+    let both = plan(&ctx, "SELECT v FROM t UNION ALL SELECT v FROM t").await?;
+    let run = Accelerator::begin_run(&ctx)?;
+    let collect_one = |partition: usize, task: Arc<TaskContext>| {
+        let stream = both.execute(partition, task);
+        async move { datafusion::physical_plan::common::collect(stream?).await }
+    };
+    let first = collect_one(0, from_python(Some(run.id()), &ctx.task_ctx())).await?;
+    t.replace(vec![batch(&[2])])?;
+    let second = collect_one(1, from_python(Some(run.id()), &ctx.task_ctx())).await?;
+    assert_eq!(first, second, "both scans of t belong to one run");
+
+    let id = run.id();
+    drop(run);
+    let err = collect_one(0, from_python(Some(id), &ctx.task_ctx()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(Error::find(&err), Some(Error::RunEnded { .. })),
+        "an ended run fails from Python too: {err}"
+    );
+    let outside = collect_one(0, from_python(None, &ctx.task_ctx())).await?;
+    assert_eq!(
+        outside.len(),
+        1,
+        "outside a run, Python reads the current rows"
     );
     Ok(())
 }
