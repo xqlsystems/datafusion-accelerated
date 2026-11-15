@@ -98,18 +98,13 @@ impl Accelerator {
     /// Begins a run of `ctx`'s plans, which read one snapshot of the
     /// runtime's tables until the run is dropped (D20).
     pub fn begin_run(ctx: &SessionContext) -> Result<Run> {
-        let mut state = ctx.state();
+        let state = ctx.state();
         let store = Arc::clone(&Self::of(&state)?.store);
-        let id = store.begin_run();
-        let config = state.config_mut();
-        config
-            .options_mut()
-            .extensions
-            .get_mut::<AcceleratedConfig>()
-            .ok_or(Error::NotAttached)?
-            .run = id;
-        let task = Arc::new(TaskContext::from(&state));
-        Ok(Run::new(id, task, store))
+        Run::begin(state, store)
+    }
+
+    pub(crate) fn store(&self) -> &Arc<TableStore> {
+        &self.store
     }
 
     fn of_config(config: &SessionConfig) -> Result<Arc<Accelerator>> {

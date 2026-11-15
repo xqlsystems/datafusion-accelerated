@@ -541,6 +541,29 @@ prevent collisions with users' tables, but every frontend would then
 qualify every name, and torch-sql and xarray-sql write plain ones. A
 collision is already an error (`Error::NameTaken`).
 
+The adversarial reviews of #40 also settled what a program's step is. A
+first amendment let a step be `INSERT OVERWRITE w SELECT ...`, so that a
+write would be plain SQL any engine runs. It isn't: DataFusion 55.2.0's
+`MemTable`, the reference for the cross-engine check, takes only appends
+(`datafusion-catalog` 55.2.0, `src/memory/table.rs:257`), and the second
+round reports that DuckDB 2.0.0 doesn't parse `INSERT OVERWRITE`
+([comment](https://github.com/xqlsystems/datafusion-accelerated/pull/40#issuecomment-6900007496)).
+A write visible to later steps also made order matter between steps that
+read nothing of each other, which would have meant running steps in the
+order listed. A named `SELECT` whose state means its value at the start of
+the run avoids both: every engine runs a `SELECT`, and order follows from
+reads, so independent steps can run at once (ddx#157).
+
+The same reviews asked for versions. A process-local run id can't be
+logged, sent to a worker or used as a cache key, and "last writer wins" at
+publish hid a decision that nothing could show (R10). So a snapshot is a
+map from tables to versions, as Iceberg's snapshots and Delta's table
+versions are, and publishing checks the versions, as Iceberg's optimistic
+commits and Delta's conflict checks do. Each version carries the table's
+UUID, as Iceberg pairs a table's UUID with its snapshot ids, so that a
+table dropped and created again under the same name never repeats a
+version.
+
 ### S3.4 Step boundaries and shared subplans
 
 ddx already draws its programs' step boundaries, for four reasons (S1.4).

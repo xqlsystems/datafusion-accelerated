@@ -11,9 +11,11 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Result;
 
-use crate::Error;
+use uuid::Uuid;
+
 use crate::instance::{Instance, Layout, Owner, Tier};
-use crate::table_store::{HandleId, TableStore};
+use crate::table_store::{HandleId, TableInfo, TableStore};
+use crate::{Error, TableVersion};
 
 /// A table the runtime owns, as a buffer handle refers to an allocation.
 ///
@@ -51,8 +53,34 @@ impl TableHandle {
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
     ) -> Result<Self> {
+        Self::with_privacy(store, name, schema, batches, false)
+    }
+
+    /// A table of a program's own, such as an input, which snapshots don't
+    /// list.
+    pub(crate) fn new_private(
+        store: Arc<TableStore>,
+        name: String,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Self> {
+        Self::with_privacy(store, name, schema, batches, true)
+    }
+
+    fn with_privacy(
+        store: Arc<TableStore>,
+        name: String,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        private: bool,
+    ) -> Result<Self> {
         let batches = stamped(&name, &schema, batches)?;
-        let id = store.insert(batches);
+        let info = TableInfo {
+            name: name.clone(),
+            table: Uuid::new_v4(),
+            private,
+        };
+        let id = store.insert(info, batches);
         Ok(Self {
             inner: Arc::new(HandleInner {
                 id,
@@ -75,6 +103,12 @@ impl TableHandle {
         Arc::clone(&self.inner.schema)
     }
 
+    /// The table's current version.
+    #[must_use]
+    pub fn version(&self) -> TableVersion {
+        self.inner.store.version(self.inner.id)
+    }
+
     /// The table's copies. In M0, one in host memory, as Arrow rows, owned
     /// by the runtime.
     #[must_use]
@@ -82,8 +116,8 @@ impl TableHandle {
         vec![Instance::new(Tier::Cpu, Layout::Rows, Owner::Runtime)]
     }
 
-    /// Replaces the table's rows. Runs that already began keep the rows
-    /// they pinned (D20).
+    /// Replaces the table's rows, as its next version. Runs that already
+    /// began keep the rows they pinned (D20).
     ///
     /// Fails if a batch's schema isn't contained in the table's. The batches
     /// are stored with the table's schema, so reads give it back.
@@ -98,6 +132,10 @@ impl TableHandle {
     #[must_use]
     pub fn read(&self) -> Arc<[RecordBatch]> {
         self.inner.store.current(self.inner.id)
+    }
+
+    pub(crate) fn id(&self) -> HandleId {
+        self.inner.id
     }
 
     /// The table's rows as `run` sees them, or its current rows outside a
@@ -130,7 +168,11 @@ impl fmt::Debug for TableHandle {
 
 /// `batches`, each with `schema`, or an error if one's schema isn't
 /// contained in it.
-fn stamped(name: &str, schema: &SchemaRef, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+pub(crate) fn stamped(
+    name: &str,
+    schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>> {
     batches
         .into_iter()
         .map(|batch| {

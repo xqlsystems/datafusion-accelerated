@@ -692,6 +692,31 @@ Rules:
   reads, and a statement named after a state table computes that table's
   next value. Outputs name a statement or a label (§5.5). In Rust,
   `Program::from_steps(&ctx, [("grads", GRADS_SQL), ("w", UPDATE_SQL)])`.
+- **A step's meaning is functional** (D21). Every step is a `SELECT`. A
+  state table read anywhere in the program means its value when the run
+  began, and the step named after it computes its next value, as a loop's
+  carry does in JAX. No step sees another's result unless it reads it, so
+  no step can read the step named after a state table: a value computed
+  from the next state is the next run's to compute. The reference for the
+  cross-engine check (R1) is the steps' `SELECT`s run on plain tables in
+  the order their reads give, then assigned.
+- **A program's names are its own, and never hide the session's.** Steps
+  are planned against the session's catalog with the program's inputs,
+  state tables, parameters and earlier steps in front of it. `lower`
+  refuses two of the program's names that are the same, and a step or an
+  input named like a session table, naming both. A state table is
+  registered in the session when `lower` succeeds, so SQL reads it between
+  runs; its name must be free.
+- **State is published all at once, and a conflict is an error** (D21, R5,
+  R10). A run's snapshot is a map from tables to versions, shown as
+  `w@4, x@1`. Each version pairs the table's identity, a UUID given when it
+  is created, with a counter that goes up by one with each replace or
+  publish. When every step has succeeded, the run publishes every state
+  table's next value under one lock, if each is still at the version the
+  run read. If another caller replaced one meanwhile, nothing is published
+  and the run fails with `Error::Conflict`, unless it was run with
+  `OnConflict::Overwrite`, which publishes and records what it
+  overwrote. A failed step publishes nothing.
 - **Programs compose.** A program may also be ddx's program followed by
   update steps that read its gradient tables, written as statements by
   name. The runtime takes both as one program.
@@ -1935,7 +1960,17 @@ are the first work for the GPU half days, since they wait on no decision.
   users expect). A run reads one snapshot of the runtime's tables, even
   when another thread replaces one during it (§5.2). Amended the same day
   after the adversarial review of #40: a run is explicit, and identified
-  by the `accelerated.run` setting, not by its `TaskContext`.
+  by the `accelerated.run` setting, not by its `TaskContext`. Amended on
+  2026-11-15: a snapshot is a map from tables to versions, and each version
+  carries its table's identity (§5.4).
+- **D21** (Alex, 2026-11-15, after the adversarial reviews of #40). A
+  program's step is a named `SELECT` with functional meaning: a state
+  table means its value when the run began, and order comes from reads.
+  This supersedes the amendment, agreed and then reversed the same day,
+  that a step could also be `INSERT OVERWRITE`, which neither DataFusion's
+  `MemTable` nor DuckDB runs (S3.3). Publishing is a compare-and-set on
+  versions: a state table replaced during a run is `Error::Conflict`,
+  unless the run overrides it with `OnConflict::Overwrite` (§5.4).
 
 ### Proposed
 

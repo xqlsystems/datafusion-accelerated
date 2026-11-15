@@ -8,12 +8,14 @@ use std::fmt;
 use std::sync::Arc;
 
 use datafusion::common::Result;
+use datafusion::execution::session_state::SessionState;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::StreamExt;
 
 use crate::table_store::TableStore;
+use crate::{AcceleratedConfig, Error, Snapshot};
 
 /// A run: the executions of plans that read one snapshot of the runtime's
 /// tables, whatever is replaced meanwhile (D20).
@@ -43,11 +45,38 @@ impl Drop for Pin {
 }
 
 impl Run {
-    pub(crate) fn new(id: u64, task: Arc<TaskContext>, store: Arc<TableStore>) -> Self {
-        Self {
-            pin: Arc::new(Pin { id, store }),
-            task,
-        }
+    /// Begins a run of plans planned with `state`, over the tables of
+    /// `store`.
+    pub(crate) fn begin(mut state: SessionState, store: Arc<TableStore>) -> Result<Self> {
+        let id = store.begin_run();
+        // The pin first, so that a failure below still ends the run.
+        let pin = Arc::new(Pin { id, store });
+        state
+            .config_mut()
+            .options_mut()
+            .extensions
+            .get_mut::<AcceleratedConfig>()
+            .ok_or(Error::NotAttached)?
+            .run = id;
+        let task = Arc::new(TaskContext::from(&state));
+        Ok(Self { pin, task })
+    }
+
+    /// The versions of the session's tables that the run reads.
+    ///
+    /// # Panics
+    ///
+    /// Never: the run holds its pin until it is dropped.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        self.pin
+            .store
+            .snapshot(self.pin.id)
+            .expect("a live run has a snapshot")
+    }
+
+    pub(crate) fn store(&self) -> &Arc<TableStore> {
+        &self.pin.store
     }
 
     /// The run's id, as the `accelerated.run` setting holds it.

@@ -46,6 +46,45 @@ pub enum Error {
         /// The run's id.
         run: u64,
     },
+    /// Two of a program's names, or one of them and a session table's, are
+    /// the same.
+    NameClash {
+        /// The name, as SQL writes it.
+        name: String,
+        /// What the first one names, such as "step" or "session table".
+        first: &'static str,
+        /// What the second one names.
+        second: &'static str,
+    },
+    /// A program's steps read each other in a cycle.
+    Cycle {
+        /// The steps in the cycle, or that depend on it.
+        steps: Vec<String>,
+    },
+    /// A name that a program doesn't declare, such as an input or an
+    /// output.
+    UnknownName {
+        /// The name.
+        name: String,
+        /// What it should have named: "input", "parameter", "output" or
+        /// "state table".
+        kind: &'static str,
+    },
+    /// A run of a program wasn't given one of its inputs.
+    MissingInput {
+        /// The input's name.
+        name: String,
+    },
+    /// A state table was replaced by another caller during a run, so the
+    /// run published nothing (design §5.4).
+    Conflict {
+        /// The state table's name.
+        table: String,
+        /// The version the run read.
+        expected: u64,
+        /// The version it found when it published.
+        found: u64,
+    },
     /// A plan ran with the id of a run that has ended, or that belongs to
     /// another session or process (D20).
     RunEnded {
@@ -94,6 +133,33 @@ impl fmt::Display for Error {
                 f,
                 "the table {table} was created after run {run} began, so it isn't in the \
                  run's snapshot"
+            ),
+            Error::NameClash {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "the program's {first} and {second} are both named {name}"
+            ),
+            Error::Cycle { steps } => write!(
+                f,
+                "the program's steps read each other in a cycle: {}",
+                steps.join(", ")
+            ),
+            Error::UnknownName { name, kind } => {
+                write!(f, "the program has no {kind} named {name}")
+            }
+            Error::MissingInput { name } => write!(f, "the run wasn't given the input {name}"),
+            Error::Conflict {
+                table,
+                expected,
+                found,
+            } => write!(
+                f,
+                "the state table {table} was replaced during the run (version {expected} was \
+                 read, {found} was found), so nothing was published; \
+                 RunArgs::on_conflict(OnConflict::Overwrite) publishes anyway"
             ),
             Error::RunEnded { run } => write!(
                 f,

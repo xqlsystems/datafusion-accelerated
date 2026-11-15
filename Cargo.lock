@@ -713,6 +713,7 @@ dependencies = [
  "datafusion-ffi",
  "futures",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
