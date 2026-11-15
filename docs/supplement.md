@@ -1476,12 +1476,18 @@ switch, there are no in-switch reductions; rings and trees do instead.
    ([#21](https://github.com/xqlsystems/datafusion-accelerated/issues/21)).
 3. **Tiers were named by Arrow device types**, and a TPU has none. They are
    now named by device family, and a TPU's tables cross into DataFusion only
-   through the host. In code, a tier keeps Arrow's open integer device
-   type and device id, with negative codes left to integrations, so a TPU's
-   integration names its family in its own crate. A closed enum of families
-   would have needed a core release naming each vendor (R13), as the second
-   adversarial review of #40 pointed out
+   through the host. In code, a tier carries a device type and a device
+   id, as Arrow's `ArrowDeviceArray` does, and the device type is open, so a
+   TPU's integration names its family in its own crate. A closed enum of
+   families would have needed a core release naming each vendor (R13), as
+   the second adversarial review of #40 pointed out
    ([comment](https://github.com/xqlsystems/datafusion-accelerated/pull/40#issuecomment-6900007496)).
+   A first version left negative codes to integrations. The third round
+   ([comment](https://github.com/xqlsystems/datafusion-accelerated/pull/40#issuecomment-6901455576))
+   showed that two integrations could pick the same one, and that no
+   `ArrowDeviceArray` consumer could read it: Arrow's codes follow
+   DLPack's, and Arrow reserves only `ARROW_DEVICE_EXT_DEV` for devices it
+   doesn't list. So a family Arrow doesn't list is named, by its crate.
 4. **The topology was a list of tiers.** It is now a graph, covering
    switched domains, full meshes and tori, taken from each platform's own
    discovery, with placement as an embedding of the partition grid into it

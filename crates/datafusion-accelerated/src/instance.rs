@@ -7,8 +7,8 @@
 /// A memory tier (design §5.2).
 ///
 /// Tiers follow the Arrow C Device Data Interface, whose `ArrowDeviceArray`
-/// names memory by an open integer device type and a device id. So a
-/// device integration, in a crate of its own (§5.8), names its devices
+/// names memory by a device type and a device id. A device type is open,
+/// so a device integration, in a crate of its own (§5.8), names its devices
 /// without a change to the core. M0 keeps its tables in host memory only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -27,42 +27,49 @@ pub enum Tier {
     Storage,
 }
 
-/// A device family, as an Arrow C Device Data Interface `ArrowDeviceType`
-/// code.
+/// A device family: an Arrow C Device Data Interface `ArrowDeviceType`
+/// code where Arrow has one, and a name the device's integration defines
+/// where it doesn't, as for a TPU (design §5.2).
 ///
-/// A family Arrow doesn't list, such as a TPU, takes a negative code that
-/// its integration crate defines. Arrow's codes are positive, so the two
-/// never collide.
+/// A name is namespaced by the integration's crate, such as `"pjrt.tpu"`,
+/// so that two integrations can't choose the same one by accident. Arrow's
+/// codes follow DLPack's, and Arrow reserves only `ARROW_DEVICE_EXT_DEV`
+/// (12) for devices it doesn't list, with meanings that differ by
+/// implementation. So a named family can't be exported in an
+/// `ArrowDeviceArray` as itself: an export must map it to `EXT_DEV` or
+/// refuse, explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DeviceType(i32);
+#[non_exhaustive]
+pub enum DeviceType {
+    /// An `ArrowDeviceType` code.
+    Arrow(i32),
+    /// A family Arrow doesn't list, named by its integration.
+    Named(&'static str),
+}
 
 impl DeviceType {
     /// `ARROW_DEVICE_CUDA`.
-    pub const CUDA: Self = Self(2);
+    pub const CUDA: Self = Self::Arrow(2);
     /// `ARROW_DEVICE_CUDA_HOST`, host memory pinned for CUDA.
-    pub const CUDA_HOST: Self = Self(3);
-    /// `ARROW_DEVICE_CUDA_MANAGED`.
-    pub const CUDA_MANAGED: Self = Self(13);
+    pub const CUDA_HOST: Self = Self::Arrow(3);
     /// `ARROW_DEVICE_METAL`.
-    pub const METAL: Self = Self(8);
+    pub const METAL: Self = Self::Arrow(8);
     /// `ARROW_DEVICE_ROCM`.
-    pub const ROCM: Self = Self(10);
+    pub const ROCM: Self = Self::Arrow(10);
     /// `ARROW_DEVICE_ROCM_HOST`, host memory pinned for ROCm.
-    pub const ROCM_HOST: Self = Self(11);
+    pub const ROCM_HOST: Self = Self::Arrow(11);
+    /// `ARROW_DEVICE_CUDA_MANAGED`.
+    pub const CUDA_MANAGED: Self = Self::Arrow(13);
     /// `ARROW_DEVICE_ONEAPI`.
-    pub const ONEAPI: Self = Self(14);
+    pub const ONEAPI: Self = Self::Arrow(14);
 
-    /// The family with Arrow's code `code`, or an integration's negative
-    /// one.
+    /// The family's `ArrowDeviceType` code, if Arrow has one.
     #[must_use]
-    pub const fn new(code: i32) -> Self {
-        Self(code)
-    }
-
-    /// The family's code.
-    #[must_use]
-    pub const fn code(self) -> i32 {
-        self.0
+    pub const fn arrow_code(self) -> Option<i32> {
+        match self {
+            Self::Arrow(code) => Some(code),
+            Self::Named(_) => None,
+        }
     }
 }
 

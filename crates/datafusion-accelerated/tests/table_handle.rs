@@ -462,11 +462,21 @@ fn a_device_tier_carries_arrows_device_type_and_id() {
         },
         "two GPUs of one family are two tiers"
     );
-    assert_eq!(DeviceType::CUDA.code(), 2, "Arrow's ARROW_DEVICE_CUDA");
     assert_eq!(
-        DeviceType::new(-1).code(),
-        -1,
-        "an integration names a family Arrow doesn't list"
+        DeviceType::CUDA.arrow_code(),
+        Some(2),
+        "Arrow's ARROW_DEVICE_CUDA"
+    );
+    let tpu = DeviceType::Named("pjrt.tpu");
+    assert_eq!(
+        tpu.arrow_code(),
+        None,
+        "a family Arrow doesn't list has no Arrow code to export"
+    );
+    assert_ne!(
+        tpu,
+        DeviceType::Named("other.tpu"),
+        "integrations' names, namespaced by crate, don't collide"
     );
 }
 

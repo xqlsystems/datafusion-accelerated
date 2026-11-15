@@ -508,11 +508,12 @@ two tiers: host memory, through its `MemoryPool`, and disk, through its
 by Arrow's device type where one exists (§2.1), by a name the device
 integration defines where none does, and `storage` for files. A device
 tier also carries its device's id, as the Arrow C Device Data Interface's
-`ArrowDeviceArray` does. The device type is an open integer, as Arrow's
-is, so an integration in its own crate (§5.8) names its devices without a
-change to the core (R13): Arrow's codes are positive, and a family Arrow
-doesn't list, such as a TPU, takes a negative code its integration
-defines
+`ArrowDeviceArray` does. The device type is open, so an integration in
+its own crate (§5.8) names its devices without a change to the core
+(R13): it is Arrow's code where Arrow has one, and otherwise a name
+namespaced by the integration's crate, such as `pjrt.tpu`. A named family
+has no Arrow code, so exporting it in an `ArrowDeviceArray` maps it to
+`ARROW_DEVICE_EXT_DEV` or refuses, explicitly
 ([#20](https://github.com/xqlsystems/datafusion-accelerated/issues/20)).
 
 | Tier | Device type | Accounting |
