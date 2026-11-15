@@ -22,3 +22,4 @@ datafusion.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+datafusion-ffi = "=55.2.0"
