@@ -34,11 +34,12 @@
 //!
 //! The design is in `docs/design.md`, in this crate's repository.
 
-#![forbid(unsafe_code)]
-#![warn(missing_docs)]
+mod accelerated_config;
+mod accelerator;
+mod accelerator_options;
+mod session_state_builder_ext;
 
-mod config;
-mod session;
-
-pub use config::AcceleratedConfig;
-pub use session::{Accelerator, AcceleratorOptions, SessionStateBuilderExt};
+pub use accelerated_config::AcceleratedConfig;
+pub use accelerator::Accelerator;
+pub use accelerator_options::AcceleratorOptions;
+pub use session_state_builder_ext::SessionStateBuilderExt;

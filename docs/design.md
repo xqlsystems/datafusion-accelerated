@@ -812,23 +812,36 @@ pub trait Kernel: Send + Sync {
 ```rust
 #[cutile::module]
 mod kernels {
-    use cutile::core::*;
+    use cutile::core::Tensor;
+
     #[cutile::entry()]
     fn scale<const B: i32>(out: &mut Tensor<f32, { [B] }>, x: &Tensor<f32, { [-1] }>, a: f32) {
-        let tx = x.load_like(out);
-        out.store(tx * a);
+        let tile = x.load_like(out);
+        out.store(tile * a);
     }
 }
 
 struct Scale;
+
 #[async_trait]
 impl Kernel for Scale {
-    async fn prepare(&self, sig: &Signature) -> Result<()> {
-        // cuTile's .compile() on placeholder tensors of sig's shapes
+    async fn prepare(&self, signature: &Signature) -> Result<()> {
+        // cuTile's .compile() on placeholder tensors of the signature's shapes
     }
+
     async fn launch(&self, args: KernelArgs<'_>) -> Result<()> {
         // The glue: borrow the runtime's stream and buffers. cuTile keeps each owner alive.
-        let stream = unsafe { Stream::borrow_with_owner(args.stream().raw(), &args.context().borrow(), args.stream().owner()) };
+        // SAFETY: the stream and its context belong to the runtime, which keeps them
+        // alive until the launch's work completes; `owner()` ties their lifetime to it.
+        let stream = unsafe {
+            Stream::borrow_with_owner(
+                args.stream().raw(),
+                &args.context().borrow(),
+                args.stream().owner(),
+            )
+        };
+        // SAFETY: the runtime allocated these buffers for this launch, with the shapes
+        // `prepare` saw, and no other launch writes them until this one completes.
         let x = unsafe { Tensor::<f32>::from_foreign(Borrowed::new(args.input("x")?), ..) };
         let mut out = unsafe { Tensor::<f32>::from_foreign(Borrowed::new(args.output()?), ..) };
         kernels::scale((&mut out).partition([128]), &x, 2.0).sync_on(&stream)?;
@@ -1265,7 +1278,7 @@ let lowered = Program::new(&ctx, STEP).state("w", w0).output("loss").lower().awa
 println!("{}", lowered.explain());
 let compiled = lowered.compile().await?;
 for i in 0..1_000 {
-    compiled.run(params! { "lr" => 1e-2 * 0.999f64.powi(i) }).await?;
+    compiled.run(Params::new().param("lr", 1e-2 * 0.999f64.powi(i))).await?;
 }
 ```
 
@@ -1600,6 +1613,13 @@ Rules:
   `xarray-sql[accelerated]`.
 - **Linux on ARM wheels from the first release**, for the Beta cluster's
   Grace CPUs.
+- **Rust follows [Google's Rust style guide](https://google.github.io/styleguide/rustguide.html)**
+  (D19), as ddx's does. `rustfmt.toml` holds its formatting settings, and
+  the workspace's lints the rules clippy can check, such as no `unwrap`
+  outside tests, `#[must_use]` builders, no glob imports and
+  `#[non_exhaustive]` public enums. Review checks the rest, such as each
+  file named after its main item, and a `SAFETY:` comment on every
+  `unsafe` block, the design's samples included.
 
 ### 12.2 Milestones
 
@@ -1853,6 +1873,8 @@ are the first work for the GPU half days, since they wait on no decision.
   Python side can run compiled plans without a fork. If it needs
   `ExecutionPlan.reset_state`, Alex proposes it to datafusion-python.
   Spike 4a found it doesn't (§12.3).
+- **D19** (Alex, 2026-11-14). The runtime's Rust follows Google's Rust
+  style guide, as ddx's does (§12.1).
 
 ### Proposed
 

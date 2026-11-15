@@ -15,12 +15,21 @@ You need Rust 1.94 or newer, with clippy and rustfmt, and
 [uv](https://docs.astral.sh/uv/) for Python. On Nix or NixOS,
 `nix develop` (or `direnv allow`) gives a shell with all of them.
 
+## Style
+
+Rust follows the [Google Rust style guide](https://google.github.io/styleguide/rustguide.html).
+`rustfmt.toml` holds its formatting settings, which need a nightly
+rustfmt (`cargo +nightly fmt`; in the Nix shell, plain `cargo fmt` has
+them). The workspace's lints in `Cargo.toml` hold the rules clippy can
+check. The rest, such as naming each file after its main item and
+explaining each assertion, are for review.
+
 ## Checks
 
 CI runs these, and a pull request must pass them:
 
 ```sh
-cargo fmt --all --check
+cargo +nightly fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 uvx --from 'reuse[charset-normalizer]' reuse lint

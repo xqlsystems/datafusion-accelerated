@@ -41,16 +41,24 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # rustfmt.toml's settings need a nightly rustfmt, pinned so that a
+      # nightly change doesn't fail a PR. It's installed first, so the
+      # matrix's toolchain, installed next, is the default.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        if: matrix.rust == 'stable'
+        with:
+          toolchain: nightly-2026-10-10
+          components: rustfmt
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: ${{ matrix.rust }}
-          components: rustfmt, clippy
+          components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.rust }}
       - name: rustfmt
         if: matrix.rust == 'stable'
-        run: cargo fmt --all --check
+        run: cargo +nightly-2026-10-10 fmt --all --check
       - name: clippy
         if: matrix.rust == 'stable'
         run: cargo clippy --workspace --all-targets -- -D warnings

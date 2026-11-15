@@ -111,6 +111,10 @@ docs, docstrings, issues, PR descriptions).
   `RuntimeEnv`, physical rules, `ExecutionPlan` nodes, metrics and codecs.
   Attach through the builder in Rust and `with_extensions` in Python, never
   through an installer or a subclass of `SessionContext`.
+- **Rust follows [Google's Rust style guide](https://google.github.io/styleguide/rustguide.html)**
+  (decision D19), as ddx's does. Format with a nightly rustfmt
+  (`cargo +nightly fmt`), since `rustfmt.toml`'s settings need one, and
+  keep the workspace's lints passing. CONTRIBUTING.md has the details.
 - **Rust and Python** (principle R12). Build every capability in Rust and
   bind it to Python. A Rust program must never need Python.
 - **The core delegates to hardware** (principle R13). The core depends on

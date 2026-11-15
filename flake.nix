@@ -25,7 +25,9 @@
             cargo
             rustc
             clippy
-            rustfmt
+            # rustfmt.toml's Google style settings are nightly-only; this is
+            # the same rustfmt with them enabled.
+            (rustfmt.override { asNightly = true; })
             rust-analyzer
             # Python: uv manages the virtual environments, and maturin builds
             # the Python package's Rust extension.

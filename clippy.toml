@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Tests may unwrap: a panic is how a test fails (Google Rust style guide,
+# "Reporting errors").
+allow-unwrap-in-tests = true

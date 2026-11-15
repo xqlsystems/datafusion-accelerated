@@ -13,6 +13,9 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 datafusion.workspace = true
 

@@ -16,6 +16,10 @@ async fn a_session_runs_a_query() -> datafusion::error::Result<()> {
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("an Int64 column");
-    assert_eq!((two.len(), two.value(0)), (1, 2));
+    assert_eq!(
+        (two.len(), two.value(0)),
+        (1, 2),
+        "SELECT 1 + 1 should give one row, 2"
+    );
     Ok(())
 }

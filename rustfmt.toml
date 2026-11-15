@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Settings from the Google Rust style guide
+# (https://google.github.io/styleguide/rustguide.html#use-the-appropriate-formatting-tool),
+# as in ddx. The three below need a nightly rustfmt: CI checks with a
+# pinned one, and the Nix shell provides one. `max_width = 100` is
+# rustfmt's default.
+
+# One `use` per module: no `::` inside braces.
+imports_granularity = "Module"
+hex_literal_case = "Lower"
+format_macro_matchers = true

@@ -29,3 +29,19 @@ datafusion = "=55.2.0"
 datafusion-ffi = "=55.2.0"
 datafusion-proto = "=55.2.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# The Google Rust style guide's rules that clippy and rustc can check
+# (https://google.github.io/styleguide/rustguide.html), for every crate.
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+needless_pass_by_value = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"
+return_self_not_must_use = "warn"
+wildcard_imports = "warn"
+# Public enums are #[non_exhaustive], so adding a variant isn't a breaking change.
+exhaustive_enums = "warn"
