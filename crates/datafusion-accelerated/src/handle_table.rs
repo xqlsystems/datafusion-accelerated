@@ -15,8 +15,10 @@ use datafusion::common::stats::Precision;
 use datafusion::common::{Result, Statistics};
 use datafusion::datasource::TableType;
 use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
 
+use crate::Error;
 use crate::handle_scan_exec::HandleScanExec;
 use crate::table_handle::TableHandle;
 
@@ -34,6 +36,14 @@ impl HandleTable {
     pub(crate) fn handle(&self) -> &TableHandle {
         &self.handle
     }
+
+    fn sql_write(&self, statement: &'static str) -> Result<Arc<dyn ExecutionPlan>> {
+        Err(Error::SqlWrite {
+            table: self.handle.name().to_string(),
+            statement,
+        }
+        .into())
+    }
 }
 
 #[async_trait]
@@ -46,7 +56,14 @@ impl TableProvider for HandleTable {
         TableType::Base
     }
 
+    // A program's own table, such as an input, is empty when its steps are
+    // planned, and its rows at a run's time could be of any size. Saying
+    // zero would put it on the build side of every join, so its statistics
+    // are unknown, here and in its scan.
     fn statistics(&self) -> Option<Statistics> {
+        if self.handle.is_private() {
+            return Some(Statistics::new_unknown(&self.handle.schema()));
+        }
         Some(statistics(&self.handle.read(), &self.handle.schema()))
     }
 
@@ -59,6 +76,36 @@ impl TableProvider for HandleTable {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let scan = HandleScanExec::try_new(self.handle.clone(), projection.cloned())?;
         Ok(Arc::new(scan))
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        _input: Arc<dyn ExecutionPlan>,
+        _insert_op: InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.sql_write("INSERT")
+    }
+
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        _filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.sql_write("DELETE")
+    }
+
+    async fn update(
+        &self,
+        _state: &dyn Session,
+        _assignments: Vec<(String, Expr)>,
+        _filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.sql_write("UPDATE")
+    }
+
+    async fn truncate(&self, _state: &dyn Session) -> Result<Arc<dyn ExecutionPlan>> {
+        self.sql_write("TRUNCATE")
     }
 }
 

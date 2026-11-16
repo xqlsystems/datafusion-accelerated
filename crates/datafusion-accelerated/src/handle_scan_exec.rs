@@ -119,6 +119,9 @@ impl ExecutionPlan for HandleScanExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        if self.handle.is_private() {
+            return Ok(Arc::new(Statistics::new_unknown(&self.schema)));
+        }
         let rows = self.project(&self.handle.read())?;
         Ok(Arc::new(handle_table::statistics(&rows, &self.schema)))
     }

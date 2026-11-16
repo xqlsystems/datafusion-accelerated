@@ -528,7 +528,7 @@ async fn versions_case(seed: u64, verbose: bool) -> Outcome {
     } else {
         vec!["w"]
     };
-    // A session table no program writes, which every snapshot lists.
+    // A session table the program doesn't read, which no snapshot lists.
     let other = Accelerator::create_table(&ctx, "other", schema(), constant(1, 0))
         .map_err(|e| e.to_string())?;
     let mut model: BTreeMap<String, ModelTable> = BTreeMap::new();
@@ -691,11 +691,11 @@ async fn versions_case(seed: u64, verbose: bool) -> Outcome {
                                 format!("overwritten {got_over:?}, expected {overwritten:?}"),
                             ));
                         }
-                        // The snapshot is the versions at the start, of the
-                        // session's tables, and nothing private.
+                        // The snapshot is the versions at the start of the
+                        // tables the program reads: its state tables, not
+                        // `other`, and nothing private.
                         let mut want_snapshot: Vec<(String, u64)> =
                             begin.iter().map(|(n, t)| (n.clone(), t.version)).collect();
-                        want_snapshot.push(("other".into(), other.version().number()));
                         want_snapshot.sort();
                         let got_snapshot: Vec<(String, u64)> = outputs
                             .snapshot()

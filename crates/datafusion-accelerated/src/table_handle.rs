@@ -5,14 +5,18 @@
 //! A table the runtime owns (design §5.2).
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::Result;
+use datafusion::catalog::CatalogProviderList;
+use datafusion::common::{Result, TableReference, plan_err};
+use datafusion::execution::session_state::SessionState;
+use futures::FutureExt;
 
 use uuid::Uuid;
 
+use crate::handle_table::HandleTable;
 use crate::instance::{Instance, Layout, Owner, Tier};
 use crate::table_store::{HandleId, TableInfo, TableStore};
 use crate::{Error, TableVersion};
@@ -26,7 +30,8 @@ use crate::{Error, TableVersion};
 /// Cloning a handle shares it. The table's rows live while anything holds
 /// it: the session's catalog, a plan that scans it, or a handle. So
 /// `DROP TABLE` or `deregister_table` frees them once no plan or handle
-/// holds the table.
+/// holds the table. A handle can't be replaced after that
+/// (`Error::Detached`).
 #[derive(Clone)]
 pub struct TableHandle {
     inner: Arc<HandleInner>,
@@ -36,8 +41,20 @@ struct HandleInner {
     id: HandleId,
     name: String,
     schema: SchemaRef,
+    private: bool,
+    // Where the session's catalog has the table, once it's registered.
+    home: OnceLock<Home>,
     // Shared with the session's runtime and with every handle it owns.
     store: Arc<TableStore>,
+}
+
+/// Where a session's catalog has a table. The catalog is held weakly, so a
+/// handle doesn't keep its session's tables alive.
+struct Home {
+    catalogs: Weak<dyn CatalogProviderList>,
+    catalog: String,
+    schema: String,
+    table: String,
 }
 
 impl Drop for HandleInner {
@@ -86,6 +103,8 @@ impl TableHandle {
                 id,
                 name,
                 schema,
+                private,
+                home: OnceLock::new(),
                 store,
             }),
         })
@@ -119,9 +138,13 @@ impl TableHandle {
     /// Replaces the table's rows, as its next version. Runs that already
     /// began keep the rows they pinned (D20).
     ///
-    /// Fails if a batch's schema isn't contained in the table's. The batches
-    /// are stored with the table's schema, so reads give it back.
+    /// Fails if a batch's schema isn't contained in the table's, or with
+    /// `Error::Detached` if the session no longer has this table under its
+    /// name: after `DROP TABLE`, `CREATE OR REPLACE TABLE`, or when the
+    /// session is gone. The batches are stored with the table's schema, so
+    /// reads give it back.
     pub fn replace(&self, batches: Vec<RecordBatch>) -> Result<()> {
+        self.check_attached()?;
         let batches = stamped(&self.inner.name, &self.inner.schema, batches)?;
         self.inner.store.replace(self.inner.id, batches);
         Ok(())
@@ -136,6 +159,66 @@ impl TableHandle {
 
     pub(crate) fn id(&self) -> HandleId {
         self.inner.id
+    }
+
+    /// Records where `state`'s catalog has the table, once it's registered
+    /// under `reference`.
+    pub(crate) fn set_home(&self, state: &SessionState, reference: TableReference) {
+        let options = &state.config().options().catalog;
+        let resolved = reference.resolve(&options.default_catalog, &options.default_schema);
+        let _ = self.inner.home.set(Home {
+            catalogs: Arc::downgrade(state.catalog_list()),
+            catalog: resolved.catalog.to_string(),
+            schema: resolved.schema.to_string(),
+            table: resolved.table.to_string(),
+        });
+    }
+
+    /// Fails with `Error::Detached` if the table was registered and the
+    /// session no longer has it under its name. DataFusion tells a table
+    /// nothing when it's dropped, so this asks the catalog.
+    fn check_attached(&self) -> Result<()> {
+        let Some(home) = self.inner.home.get() else {
+            return Ok(());
+        };
+        let schema = home
+            .catalogs
+            .upgrade()
+            .and_then(|catalogs| catalogs.catalog(&home.catalog))
+            .and_then(|catalog| catalog.schema(&home.schema));
+        let attached = match schema {
+            None => false,
+            // A catalog in memory, as a session's is by default, answers at
+            // once. One that would wait can't be asked here, so this fails
+            // closed.
+            Some(schema) => match schema.table(&home.table).now_or_never() {
+                Some(provider) => provider?.is_some_and(|provider| {
+                    provider
+                        .downcast_ref::<HandleTable>()
+                        .is_some_and(|table| table.handle().id() == self.inner.id)
+                }),
+                None => {
+                    return plan_err!(
+                        "the session's catalog didn't answer at once, so replace can't check \
+                         that {} is still the session's table",
+                        self.inner.name
+                    );
+                }
+            },
+        };
+        if attached {
+            Ok(())
+        } else {
+            Err(Error::Detached {
+                table: self.inner.name.clone(),
+            }
+            .into())
+        }
+    }
+
+    /// Whether the table is a program's own, such as an input.
+    pub(crate) fn is_private(&self) -> bool {
+        self.inner.private
     }
 
     /// The table's rows as `run` sees them, or its current rows outside a

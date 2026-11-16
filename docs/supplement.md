@@ -564,6 +564,34 @@ UUID, as Iceberg pairs a table's UUID with its snapshot ids, so that a
 table dropped and created again under the same name never repeats a
 version.
 
+The review of `Program` at `56be21c`
+([comment](https://github.com/xqlsystems/datafusion-accelerated/pull/40#issuecomment-6903589670))
+found that the limit `56be21c` documented, a compiled program not
+noticing a table registered again, gave a silent wrong answer: after
+`lookup` was registered again with `v = 2`, SQL read 2 and the program 1,
+and after `DROP TABLE lookup` the program still read 1. A plan holds the
+provider it was planned with, so nothing in DataFusion fails. The rule
+since is to fail where an answer could be silently wrong, not to document
+it: each run checks the names it reads against the session's catalog, at
+one lookup per table per run. The same review placed the conflict check
+as snapshot isolation, Delta Lake's default `WriteSerializable` level
+([Delta isolation levels](https://docs.databricks.com/en/optimizations/isolation-level.html)),
+and showed that a snapshot of every runtime table changed when an
+unrelated table was replaced, so a cache keyed on it would miss; a run's
+snapshot now lists only what the program reads.
+
+A parameter is rewritten into a scalar subquery of the parameters' table
+(S3.2), which isn't a literal everywhere. The same review tried 10
+positions against the same SQL with a literal: `VALUES (0, $k)` planned
+and then failed on every run with DataFusion 55.2.0's internal error
+`ScalarSubqueryExpr evaluated before the subquery was executed`, which
+plain DataFusion gives for `VALUES (0, (SELECT 1))` too (#48); `LIMIT`,
+`OFFSET` and `generate_series(0, $k)` failed to plan; `IN`, `JOIN ... ON`,
+`CASE`, `HAVING` and `FILTER` gave the literal's rows. So `lower` refuses
+the positions planning needs. Rewriting DataFusion's `Expr::Placeholder`
+in a `LogicalPlan`, once steps can be plans (#49), would serve every
+frontend with one rewrite.
+
 ### S3.4 Step boundaries and shared subplans
 
 ddx already draws its programs' step boundaries, for four reasons (S1.4).

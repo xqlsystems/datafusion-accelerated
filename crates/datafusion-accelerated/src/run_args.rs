@@ -36,15 +36,21 @@ impl RunArgs {
         Self::default()
     }
 
-    /// The rows of the input `name` for this run.
+    /// The rows of the input `name` for this run. Giving one input twice
+    /// is an error.
     #[must_use]
     pub fn input(mut self, name: impl Into<String>, batches: Vec<RecordBatch>) -> Self {
         self.inputs.push((name.into(), batches));
         self
     }
 
-    /// A value of the parameter `name` for this run. Runs not given one
-    /// use the parameter's initial value.
+    /// A value of the parameter `name`, for this run only: a run not given
+    /// one uses the parameter's initial value, not the last run's. Each
+    /// run's arguments are explicit, as a function's are (design §5.4).
+    ///
+    /// The value must be of the parameter's type, or a number that casts to
+    /// it and back unchanged: 2 for a `Float64`, but not 2.9 for an `Int64`,
+    /// and not text for either. Giving one parameter twice is an error.
     #[must_use]
     pub fn param(mut self, name: impl Into<String>, value: ScalarValue) -> Self {
         self.params.push((name.into(), value));

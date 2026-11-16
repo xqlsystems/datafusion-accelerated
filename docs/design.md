@@ -537,8 +537,12 @@ Rules:
 - **A table handle** refers to a table the runtime owns, as a buffer handle
   refers to an allocation. It carries the table's schema and one or more
   *instances*. Its rows live while the session's catalog, a plan or a
-  handle holds it, so `DROP TABLE` frees them once no plan or handle does. Each
-  instance has a tier; a layout, either Arrow rows or a compact array; and
+  handle holds it, so `DROP TABLE` frees them once no plan or handle does.
+  A handle whose session no longer has it under its name, after
+  `DROP TABLE` or `CREATE OR REPLACE TABLE`, can't be replaced
+  (`Error::Detached`), and SQL's `INSERT`, `DELETE`, `UPDATE` and
+  `TRUNCATE` on it fail with `Error::SqlWrite`, which names what to use
+  instead. Each instance has a tier; a layout, either Arrow rows or a compact array; and
   an owner, either DataFusion (as one of its tables) or the runtime.
 - **Runtime tables are DataFusion table providers**, read as Arrow batches
   by DataFusion's operators, and as compact arrays by device nodes that
@@ -671,14 +675,20 @@ A program is *lowered*, then *compiled*, as a JAX function is (S6.1):
   and edited (§5.6).
 - **`compile`** fixes implementations and placements, runs the checks that
   need running only once, and returns a compiled program.
-- **`run`** runs it with new inputs and parameters. A run is asynchronous:
-  `run` returns at once with a future for its outputs. Runs of one
+- **`run`** runs it with new inputs and parameters. A run is asynchronous.
+  In Python, `run` returns at once with a future for its outputs. In
+  Rust, `run` is an `async fn`, which starts when it's first polled, so a
+  caller that wants other work done meanwhile spawns it. Runs of one
   compiled program execute in order.
 
 A compiled program is reused only while the session's *session key* is
 unchanged. ddx's `Backend` reports that key, which changes whenever the
 session's tables or settings change, and ddx's `prepare`, which plans a
-derivative once for many runs, follows the same rule.
+derivative once for many runs, follows the same rule. Until the ddx
+integration brings the key, each run checks that the session still gives
+every name the steps read, and each state table's name, the table `lower`
+found, and fails with `Error::Stale` if not, since a plan holds the table
+it was planned with and would otherwise give a wrong answer silently.
 
 Rules:
 - **A training step can be one statement.** With the ddx integration in
@@ -704,9 +714,21 @@ Rules:
   are planned against the session's catalog with the program's inputs,
   state tables, parameters and earlier steps in front of it. `lower`
   refuses two of the program's names that are the same, and a step or an
-  input named like a session table, naming both. A state table is
+  input named like a session table, naming both (`Error::NameClash`, with
+  each `NameKind`). A step read by a name qualified with the default
+  catalog or schema is still a read of that step. A new state table is
   registered in the session when `lower` succeeds, so SQL reads it between
-  runs; its name must be free.
+  runs; its name must be free. `state_from(name)` instead takes a table
+  the runtime already owns, such as one an earlier program trained, so
+  training continues after a step is edited. A new state table's schema is
+  its first batch's, or is given with `state_with_schema` when it starts
+  empty.
+- **A state step's result fits its table by names and types.** A field may
+  be nullable in the step's result and not in the table, since a
+  parameter or an outer join makes a field nullable that never holds a
+  null. Each run then checks for nulls (`Error::NullInState`). Any other
+  difference fails at `lower` (`Error::StateSchema`), naming the field.
+  Every error from planning a step names the step.
 - **State is published all at once, and a conflict is an error** (D21, R5,
   R10). A run's snapshot is a map from tables to versions, shown as
   `w@4, x@1`. Each version pairs the table's identity, a UUID given when it
@@ -716,7 +738,28 @@ Rules:
   run read. If another caller replaced one meanwhile, nothing is published
   and the run fails with `Error::Conflict`, unless it was run with
   `OnConflict::Overwrite`, which publishes and records what it
-  overwrote. A failed step publishes nothing.
+  overwrote. A failed step publishes nothing. The counter's rules:
+  - a published version is one more than the table's current version,
+    under `Overwrite` too, so two states never share a version;
+  - a conflict or a failed step adds no version;
+  - a publish adds a version even if the rows are unchanged, since a
+    version counts publishes, not contents;
+  - a run checks only the tables it writes, so two runs that write
+    different state tables don't conflict.
+- **A run has snapshot isolation, as Delta Lake's default level,
+  `WriteSerializable`, does** (D21). A run reads one snapshot and
+  publishes with a check on the tables it writes, not the tables it reads.
+  So two runs can each read a table the other writes and both publish
+  ("write skew"): a run that reads the session table `stats` and writes
+  `w` doesn't conflict when `stats` is replaced during it. "All old or all
+  new" holds for each publish, not across publishes. A level that also
+  checks reads, as Delta's `Serializable` does, waits for a user who needs
+  it.
+- **A run's snapshot lists what the program reads**: its state tables and
+  the runtime tables its steps read, by version, sorted by name and then
+  identity (`RunOutputs::snapshot`). Replacing a table the program doesn't
+  read doesn't change it, so it serves as a key for checkpoints and
+  caches.
 - **Programs compose.** A program may also be ddx's program followed by
   update steps that read its gradient tables, written as statements by
   name. The runtime takes both as one program.
@@ -728,7 +771,15 @@ Rules:
   that run (§6.3, S3.1).
 - **Parameters are written as DataFusion's placeholders**, such as `$lr`.
   Where a placeholder can't reach ddx through Substrait, the runtime turns
-  it into a one-row table that the plans cross join (S3.2).
+  it into a one-row table that the plans cross join (S3.2). A parameter
+  may go wherever a value is read per row or per query: `SELECT`,
+  `WHERE`, `JOIN ... ON`, `GROUP BY`, `HAVING`, `ORDER BY`, `CASE`, `IN`
+  and an aggregate's `FILTER`. Where planning needs its value, in
+  `VALUES`, `LIMIT`, `OFFSET`, `FETCH` or a table function's arguments,
+  `lower` fails with `Error::ParameterPosition` (#48). A run's value is
+  for that run only, and must be of the parameter's type, or a number
+  that casts to it and back unchanged (`Error::ParameterType`); a value
+  given twice is an error (`Error::GivenTwice`).
 
 ### 5.5 Labels
 
@@ -1307,14 +1358,14 @@ ctx.sql("SET accelerated.strict = true")            # declines are errors (R8)
 ctx.register_table("features", features)
 ctx.register_table("target", target)
 
-STEP = """
-WITH pred AS (SELECT x.cell, ddx_name(SUM(x.v * w.v), 'predict') AS v
-              FROM features x JOIN w ON x.k = w.k GROUP BY x.cell),
-     loss AS (SELECT AVG((p.v - y.v) * (p.v - y.v)) AS l
-              FROM pred p JOIN target y USING (cell))
-SELECT k, v - $lr * grad(loss, v) AS v FROM w
-"""
-lowered = Program(ctx, STEP, state={"w": w0}, outputs=["loss"]).lower()
+STEPS = {
+    "pred": """SELECT x.cell, ddx_name(SUM(x.v * w.v), 'predict') AS v
+               FROM features x JOIN w ON x.k = w.k GROUP BY x.cell""",
+    "loss": """SELECT AVG((p.v - y.v) * (p.v - y.v)) AS l
+               FROM pred p JOIN target y USING (cell)""",
+    "w": "SELECT k, v - $lr * grad(loss, v) AS v FROM w",
+}
+lowered = Program(ctx, STEPS, state={"w": w0}, params={"lr": 1e-2}, outputs=["loss"]).lower()
 print(lowered.explain())                            # device plans, copies, who chose what
 
 schedule = lowered.schedule()                       # read, edit (§5.6)
@@ -1340,11 +1391,20 @@ let ctx = SessionContext::new_with_state(
         .with_accelerated_cuda()
         .build(),
 );
-let lowered = Program::new(&ctx, STEP).state("w", w0).output("loss").lower().await?;
+let lowered = Program::from_steps(&ctx, STEPS)
+    .state("w", w0)
+    .param("lr", ScalarValue::from(1e-2))
+    .output("loss")
+    .lower()
+    .await?;
 println!("{}", lowered.explain());
-let compiled = lowered.compile().await?;
+let compiled = lowered.compile()?;
 for i in 0..1_000 {
-    compiled.run(Params::new().param("lr", 1e-2 * 0.999f64.powi(i))).await?;
+    let lr = ScalarValue::from(1e-2 * 0.999f64.powi(i));
+    let outputs = compiled.run(RunArgs::new().param("lr", lr)).await?;
+    if i == 999 {
+        println!("{}", f64::try_from(outputs.scalar("loss")?)?);
+    }
 }
 ```
 
@@ -1971,6 +2031,14 @@ are the first work for the GPU half days, since they wait on no decision.
   `MemTable` nor DuckDB runs (S3.3). Publishing is a compare-and-set on
   versions: a state table replaced during a run is `Error::Conflict`,
   unless the run overrides it with `OnConflict::Overwrite` (§5.4).
+  Amended the same day, after the review of `Program`: a run has snapshot
+  isolation, Delta Lake's default `WriteSerializable` level, which Alex
+  chose as the default; the counter's rules are in §5.4; a compiled
+  program fails on a table dropped or registered again (`Error::Stale`)
+  instead of reading the old one; and a run's snapshot lists only what the
+  program reads. Steps may later be given as DataFusion `LogicalPlan`s as
+  well as SQL, which Alex accepted, to be sketched before the Python
+  binding (#49).
 
 ### Proposed
 

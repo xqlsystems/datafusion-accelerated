@@ -192,6 +192,19 @@ impl TableStore {
         ))
     }
 
+    /// The versions run `run` reads of the tables `ids`. A table created
+    /// after the run began isn't listed.
+    pub(crate) fn snapshot_of(&self, run: u64, ids: &[HandleId]) -> Result<Snapshot, Error> {
+        let state = self.lock();
+        let run_state = state.runs.get(&run).ok_or(Error::RunEnded { run })?;
+        Ok(Snapshot::new(ids.iter().filter_map(|id| {
+            run_state
+                .versions
+                .get(id)
+                .map(|stored| (stored.info.name.clone(), stored.version()))
+        })))
+    }
+
     /// Publishes `writes` as the next version of each table, all at once
     /// (R5). A table that another caller replaced after the run began is a
     /// conflict: with `OnConflict::Fail`, nothing is published.

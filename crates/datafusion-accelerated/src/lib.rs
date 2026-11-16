@@ -58,7 +58,7 @@ pub use accelerator::Accelerator;
 pub use accelerator_ext::AcceleratorExt;
 pub use accelerator_options::AcceleratorOptions;
 pub use compiled_program::CompiledProgram;
-pub use error::Error;
+pub use error::{Error, NameKind};
 pub use instance::{DeviceType, Instance, Layout, Owner, Tier};
 pub use lowered_program::LoweredProgram;
 pub use program::Program;

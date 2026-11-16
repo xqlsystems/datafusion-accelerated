@@ -16,7 +16,7 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_accelerated::{
-    Accelerator, AcceleratorExt, AcceleratorOptions, Error, OnConflict, Program, RunArgs,
+    Accelerator, AcceleratorExt, AcceleratorOptions, Error, NameKind, OnConflict, Program, RunArgs,
 };
 
 fn session() -> SessionContext {
@@ -171,8 +171,10 @@ async fn fifty_runs_match_the_loop_as_plain_sql() -> Result<()> {
             .await?;
         let (loss, next) = reference_step(&w, data(step), lr).await?;
         let got = scalar(&outputs.table("loss")?);
+        // Relative, since the loss grows large and the plans may sum in
+        // different orders.
         assert!(
-            (got - loss).abs() < 1e-9,
+            (got - loss).abs() <= 1e-12 * loss.abs().max(1.0),
             "run {step}: loss {got}, plain SQL {loss}"
         );
         let got = by_index(&outputs.table("w")?);
@@ -412,37 +414,37 @@ async fn a_replace_during_a_run_is_a_conflict_unless_overridden() -> Result<()> 
 async fn names_clash_at_lower_with_both_named() -> Result<()> {
     let ctx = session();
     ctx.register_batch("taken", weights(&[0.0]))?;
-    let cases: Vec<(Program, &str, &str, &str)> = vec![
+    let cases: Vec<(Program, &str, NameKind, NameKind)> = vec![
         (
             Program::from_steps(&ctx, [("a", "SELECT 1 AS v"), ("a", "SELECT 2 AS v")]),
             "a",
-            "step",
-            "step",
+            NameKind::Step,
+            NameKind::Step,
         ),
         (
             Program::from_steps(&ctx, [("d", "SELECT 1 AS v")]).input("d", data_schema()),
             "d",
-            "input",
-            "step",
+            NameKind::Input,
+            NameKind::Step,
         ),
         (
             Program::from_steps(&ctx, [("lr", "SELECT 1 AS v")])
                 .param("lr", ScalarValue::from(1.0)),
             "lr",
-            "parameter",
-            "step",
+            NameKind::Parameter,
+            NameKind::Step,
         ),
         (
             Program::from_steps(&ctx, [("taken", "SELECT 1 AS v")]),
             "taken",
-            "step",
-            "session table",
+            NameKind::Step,
+            NameKind::SessionTable,
         ),
         (
             Program::from_steps(&ctx, [("a", "SELECT 1 AS v")]).input("taken", data_schema()),
             "taken",
-            "input",
-            "session table",
+            NameKind::Input,
+            NameKind::SessionTable,
         ),
     ];
     for (program, name, first, second) in cases {
@@ -499,7 +501,7 @@ async fn a_cycle_and_an_unknown_name_fail_with_reasons() -> Result<()> {
         matches!(
             Error::find(&err),
             Some(Error::UnknownName {
-                kind: "parameter",
+                kind: NameKind::Parameter,
                 ..
             })
         ),
@@ -524,7 +526,10 @@ async fn a_run_needs_its_inputs() -> Result<()> {
     assert!(
         matches!(
             Error::find(&err),
-            Some(Error::UnknownName { kind: "input", .. })
+            Some(Error::UnknownName {
+                kind: NameKind::Input,
+                ..
+            })
         ),
         "{err}"
     );

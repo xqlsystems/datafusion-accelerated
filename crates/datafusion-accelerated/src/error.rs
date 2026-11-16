@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::DataFusionError;
 
 /// An error of the runtime's own. It reaches callers inside a
@@ -51,10 +51,10 @@ pub enum Error {
     NameClash {
         /// The name, as SQL writes it.
         name: String,
-        /// What the first one names, such as "step" or "session table".
-        first: &'static str,
+        /// What the first one names.
+        first: NameKind,
         /// What the second one names.
-        second: &'static str,
+        second: NameKind,
     },
     /// A program's steps read each other in a cycle.
     Cycle {
@@ -66,9 +66,8 @@ pub enum Error {
     UnknownName {
         /// The name.
         name: String,
-        /// What it should have named: "input", "parameter", "output" or
-        /// "state table".
-        kind: &'static str,
+        /// What it should have named.
+        kind: NameKind,
     },
     /// A run of a program wasn't given one of its inputs.
     MissingInput {
@@ -85,12 +84,112 @@ pub enum Error {
         /// The version it found when it published.
         found: u64,
     },
+    /// A table a compiled program reads, or one of its state tables, is no
+    /// longer the table the session gives that name, because it was dropped
+    /// or registered again after `lower`. Lower the program again.
+    Stale {
+        /// The table's name, as SQL writes it.
+        table: String,
+    },
+    /// A table handle was replaced after its session stopped having the
+    /// table under its name.
+    Detached {
+        /// The table's name, as SQL writes it.
+        table: String,
+    },
+    /// A parameter is in a place where its value is needed to plan the
+    /// step, so it can't change between runs (design §5.4).
+    ParameterPosition {
+        /// The step's name.
+        step: String,
+        /// Where the parameter is, such as `LIMIT`.
+        position: &'static str,
+    },
+    /// A run was given one input or parameter twice.
+    GivenTwice {
+        /// The name.
+        name: String,
+        /// What it names.
+        kind: NameKind,
+    },
+    /// A run gave a parameter a value that its type can't hold without
+    /// loss, or a value of another kind, such as text for a number.
+    ParameterType {
+        /// The parameter's name.
+        name: String,
+        /// The parameter's type.
+        expected: DataType,
+        /// The value's type.
+        found: DataType,
+    },
+    /// The step that computes a state table's next value gives a schema
+    /// other than the table's. A field that the step's result may leave
+    /// null where the table's can't isn't a difference: each run checks
+    /// that it has no nulls.
+    StateSchema {
+        /// The state table's name, and its step's.
+        table: String,
+        /// The table's schema.
+        expected: SchemaRef,
+        /// The step's.
+        found: SchemaRef,
+    },
+    /// A run's next value for a state table has a null in a field the
+    /// table's schema says isn't nullable.
+    NullInState {
+        /// The state table's name.
+        table: String,
+        /// The field's name.
+        field: String,
+    },
+    /// SQL tried to change a table the runtime owns, which only
+    /// `TableHandle::replace` and programs change.
+    SqlWrite {
+        /// The table's name, as SQL writes it.
+        table: String,
+        /// The statement, such as `INSERT`.
+        statement: &'static str,
+    },
     /// A plan ran with the id of a run that has ended, or that belongs to
     /// another session or process (D20).
     RunEnded {
         /// The run's id, from the `accelerated.run` setting.
         run: u64,
     },
+}
+
+/// What one of a program's names names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NameKind {
+    /// A state table.
+    StateTable,
+    /// An input.
+    Input,
+    /// A parameter.
+    Parameter,
+    /// A step.
+    Step,
+    /// An output: a step or a state table.
+    Output,
+    /// A table of the session, outside the program.
+    SessionTable,
+    /// A table of the session that the runtime owns.
+    RuntimeTable,
+}
+
+impl fmt::Display for NameKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            NameKind::StateTable => "state table",
+            NameKind::Input => "input",
+            NameKind::Parameter => "parameter",
+            NameKind::Step => "step",
+            NameKind::Output => "output",
+            NameKind::SessionTable => "session table",
+            NameKind::RuntimeTable => "runtime table",
+        })
+    }
 }
 
 impl Error {
@@ -161,12 +260,94 @@ impl fmt::Display for Error {
                  read, {found} was found), so nothing was published; \
                  RunArgs::on_conflict(OnConflict::Overwrite) publishes anyway"
             ),
+            Error::Stale { table } => write!(
+                f,
+                "the table {table} was dropped or registered again after the program was \
+                 lowered, so the program would read or publish a table the session no longer \
+                 has; lower the program again"
+            ),
+            Error::Detached { table } => write!(
+                f,
+                "the session no longer has this table under the name {table}: it was dropped, \
+                 another table took its name, or the session is gone, so replacing it would \
+                 change rows nobody reads by that name"
+            ),
+            Error::ParameterPosition { step, position } => write!(
+                f,
+                "the step {step} has a parameter in {position}, where its value is needed to \
+                 plan the step, so it couldn't change between runs; write a literal there"
+            ),
+            Error::GivenTwice { name, kind } => {
+                write!(f, "the run was given the {kind} {name} twice")
+            }
+            Error::ParameterType {
+                name,
+                expected,
+                found,
+            } => write!(
+                f,
+                "the parameter {name} is {expected}, and a {found} value can't be one without \
+                 loss"
+            ),
+            Error::StateSchema {
+                table,
+                expected,
+                found,
+            } => {
+                write!(
+                    f,
+                    "the step {table} computes the state table {table}'s next value"
+                )?;
+                match first_difference(expected, found) {
+                    Some((want, got)) => write!(f, " with {got}, where the table has {want}"),
+                    None => write!(f, " with the schema {found}, not the table's {expected}"),
+                }
+            }
+            Error::NullInState { table, field } => write!(
+                f,
+                "the next value of the state table {table} has a null in {field}, which the \
+                 table's schema says isn't nullable"
+            ),
+            Error::SqlWrite { table, statement } => write!(
+                f,
+                "{statement} can't change {table}, a table the runtime owns: replace its rows \
+                 with TableHandle::replace, or compute them in a program"
+            ),
             Error::RunEnded { run } => write!(
                 f,
                 "run {run} has ended, or belongs to another session or process"
             ),
         }
     }
+}
+
+/// The first field in which two schemas differ, each as text, or "no
+/// field" where one has fewer.
+fn first_difference(expected: &SchemaRef, found: &SchemaRef) -> Option<(String, String)> {
+    let describe = |field: Option<&datafusion::arrow::datatypes::FieldRef>| match field {
+        Some(field) => format!(
+            "the field {} of type {}{}",
+            field.name(),
+            field.data_type(),
+            if field.is_nullable() {
+                ", nullable"
+            } else {
+                ""
+            }
+        ),
+        None => String::from("no field"),
+    };
+    let count = expected.fields().len().max(found.fields().len());
+    (0..count).find_map(|i| {
+        let (want, got) = (expected.fields().get(i), found.fields().get(i));
+        let same = match (want, got) {
+            (Some(want), Some(got)) => {
+                want.name() == got.name() && want.data_type() == got.data_type()
+            }
+            _ => false,
+        };
+        (!same).then(|| (describe(want), describe(got)))
+    })
 }
 
 impl std::error::Error for Error {}

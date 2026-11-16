@@ -45,27 +45,36 @@ impl TableVersion {
 /// `w@4, x@1`, by name and counter.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
-    // Sorted by name.
+    // Sorted by name, then identity, so that two snapshots of one state are
+    // equal and print alike.
     tables: Vec<(String, TableVersion)>,
 }
 
 impl Snapshot {
     pub(crate) fn new(tables: impl IntoIterator<Item = (String, TableVersion)>) -> Self {
         let mut tables: Vec<_> = tables.into_iter().collect();
-        tables.sort_by(|a, b| a.0.cmp(&b.0));
+        tables.sort_by(|a, b| (&a.0, a.1.table).cmp(&(&b.0, b.1.table)));
         Self { tables }
     }
 
-    /// The version of the table named `name`, if the snapshot has it.
+    /// The version of the table named `name`, if the snapshot has one
+    /// table of that name.
+    ///
+    /// A run's snapshot can have two: one dropped from the session, which a
+    /// plan still reads, and the table created in its place. Then this is
+    /// `None`, and [`tables`](Snapshot::tables) lists both. A program's
+    /// snapshot never has two, since a program fails on a dropped table
+    /// (`Error::Stale`).
     #[must_use]
     pub fn version(&self, name: &str) -> Option<TableVersion> {
-        self.tables
-            .iter()
-            .find(|(table, _)| table == name)
-            .map(|(_, version)| *version)
+        let mut named = self.tables.iter().filter(|(table, _)| table == name);
+        match (named.next(), named.next()) {
+            (Some((_, version)), None) => Some(*version),
+            _ => None,
+        }
     }
 
-    /// The snapshot's tables and their versions, by name.
+    /// The snapshot's tables and their versions, by name, then identity.
     pub fn tables(&self) -> impl Iterator<Item = (&str, TableVersion)> {
         self.tables
             .iter()

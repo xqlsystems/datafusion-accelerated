@@ -79,7 +79,11 @@ impl Accelerator {
             return Err(Error::NameTaken { name }.into());
         }
         let handle = TableHandle::new(store, name, schema, batches)?;
-        ctx.register_table(reference, Arc::new(HandleTable::new(handle.clone())))?;
+        ctx.register_table(
+            reference.clone(),
+            Arc::new(HandleTable::new(handle.clone())),
+        )?;
+        handle.set_home(&ctx.state(), reference);
         Ok(handle)
     }
 
