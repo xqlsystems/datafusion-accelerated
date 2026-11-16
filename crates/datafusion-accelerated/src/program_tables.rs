@@ -34,7 +34,7 @@ impl ProgramTables {
             .insert(name, table);
     }
 
-    fn get(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+    pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         self.tables
             .read()
             .unwrap_or_else(PoisonError::into_inner)

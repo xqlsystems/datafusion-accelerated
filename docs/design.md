@@ -706,6 +706,18 @@ Rules:
   reads, and a statement named after a state table computes that table's
   next value. Outputs name a statement or a label (§5.5). In Rust,
   `Program::from_steps(&ctx, [("grads", GRADS_SQL), ("w", UPDATE_SQL)])`.
+- **A step is SQL or a DataFusion plan** (#49). DataFusion represents
+  every query as a `LogicalPlan`, whether it came from SQL, a `DataFrame`
+  or a Substrait plan read by datafusion-substrait, so a frontend that
+  builds plans hands them over as `Step::plan` or a `DataFrame`. A plan
+  reads the program's tables by name: a `TableScan` named after a step, a
+  state table or an input reads that table, so a plan can be built before
+  the program exists, with scans that hold only a schema, such as
+  DataFusion's `LogicalTableSource`. A scan's fields must be its table's
+  (`Error::ScanSchema`). A scan of another name with only a schema reads
+  the session's table of that name. A scan that holds a table the session
+  has since replaced under its name fails with `Error::Stale` at `lower`,
+  as it would on a run.
 - **A step's meaning is functional** (D21). Every step is a `SELECT`. A
   state table read anywhere in the program means its value when the run
   began, and the step named after it computes its next value, as a loop's
@@ -774,15 +786,20 @@ Rules:
   never when a frontend's fact gives the same promise.
 - **einfold's checks run on every run**, as data checks on the values of
   that run (§6.3, S3.1).
-- **Parameters are written as DataFusion's placeholders**, such as `$lr`.
-  Where a placeholder can't reach ddx through Substrait, the runtime turns
-  it into a one-row table that the plans cross join (S3.2). A parameter
+- **Parameters are written as DataFusion's placeholders**, `$lr` in SQL
+  and `placeholder("$lr")` in a plan. Where a placeholder can't reach ddx
+  through Substrait, the runtime turns it into a one-row table that the
+  plans cross join (S3.2): `lower` replaces each placeholder in a step's
+  `LogicalPlan` with a scalar subquery of that table, the one rewrite for
+  SQL and plans. A parameter
   may go wherever a value is read per row or per query: `SELECT`,
   `WHERE`, `JOIN ... ON`, `GROUP BY`, `HAVING`, `ORDER BY`, `CASE`, `IN`
   and an aggregate's `FILTER`. Where planning needs its value, `lower`
-  fails with `Error::ParameterPosition` (#48). It finds `VALUES`, `LIMIT`,
-  `OFFSET`, `FETCH` and a table function's arguments in the SQL, since
-  `VALUES` would otherwise fail on every run. Elsewhere, such as a window
+  fails with `Error::ParameterPosition` (#48). It finds a placeholder in
+  a plan's `Values` node (`VALUES`) and a `Limit`'s fetch (`LIMIT`, and
+  SQL's `FETCH`) or skip (`OFFSET`), since `VALUES` would otherwise fail
+  on every run, and in SQL, a table function's arguments, which DataFusion
+  evaluates before there is a plan. Elsewhere, such as a window
   frame's bounds or a function that needs a literal argument, a step that
   fails to plan but plans with each parameter as its initial value fails
   the same way, so no list has to be complete. A run's value is
@@ -2049,7 +2066,10 @@ are the first work for the GPU half days, since they wait on no decision.
   instead of reading the old one; and a run's snapshot lists only what the
   program reads. Steps may later be given as DataFusion `LogicalPlan`s as
   well as SQL, which Alex accepted, to be sketched before the Python
-  binding (#49).
+  binding (#49). Amended 2026-11-16, with Alex's agreement to start M0b:
+  a step is SQL or a `LogicalPlan` (`Step`), which reads the program's
+  tables by name, and parameters are rewritten in the plan (§5.4,
+  [sketch](https://github.com/xqlsystems/datafusion-accelerated/issues/49#issuecomment-6926881260)).
 
 ### Proposed
 

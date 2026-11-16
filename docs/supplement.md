@@ -476,6 +476,19 @@ new values written in place. torch-sql already reads its non-finite
 constants from such a table. ddx#264 and #265 are bugs in ddx's handling
 of one-row tables on DuckDB, not limits of the approach.
 
+Until #49, the runtime rewrote `$lr` in the SQL's syntax tree, parsing a
+subquery's text for each parameter. That served only SQL, and parsed SQL
+a second time. Since #49, `lower` rewrites DataFusion's own
+`Expr::Placeholder` in each step's `LogicalPlan`, as DataFusion's
+`LogicalPlan::with_param_values` replaces placeholders with literals:
+each expression keeps its name, and every schema above is recomputed. So
+a `DataFrame`, a plan built by hand and SQL share one rewrite. The
+existing suite at `97af10a`, including the seeded properties over random
+programs of 16 step templates, passed unchanged with SQL steps moved onto
+it. A placeholder of unknown type is typed `Null` while DataFusion plans
+SQL, and takes its parameter's type when the rewrite recomputes the
+schemas.
+
 ### S3.3 Stable names and tables kept in place
 
 ddx names every table it writes under a fresh prefix, or under a namespace
