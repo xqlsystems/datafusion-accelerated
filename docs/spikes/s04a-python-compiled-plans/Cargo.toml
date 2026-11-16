@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "s04a-python-compiled-plans"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# A spike, not part of any workspace: build it with `maturin develop --release`.
+[workspace]
+
+[lib]
+name = "s04a"
+crate-type = ["cdylib"]
+
+[dependencies]
+datafusion = "=55.2.0"
+datafusion-ffi = "=55.2.0"
+datafusion-proto = "=55.2.0"
+datafusion-python-util = "=55.0.0"
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py312"] }
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread"] }

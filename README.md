@@ -27,7 +27,10 @@ Its first user is [XQL](https://github.com/xqlsystems), whose projects
 compute on scientific arrays with databases and train models such as the
 ocean emulator Samudra in SQL.
 
-Nothing is built yet. The design is in [docs/design.md](docs/design.md),
+M0's Rust core is built: tables the runtime owns, runs that read one
+snapshot of them, and programs of SQL steps that run with no planning per
+run. It runs on the CPU, and the rest of the design isn't built yet. The
+design is in [docs/design.md](docs/design.md),
 and the evidence and reasoning behind it in
 [docs/supplement.md](docs/supplement.md).
 

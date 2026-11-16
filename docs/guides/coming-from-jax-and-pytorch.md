@@ -246,21 +246,25 @@ from datafusion_accelerated_cuda import Cuda
 ctx = SessionContext().with_extensions(Ddx(), Accelerator(), Cuda(devices="local"))
 # ... register x and y as above ...
 
-STEP = """
-WITH pred AS (SELECT x.i, SUM(x.v * w.v) AS v FROM x JOIN w ON x.k = w.k GROUP BY x.i),
-     loss AS (SELECT AVG((pred.v - y.v) * (pred.v - y.v)) AS l FROM pred JOIN y ON pred.i = y.i)
-SELECT k, v - $lr * grad(loss, v) AS v FROM w
-"""
-compiled = Program(ctx, STEP, state={"w": w0}, outputs=["loss"]).lower().compile()
+STEPS = {
+    "pred": "SELECT x.i, SUM(x.v * w.v) AS v FROM x JOIN w ON x.k = w.k GROUP BY x.i",
+    "loss": "SELECT AVG((pred.v - y.v) * (pred.v - y.v)) AS l FROM pred JOIN y ON pred.i = y.i",
+    "w": "SELECT k, v - $lr * grad(loss, v) AS v FROM w",
+}
+compiled = Program(
+    ctx, STEPS, state={"w": w0}, params={"lr": 1e-2}, outputs=["loss"]
+).lower().compile()
 
 for step in range(100):
     future = compiled.run(lr=1e-2)
 print(future.result()["loss"])
 ```
 
+- Each step is a named query, and a step reads another by its name, as
+  `loss` reads `pred`. The order of the steps comes from those reads.
 - `state={"w": w0}` makes `w` a table that the program owns and keeps on the
-  GPU. Each run replaces it with the query's result, but only once the run
-  has succeeded, so a failed step leaves `w` as it was.
+  GPU. Each run replaces it with the result of the step named `w`, but only
+  once the run has succeeded, so a failed step leaves `w` as it was.
 - `$lr` is a parameter: it can change every run without recompiling.
 - `run` returns at once, like a CUDA launch. Only the final read waits.
 - Adam, momentum and the rest are SQL too: their moments are more state
@@ -278,7 +282,7 @@ you get from it:
 
   ```python
   # DataFusion Accelerated, proposed
-  lowered = Program(ctx, STEP, state={"w": w0}).lower()
+  lowered = Program(ctx, STEPS, state={"w": w0}, params={"lr": 1e-2}).lower()
   schedule = lowered.schedule()
   schedule.table("x").pin("CUDA")          # keep x on the GPU across runs, like a resident tensor
   compiled = lowered.compile(schedule=schedule)
@@ -348,7 +352,7 @@ chose, and `report()` what it cost, as JSON an agent can read:
 
 ```python
 # DataFusion Accelerated, proposed
-lowered = Program(ctx, STEP, state={"w": w0}).lower()
+lowered = Program(ctx, STEPS, state={"w": w0}, params={"lr": 1e-2}).lower()
 print(lowered.explain())      # each step's plan: which node runs where, with which kernel, chosen by whom
 compiled = lowered.compile()
 compiled.run(lr=1e-2)
@@ -431,7 +435,7 @@ The program API copies JAX's on purpose:
 
 | JAX | DataFusion Accelerated (proposed) |
 |---|---|
-| `jax.jit(step)` | `Program(ctx, STEP, state=..., outputs=...)` |
+| `jax.jit(step)` | `Program(ctx, STEPS, state=..., outputs=...)` |
 | `.lower(w, x, y)` | `.lower()` |
 | `Lowered.as_text()` | `explain()` |
 | `.compile()` | `.compile()` |

@@ -14,18 +14,18 @@ physical plans on GPUs and other devices, with XQL as its first user. It
 keeps tables in device memory, runs kernels for array work and relational
 operators, schedules steps, and distributes them through
 datafusion-distributed. Its design is in [docs/design.md](docs/design.md).
-Nothing is built.
 
 Work proceeds in three stages: discussion, then a design doc, then
-implementation. The project is in the design stage.
+implementation. M0 is being built (decision D14), one pull request per
+milestone, with a sketch posted on the PR before each feature.
 
 - **Spikes are allowed now.** The spikes listed in the design doc (§12.3)
   exist to settle its open questions. Keep each one small, keep it under
   `docs/spikes/`, and report what it found in the design doc, whichever way
   it went.
-- **Milestone M0 and later wait for agreement.** Do not build the runtime
-  itself until the design's proposals are settled in its decision log and
-  Alex agrees to start.
+- **Each milestone waits for agreement.** Build a milestone only once the
+  proposals it rests on are settled in the decision log and Alex agrees to
+  start it. M0's are (D14).
 
 ## Who does what
 
@@ -111,6 +111,10 @@ docs, docstrings, issues, PR descriptions).
   `RuntimeEnv`, physical rules, `ExecutionPlan` nodes, metrics and codecs.
   Attach through the builder in Rust and `with_extensions` in Python, never
   through an installer or a subclass of `SessionContext`.
+- **Rust follows [Google's Rust style guide](https://google.github.io/styleguide/rustguide.html)**
+  (decision D19), as ddx's does. Format with a nightly rustfmt
+  (`cargo +nightly fmt`), since `rustfmt.toml`'s settings need one, and
+  keep the workspace's lints passing. CONTRIBUTING.md has the details.
 - **Rust and Python** (principle R12). Build every capability in Rust and
   bind it to Python. A Rust program must never need Python.
 - **The core delegates to hardware** (principle R13). The core depends on
