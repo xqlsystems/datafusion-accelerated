@@ -99,6 +99,18 @@ impl CompiledProgram {
             }
         }
 
+        // A state table dropped during the run would take rows no name
+        // reads. The catalog isn't under the store's lock, so a drop between
+        // this check and the publish still goes unseen (design §5.4).
+        for (_, handle) in &program.states {
+            let written = writes.iter().any(|(id, _)| *id == handle.id());
+            if written && !handle.is_attached()? {
+                return Err(Error::Stale {
+                    table: handle.name().to_string(),
+                }
+                .into());
+            }
+        }
         let snapshot = store.snapshot_of(run.id(), &program.snapshot_ids())?;
         let publication = store.publish(run.id(), writes, args.on_conflict)?;
         let mut tables = HashMap::with_capacity(program.outputs.len());

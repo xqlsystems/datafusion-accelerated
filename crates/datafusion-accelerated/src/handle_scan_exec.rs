@@ -42,6 +42,11 @@ pub(crate) struct HandleScanExec {
 }
 
 impl HandleScanExec {
+    /// The handle it scans.
+    pub(crate) fn handle(&self) -> &TableHandle {
+        &self.handle
+    }
+
     pub(crate) fn try_new(handle: TableHandle, projection: Option<Vec<usize>>) -> Result<Self> {
         let schema = match &projection {
             Some(columns) => Arc::new(handle.schema().project(columns)?),

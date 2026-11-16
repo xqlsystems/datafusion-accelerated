@@ -688,7 +688,11 @@ derivative once for many runs, follows the same rule. Until the ddx
 integration brings the key, each run checks that the session still gives
 every name the steps read, and each state table's name, the table `lower`
 found, and fails with `Error::Stale` if not, since a plan holds the table
-it was planned with and would otherwise give a wrong answer silently.
+it was planned with and would otherwise give a wrong answer silently. It
+checks the state tables it writes again just before it publishes, so a
+table dropped during the run isn't published into. The session's catalog
+isn't under the store's lock, so a drop between that check and the
+publish still goes unseen.
 
 Rules:
 - **A training step can be one statement.** With the ddx integration in
@@ -756,7 +760,8 @@ Rules:
   checks reads, as Delta's `Serializable` does, waits for a user who needs
   it.
 - **A run's snapshot lists what the program reads**: its state tables and
-  the runtime tables its steps read, by version, sorted by name and then
+  the runtime tables its steps' plans scan, through a view too, by
+  version, sorted by name and then
   identity (`RunOutputs::snapshot`). Replacing a table the program doesn't
   read doesn't change it, so it serves as a key for checkpoints and
   caches.
@@ -774,9 +779,13 @@ Rules:
   it into a one-row table that the plans cross join (S3.2). A parameter
   may go wherever a value is read per row or per query: `SELECT`,
   `WHERE`, `JOIN ... ON`, `GROUP BY`, `HAVING`, `ORDER BY`, `CASE`, `IN`
-  and an aggregate's `FILTER`. Where planning needs its value, in
-  `VALUES`, `LIMIT`, `OFFSET`, `FETCH` or a table function's arguments,
-  `lower` fails with `Error::ParameterPosition` (#48). A run's value is
+  and an aggregate's `FILTER`. Where planning needs its value, `lower`
+  fails with `Error::ParameterPosition` (#48). It finds `VALUES`, `LIMIT`,
+  `OFFSET`, `FETCH` and a table function's arguments in the SQL, since
+  `VALUES` would otherwise fail on every run. Elsewhere, such as a window
+  frame's bounds or a function that needs a literal argument, a step that
+  fails to plan but plans with each parameter as its initial value fails
+  the same way, so no list has to be complete. A run's value is
   for that run only, and must be of the parameter's type, or a number
   that casts to it and back unchanged (`Error::ParameterType`); a value
   given twice is an error (`Error::GivenTwice`).
@@ -1657,7 +1666,9 @@ ctx.sql("""CREATE EXTERNAL TABLE ocean STORED AS ZARR LOCATION 'om4.zarr'
 ctx.sql("""CREATE EXTERNAL TABLE w STORED AS ACCELERATED
            OPTIONS ('accelerated.distribution' 'blocks(k)')""")              # sharded state
 
-compiled = Program(ctx, STEP, state={"w": w0}, outputs=["loss"]).lower().compile()
+compiled = Program(                             # STEPS as in §10.1
+    ctx, STEPS, state={"w": w0}, params={"lr": 1e-3}, outputs=["loss"]
+).lower().compile()
 print(compiled.explain())                      # the exchanges the planner added, and their links
 for i in range(10_000):
     compiled.run(lr=1e-3 * 0.999**i)

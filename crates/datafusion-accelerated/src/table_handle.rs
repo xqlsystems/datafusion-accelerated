@@ -175,11 +175,24 @@ impl TableHandle {
     }
 
     /// Fails with `Error::Detached` if the table was registered and the
-    /// session no longer has it under its name. DataFusion tells a table
-    /// nothing when it's dropped, so this asks the catalog.
+    /// session no longer has it under its name.
     fn check_attached(&self) -> Result<()> {
+        if self.is_attached()? {
+            Ok(())
+        } else {
+            Err(Error::Detached {
+                table: self.inner.name.clone(),
+            }
+            .into())
+        }
+    }
+
+    /// Whether the session still has the table under the name it was
+    /// registered with, or `true` for a table never registered. DataFusion
+    /// tells a table nothing when it's dropped, so this asks the catalog.
+    pub(crate) fn is_attached(&self) -> Result<bool> {
         let Some(home) = self.inner.home.get() else {
-            return Ok(());
+            return Ok(true);
         };
         let schema = home
             .catalogs
@@ -199,21 +212,14 @@ impl TableHandle {
                 }),
                 None => {
                     return plan_err!(
-                        "the session's catalog didn't answer at once, so replace can't check \
-                         that {} is still the session's table",
+                        "the session's catalog didn't answer at once, so the runtime can't \
+                         check that {} is still the session's table",
                         self.inner.name
                     );
                 }
             },
         };
-        if attached {
-            Ok(())
-        } else {
-            Err(Error::Detached {
-                table: self.inner.name.clone(),
-            }
-            .into())
-        }
+        Ok(attached)
     }
 
     /// Whether the table is a program's own, such as an input.

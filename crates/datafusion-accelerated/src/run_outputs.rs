@@ -53,9 +53,9 @@ impl RunOutputs {
     }
 
     /// The versions the run read of the program's state tables and of the
-    /// runtime's tables its steps read, sorted by name. A table the
-    /// program doesn't read isn't listed, so replacing it doesn't change
-    /// the snapshot.
+    /// runtime's tables its steps' plans scan, through a view too, sorted by
+    /// name. A table the program doesn't read isn't listed, so replacing it
+    /// doesn't change the snapshot.
     #[must_use]
     pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot

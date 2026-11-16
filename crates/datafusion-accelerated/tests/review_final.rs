@@ -318,7 +318,6 @@ async fn literal(sql: &str) -> Result<Vec<i64>> {
 /// `Error::ParameterPosition`. So a step either gives what the literal
 /// gives, or is refused with that error, never another.
 #[tokio::test]
-#[ignore = "finding: https://github.com/xqlsystems/datafusion-accelerated/pull/40#discussion_r4581636765"]
 async fn a_parameter_anywhere_is_its_literal_or_a_parameter_position_error() -> Result<()> {
     let mut wrong = Vec::new();
     for sql in [
@@ -351,7 +350,6 @@ async fn a_parameter_anywhere_is_its_literal_or_a_parameter_position_error() -> 
 /// **Assumes:** `RunOutputs::snapshot`'s doc, that it lists "the
 /// runtime's tables its steps read", including through a view.
 #[tokio::test]
-#[ignore = "finding: https://github.com/xqlsystems/datafusion-accelerated/pull/40#discussion_r4581636759"]
 async fn a_snapshot_lists_a_runtime_table_read_through_a_view() -> Result<()> {
     let ctx = session();
     Accelerator::create_table(&ctx, "t", schema(), rows(&[(0, 1)]))?;
@@ -417,7 +415,6 @@ async fn a_program_reads_a_view_as_the_session_does_after_its_table_changes() ->
 /// into a table the session no longer has, so a run whose state table is
 /// dropped while it runs publishes nothing and fails.
 #[tokio::test]
-#[ignore = "finding: https://github.com/xqlsystems/datafusion-accelerated/pull/40#discussion_r4581636752"]
 async fn a_state_table_dropped_during_a_run_isnt_published_into() -> Result<()> {
     let ctx = session();
     // `drop_w(v)` is `v`, and deregisters `w` once armed.

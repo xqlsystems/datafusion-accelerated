@@ -13,16 +13,19 @@ use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result, ScalarValue, TableReference, plan_err};
-use datafusion::prelude::SessionContext;
+use datafusion::execution::session_state::SessionState;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::prelude::{SessionContext, lit};
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::{
     self, Visit, Visitor, visit_expressions, visit_expressions_mut,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
+use datafusion::sql::unparser::Unparser;
 
 use crate::handle_table::HandleTable;
-use crate::lowered_program::{LoweredStep, Params, SessionRead, Target};
+use crate::lowered_program::{LoweredStep, Params, SessionRead, Target, runtime_reads};
 use crate::program_tables::{ProgramTables, layered};
 use crate::table_store::TableStore;
 use crate::{Accelerator, Error, LoweredProgram, NameKind, TableHandle};
@@ -49,8 +52,12 @@ use crate::{Accelerator, Error, LoweredProgram, NameKind, TableHandle};
 /// A parameter may go wherever a value is read per row or per query: in
 /// `SELECT`, `WHERE`, `JOIN ... ON`, `GROUP BY`, `HAVING`, `ORDER BY`,
 /// `CASE`, `IN` and an aggregate's `FILTER`. It may not go where planning
-/// needs its value: in `VALUES`, `LIMIT`, `OFFSET`, `FETCH` or a table
-/// function's arguments (`Error::ParameterPosition`).
+/// needs its value, such as `VALUES`, `LIMIT`, `OFFSET`, `FETCH`, a table
+/// function's arguments, a window frame's bounds or `nth_value`'s position:
+/// `lower` fails there with `Error::ParameterPosition`. Since a function may
+/// need a literal argument too, the list is of examples: a step that fails
+/// to plan, and plans with each parameter as its initial value, fails the
+/// same way.
 #[derive(Clone)]
 #[must_use]
 pub struct Program {
@@ -286,6 +293,7 @@ impl Program {
         for (name, sql) in &steps {
             let in_step = |error: DataFusionError| error.context(format!("in step {name}"));
             let mut statement = state.sql_to_statement(sql, &dialect).map_err(in_step)?;
+            let written = params.is_some().then(|| statement.clone());
             rewrite_params(&mut statement, name, params.as_ref()).map_err(in_step)?;
             let mut reads = Vec::new();
             for reference in state
@@ -321,6 +329,7 @@ impl Program {
                 name: name.clone(),
                 sql: sql.clone(),
                 statement,
+                written,
                 reads,
             });
         }
@@ -330,15 +339,35 @@ impl Program {
             name,
             sql,
             statement,
+            written,
             reads,
         } in order(parsed)?
         {
-            let in_step = |error: DataFusionError| error.context(format!("in step {name}"));
-            let logical = state.statement_to_plan(statement).await.map_err(in_step)?;
-            let plan = state
-                .create_physical_plan(&logical)
-                .await
-                .map_err(in_step)?;
+            let plan = match physical_plan(&state, statement).await {
+                Ok(plan) => plan,
+                Err(error) => {
+                    // Where DataFusion needs a literal, a parameter's scalar
+                    // subquery fails to plan, in more places than
+                    // `PlannedPositions` can list, such as a function's
+                    // argument. So if the step plans with each parameter as
+                    // its initial value, the parameter is the cause.
+                    if let (Some(written), Some(params)) = (written, &params)
+                        && physical_plan(&state, with_literals(written, params)?)
+                            .await
+                            .is_ok()
+                    {
+                        return Err(DataFusionError::from(Error::ParameterPosition {
+                            step: quoted(&name),
+                            position: "a place DataFusion plans from a literal",
+                        })
+                        .context(format!(
+                            "in step {name}, which plans with its parameters as literals, while \
+                             with them as parameters DataFusion says: {error}"
+                        )));
+                    }
+                    return Err(error.context(format!("in step {name}")));
+                }
+            };
             let schema = plan.schema();
             let target = match state_handles.iter().position(|(state, _)| *state == name) {
                 Some(index) => {
@@ -382,6 +411,7 @@ impl Program {
             )?;
             handle.set_home(&base, reference);
         }
+        let runtime_reads = runtime_reads(&lowered, &state_handles, &session_reads);
         Ok(LoweredProgram {
             steps: lowered,
             states: state_handles,
@@ -389,6 +419,7 @@ impl Program {
             params,
             outputs,
             session_reads,
+            runtime_reads,
             state,
             session: base,
             store,
@@ -526,7 +557,51 @@ struct ParsedStep {
     name: String,
     sql: String,
     statement: Statement,
+    /// The statement as written, before its parameters were rewritten, if
+    /// the program has parameters.
+    written: Option<Statement>,
     reads: Vec<String>,
+}
+
+/// A step's physical plan.
+async fn physical_plan(
+    state: &SessionState,
+    statement: Statement,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let logical = state.statement_to_plan(statement).await?;
+    state.create_physical_plan(&logical).await
+}
+
+/// `statement` with each parameter replaced by its initial value, as a
+/// literal.
+fn with_literals(mut statement: Statement, params: &Params) -> Result<Statement> {
+    let Statement::Statement(inner) = &mut statement else {
+        return Ok(statement);
+    };
+    let unparser = Unparser::default();
+    let flow = visit_expressions_mut(inner.as_mut(), |expr| {
+        let ast::Expr::Value(value) = expr else {
+            return ControlFlow::Continue(());
+        };
+        let ast::Value::Placeholder(placeholder) = &value.value else {
+            return ControlFlow::Continue(());
+        };
+        let name = placeholder.trim_start_matches('$');
+        let Some((_, value)) = params.values.iter().find(|(param, _)| param == name) else {
+            return ControlFlow::Continue(());
+        };
+        match unparser.expr_to_sql(&lit(value.clone())) {
+            Ok(literal) => {
+                *expr = literal;
+                ControlFlow::Continue(())
+            }
+            Err(error) => ControlFlow::Break(error),
+        }
+    });
+    match flow {
+        ControlFlow::Break(error) => Err(error),
+        ControlFlow::Continue(()) => Ok(statement),
+    }
 }
 
 /// The steps in an order in which each comes after the steps it reads,

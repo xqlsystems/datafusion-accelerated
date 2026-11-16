@@ -12,6 +12,7 @@ use datafusion::common::{Result, ScalarValue, TableReference};
 use datafusion::execution::session_state::SessionState;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
 
+use crate::handle_scan_exec::HandleScanExec;
 use crate::handle_table::HandleTable;
 use crate::table_store::{HandleId, TableStore};
 use crate::{CompiledProgram, Error, TableHandle};
@@ -26,8 +27,11 @@ pub struct LoweredProgram {
     pub(crate) inputs: Vec<(String, TableHandle)>,
     pub(crate) params: Option<Params>,
     pub(crate) outputs: Vec<String>,
-    /// The session's tables the steps read, as `lower` found them.
+    /// The session's tables the steps name, as `lower` found them.
     pub(crate) session_reads: Vec<SessionRead>,
+    /// The runtime's tables, other than the state tables, that the steps'
+    /// plans scan, through a view or any other way, in the order found.
+    pub(crate) runtime_reads: Vec<TableHandle>,
     // The session's state, with the program's tables in front.
     pub(crate) state: SessionState,
     // The session's own state, whose catalog is the session's.
@@ -108,11 +112,7 @@ impl LoweredProgram {
     /// runtime tables the steps read.
     pub(crate) fn snapshot_ids(&self) -> Vec<HandleId> {
         let states = self.states.iter().map(|(_, handle)| handle.id());
-        let reads = self.session_reads.iter().filter_map(|read| {
-            read.provider
-                .downcast_ref::<HandleTable>()
-                .map(|table| table.handle().id())
-        });
+        let reads = self.runtime_reads.iter().map(TableHandle::id);
         states.chain(reads).collect()
     }
 
@@ -130,6 +130,8 @@ impl LoweredProgram {
         };
         let _ = writeln!(text, "state: {}", names(&self.states));
         let _ = writeln!(text, "inputs: {}", names(&self.inputs));
+        let reads: Vec<&str> = self.runtime_reads.iter().map(TableHandle::name).collect();
+        let _ = writeln!(text, "reads the runtime's tables: {}", reads.join(", "));
         if let Some(params) = &self.params {
             let values: Vec<String> = params
                 .values
@@ -175,6 +177,36 @@ impl LoweredProgram {
     pub fn compile(self) -> Result<CompiledProgram> {
         Ok(CompiledProgram::new(self))
     }
+}
+
+/// The runtime's tables, other than `states`, that `steps` scan or that
+/// `session_reads` name, each once.
+pub(crate) fn runtime_reads(
+    steps: &[LoweredStep],
+    states: &[(String, TableHandle)],
+    session_reads: &[SessionRead],
+) -> Vec<TableHandle> {
+    let mut found: Vec<TableHandle> = Vec::new();
+    let mut add = |handle: &TableHandle| {
+        let known = states.iter().map(|(_, state)| state).chain(&found);
+        if !handle.is_private() && !known.into_iter().any(|seen| seen.id() == handle.id()) {
+            found.push(handle.clone());
+        }
+    };
+    let mut plans: Vec<&Arc<dyn ExecutionPlan>> =
+        steps.iter().rev().map(|step| &step.plan).collect();
+    while let Some(plan) = plans.pop() {
+        if let Some(scan) = plan.downcast_ref::<HandleScanExec>() {
+            add(scan.handle());
+        }
+        plans.extend(plan.children().into_iter().rev());
+    }
+    for read in session_reads {
+        if let Some(table) = read.provider.downcast_ref::<HandleTable>() {
+            add(table.handle());
+        }
+    }
+    found
 }
 
 /// Whether two providers are one table: the same handle, for the runtime's
