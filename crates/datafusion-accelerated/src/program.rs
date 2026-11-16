@@ -12,26 +12,30 @@ use std::sync::Arc;
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, Result, ScalarValue, TableReference, plan_err};
+use datafusion::datasource::source_as_provider;
 use datafusion::execution::session_state::SessionState;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionContext, lit};
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::{
     self, Visit, Visitor, visit_expressions, visit_expressions_mut,
 };
-use datafusion::sql::sqlparser::dialect::GenericDialect;
-use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::unparser::Unparser;
 
 use crate::handle_table::HandleTable;
-use crate::lowered_program::{LoweredStep, Params, SessionRead, Target, runtime_reads};
+use crate::lowered_program::{LoweredStep, Params, SessionRead, Target, runtime_reads, same_table};
 use crate::program_tables::{ProgramTables, layered};
+use crate::step::{
+    StepKind, bind_scans, parameter_names, planned_position, read_params, scans, with_literals,
+};
 use crate::table_store::TableStore;
-use crate::{Accelerator, Error, LoweredProgram, NameKind, TableHandle};
+use crate::{Accelerator, Error, LoweredProgram, NameKind, Step, TableHandle};
 
-/// A program: steps, each a named `SELECT`, with the tables and parameters
-/// they read (design §5.4).
+/// A program: steps, each a named query in SQL or as a DataFusion plan
+/// ([`Step`]), with the tables and parameters they read (design §5.4).
 ///
 /// It names:
 /// - its **state**: tables kept across runs. Wherever a step reads a state
@@ -41,7 +45,8 @@ use crate::{Accelerator, Error, LoweredProgram, NameKind, TableHandle};
 ///   value computed from the next state is the next run's to compute.
 /// - its **inputs**: tables supplied on every run;
 /// - its **parameters**: scalars such as a learning rate, written `$lr` in
-///   the steps' SQL, which change between runs without planning again;
+///   SQL and `placeholder("$lr")` in a plan, which change between runs
+///   without planning again;
 /// - its **outputs**: the steps and state tables the caller reads after a
 ///   run.
 ///
@@ -64,7 +69,7 @@ pub struct Program {
     ctx: SessionContext,
     // `None` for the one step of `Program::new`, named at `lower` after the
     // program's one state table.
-    steps: Vec<(Option<String>, String)>,
+    steps: Vec<(Option<String>, Step)>,
     state: Vec<(String, StateSource)>,
     inputs: Vec<(String, SchemaRef)>,
     params: Vec<(String, ScalarValue)>,
@@ -88,26 +93,26 @@ impl fmt::Debug for Program {
 }
 
 impl Program {
-    /// A program of one step, `sql`, whose result is the next value of the
-    /// program's one state table.
-    pub fn new(ctx: &SessionContext, sql: impl Into<String>) -> Self {
-        Self::with_steps(ctx, vec![(None, sql.into())])
+    /// A program of one step, in SQL or as a plan, whose result is the next
+    /// value of the program's one state table.
+    pub fn new(ctx: &SessionContext, step: impl Into<Step>) -> Self {
+        Self::with_steps(ctx, vec![(None, step.into())])
     }
 
-    /// A program of named steps.
+    /// A program of named steps, each in SQL or as a plan ([`Step`]).
     pub fn from_steps<N, S>(ctx: &SessionContext, steps: impl IntoIterator<Item = (N, S)>) -> Self
     where
         N: Into<String>,
-        S: Into<String>,
+        S: Into<Step>,
     {
         let steps = steps
             .into_iter()
-            .map(|(name, sql)| (Some(name.into()), sql.into()))
+            .map(|(name, step)| (Some(name.into()), step.into()))
             .collect();
         Self::with_steps(ctx, steps)
     }
 
-    fn with_steps(ctx: &SessionContext, steps: Vec<(Option<String>, String)>) -> Self {
+    fn with_steps(ctx: &SessionContext, steps: Vec<(Option<String>, Step)>) -> Self {
         Self {
             ctx: ctx.clone(),
             steps,
@@ -280,8 +285,8 @@ impl Program {
         own.extend(input_handles.iter().map(|(name, _)| name.clone()));
         own.extend(params.iter().map(|p| p.handle.name().to_string()));
 
-        // Each step, parsed, with its parameters rewritten, the steps it
-        // reads, and the session's tables it reads.
+        // Each step, parsed if it's SQL, with the steps it reads and the
+        // session's tables it reads.
         let options = &state.config().options().catalog;
         let (catalog, schema) = (
             options.default_catalog.as_str(),
@@ -290,33 +295,74 @@ impl Program {
         let dialect = state.config().options().sql_parser.dialect;
         let mut parsed = Vec::with_capacity(steps.len());
         let mut session_reads: Vec<SessionRead> = Vec::new();
-        for (name, sql) in &steps {
+        for (name, step) in steps {
             let in_step = |error: DataFusionError| error.context(format!("in step {name}"));
-            let mut statement = state.sql_to_statement(sql, &dialect).map_err(in_step)?;
-            let written = params.is_some().then(|| statement.clone());
-            rewrite_params(&mut statement, name, params.as_ref()).map_err(in_step)?;
+            // Each table the step names, with the source a plan's scan has.
+            let (form, named) = match &step.0 {
+                StepKind::Sql(sql) => {
+                    let statement = state.sql_to_statement(sql, &dialect).map_err(in_step)?;
+                    check_sql(&statement, &name).map_err(in_step)?;
+                    let named = state
+                        .resolve_table_references(&statement)
+                        .map_err(in_step)?
+                        .into_iter()
+                        .map(|reference| (reference, None))
+                        .collect::<Vec<_>>();
+                    (Form::Sql(statement), named)
+                }
+                StepKind::Plan(plan) => {
+                    check_plan(plan, &name).map_err(in_step)?;
+                    let named = scans(plan)?
+                        .into_iter()
+                        .map(|(reference, source)| (reference, Some(source)))
+                        .collect();
+                    (Form::Plan(plan.clone()), named)
+                }
+            };
             let mut reads = Vec::new();
-            for reference in state
-                .resolve_table_references(&statement)
-                .map_err(in_step)?
-            {
+            let mut bindings: HashMap<String, Arc<dyn TableProvider>> = HashMap::new();
+            for (reference, source) in named {
                 let resolved = reference.clone().resolve(catalog, schema);
                 let table = resolved.table.to_string();
                 let default = *resolved.catalog == *catalog && *resolved.schema == *schema;
                 if default && own.contains(&table) {
-                    if step_names.contains(&table) && !state_names.contains(&table) {
+                    if step_names.contains(&table)
+                        && !state_names.contains(&table)
+                        && !reads.contains(&table)
+                    {
                         reads.push(table);
                     }
                     continue;
                 }
                 let quoted = reference.to_quoted_string();
-                if session_reads.iter().any(|read| read.name == quoted) {
-                    continue;
-                }
-                // A name nothing defines fails below, with DataFusion's own
-                // error.
-                if let Ok(schema) = base.schema_for_ref(reference.clone())
-                    && let Some(provider) = schema.table(&table).await?
+                let now = match base.schema_for_ref(reference.clone()) {
+                    Ok(schema) => schema.table(&table).await?,
+                    Err(_) => None,
+                };
+                let held = source.and_then(|source| source_as_provider(&source).ok());
+                let read = match (held, now) {
+                    // SQL reads the session's table; a name nothing
+                    // defines fails below, with DataFusion's own error.
+                    (None, now) if matches!(form, Form::Sql(_)) => now,
+                    // A plan built against a table the session has since
+                    // replaced would read the old one.
+                    (Some(held), Some(now)) if !same_table(&held, &now) => {
+                        return Err(in_step(Error::Stale { table: quoted }.into()));
+                    }
+                    (Some(_), now) => now,
+                    // A scan with only a schema reads the session's table.
+                    (None, Some(now)) => {
+                        bindings.insert(resolved.to_string(), Arc::clone(&now));
+                        Some(now)
+                    }
+                    (None, None) => {
+                        return Err(in_step(DataFusionError::Plan(format!(
+                            "table '{resolved}' not found"
+                        ))));
+                    }
+                };
+                if let Some(provider) = read
+                    && !session_reads.iter().any(|read| read.name == quoted)
                 {
                     session_reads.push(SessionRead {
                         name: quoted,
@@ -326,10 +372,10 @@ impl Program {
                 }
             }
             parsed.push(ParsedStep {
-                name: name.clone(),
-                sql: sql.clone(),
-                statement,
-                written,
+                name,
+                step,
+                form,
+                bindings,
                 reads,
             });
         }
@@ -337,37 +383,13 @@ impl Program {
         let mut lowered = Vec::with_capacity(parsed.len());
         for ParsedStep {
             name,
-            sql,
-            statement,
-            written,
+            step,
+            form,
+            bindings,
             reads,
         } in order(parsed)?
         {
-            let plan = match physical_plan(&state, statement).await {
-                Ok(plan) => plan,
-                Err(error) => {
-                    // Where DataFusion needs a literal, a parameter's scalar
-                    // subquery fails to plan, in more places than
-                    // `PlannedPositions` can list, such as a function's
-                    // argument. So if the step plans with each parameter as
-                    // its initial value, the parameter is the cause.
-                    if let (Some(written), Some(params)) = (written, &params)
-                        && physical_plan(&state, with_literals(written, params)?)
-                            .await
-                            .is_ok()
-                    {
-                        return Err(DataFusionError::from(Error::ParameterPosition {
-                            step: quoted(&name),
-                            position: "a place DataFusion plans from a literal",
-                        })
-                        .context(format!(
-                            "in step {name}, which plans with its parameters as literals, while \
-                             with them as parameters DataFusion says: {error}"
-                        )));
-                    }
-                    return Err(error.context(format!("in step {name}")));
-                }
-            };
+            let plan = lower_step(&state, &name, form, &bindings, &tables, params.as_ref()).await?;
             let schema = plan.schema();
             let target = match state_handles.iter().position(|(state, _)| *state == name) {
                 Some(index) => {
@@ -395,7 +417,7 @@ impl Program {
             };
             lowered.push(LoweredStep {
                 name,
-                sql,
+                step,
                 reads,
                 plan,
                 target,
@@ -457,7 +479,7 @@ enum StateSource {
 /// field may be nullable in `found` and not in `expected`, since a
 /// parameter or an outer join makes a field nullable that never holds a
 /// null; each run checks.
-fn fits(expected: &SchemaRef, found: &SchemaRef) -> bool {
+pub(crate) fn fits(expected: &SchemaRef, found: &SchemaRef) -> bool {
     expected.fields().len() == found.fields().len()
         && expected
             .fields()
@@ -468,14 +490,14 @@ fn fits(expected: &SchemaRef, found: &SchemaRef) -> bool {
 
 /// The steps, with `Program::new`'s step named after the one state table.
 fn name_steps(
-    steps: Vec<(Option<String>, String)>,
+    steps: Vec<(Option<String>, Step)>,
     states: &[(String, StateSource)],
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<(String, Step)>> {
     steps
         .into_iter()
-        .map(|(name, sql)| match name {
-            Some(name) => Ok((bare(&name)?, sql)),
-            None if states.len() == 1 => Ok((states[0].0.clone(), sql)),
+        .map(|(name, step)| match name {
+            Some(name) => Ok((bare(&name)?, step)),
+            None if states.len() == 1 => Ok((states[0].0.clone(), step)),
             None => plan_err!(
                 "Program::new's one step is the next value of the program's one state table, \
                  and the program has {} state tables",
@@ -493,7 +515,7 @@ fn check_names(
     states: &[(String, StateSource)],
     inputs: &[(String, SchemaRef)],
     params: &[(String, ScalarValue)],
-    steps: &[(String, String)],
+    steps: &[(String, Step)],
 ) -> Result<()> {
     let mut seen: HashMap<&str, NameKind> = HashMap::new();
     let declared = states
@@ -552,29 +574,167 @@ fn clash(name: &str, first: NameKind, second: NameKind) -> DataFusionError {
     .into()
 }
 
-/// A step, parsed, with the other steps it reads.
+/// A step, with the other steps it reads.
 struct ParsedStep {
     name: String,
-    sql: String,
-    statement: Statement,
-    /// The statement as written, before its parameters were rewritten, if
-    /// the program has parameters.
-    written: Option<Statement>,
+    step: Step,
+    form: Form,
+    /// For a plan, the session's tables that its scans with only a schema
+    /// read, by resolved name.
+    bindings: HashMap<String, Arc<dyn TableProvider>>,
     reads: Vec<String>,
 }
 
-/// A step's physical plan.
-async fn physical_plan(
+/// A step, parsed if it's SQL.
+enum Form {
+    Sql(Statement),
+    Plan(LogicalPlan),
+}
+
+/// Fails unless `statement` is one `SELECT` with no parameter in a table
+/// function's arguments, which DataFusion evaluates while it plans the SQL,
+/// before any plan has a parameter to rewrite.
+fn check_sql(statement: &Statement, step: &str) -> Result<()> {
+    let Statement::Statement(inner) = statement else {
+        return plan_err!("a program's step is a SELECT, and {step} isn't one");
+    };
+    if !matches!(inner.as_ref(), ast::Statement::Query(_)) {
+        return plan_err!("a program's step is a SELECT, and {step} isn't one");
+    }
+    if let ControlFlow::Break(position) = inner.visit(&mut TableFunctionArguments) {
+        return Err(Error::ParameterPosition {
+            step: quoted(step),
+            position,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Fails unless `plan` is a query.
+fn check_plan(plan: &LogicalPlan, step: &str) -> Result<()> {
+    match plan {
+        LogicalPlan::Dml(_)
+        | LogicalPlan::Ddl(_)
+        | LogicalPlan::Copy(_)
+        | LogicalPlan::Statement(_)
+        | LogicalPlan::Explain(_)
+        | LogicalPlan::Analyze(_)
+        | LogicalPlan::DescribeTable(_) => {
+            plan_err!("a program's step is a query, and {step} isn't one")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A step's physical plan. SQL is planned in `state`, where the program's
+/// tables are found first; a plan's scans of the program's tables, and its
+/// scans with only a schema, are bound to their tables. Then each
+/// parameter is read from the parameters' table.
+async fn lower_step(
     state: &SessionState,
-    statement: Statement,
+    name: &str,
+    form: Form,
+    bindings: &HashMap<String, Arc<dyn TableProvider>>,
+    tables: &ProgramTables,
+    params: Option<&Params>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let logical = state.statement_to_plan(statement).await?;
-    state.create_physical_plan(&logical).await
+    let in_step = |error: DataFusionError| error.context(format!("in step {name}"));
+    let logical = match form {
+        Form::Sql(statement) => match state.statement_to_plan(statement.clone()).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                if let Some(params) = params
+                    && plans(state, sql_with_literals(statement, params)?).await
+                {
+                    return Err(needs_literal(name, &error));
+                }
+                return Err(in_step(error));
+            }
+        },
+        Form::Plan(plan) => {
+            let options = &state.config().options().catalog;
+            let (catalog, schema) = (
+                options.default_catalog.as_str(),
+                options.default_schema.as_str(),
+            );
+            bind_scans(plan, &quoted(name), |reference| {
+                let resolved = reference.clone().resolve(catalog, schema);
+                let default = *resolved.catalog == *catalog && *resolved.schema == *schema;
+                default
+                    .then(|| tables.get(&resolved.table))
+                    .flatten()
+                    .or_else(|| bindings.get(&resolved.to_string()).cloned())
+            })
+            .map_err(in_step)?
+        }
+    };
+    for param in parameter_names(&logical)? {
+        if !params.is_some_and(|params| params.values.iter().any(|(known, _)| *known == param)) {
+            return Err(in_step(
+                Error::UnknownName {
+                    name: format!("${param}"),
+                    kind: NameKind::Parameter,
+                }
+                .into(),
+            ));
+        }
+    }
+    let Some(params) = params else {
+        return state.create_physical_plan(&logical).await.map_err(in_step);
+    };
+    if let Some(position) = planned_position(&logical)? {
+        return Err(in_step(
+            Error::ParameterPosition {
+                step: quoted(name),
+                position,
+            }
+            .into(),
+        ));
+    }
+    let error = match read_params(logical.clone(), params) {
+        Ok(read) => match state.create_physical_plan(&read).await {
+            Ok(plan) => return Ok(plan),
+            Err(error) => error,
+        },
+        Err(error) => error,
+    };
+    // Where DataFusion needs a literal, a parameter's scalar subquery fails
+    // to plan, in more places than any list can name, such as a function's
+    // argument. So if the step plans with each parameter as its initial
+    // value, the parameter is the cause.
+    if let Ok(literal) = with_literals(logical, params)
+        && state.create_physical_plan(&literal).await.is_ok()
+    {
+        return Err(needs_literal(name, &error));
+    }
+    Err(in_step(error))
+}
+
+/// The error for a step that plans with its parameters as literals, and
+/// fails with them as parameters with `error`.
+fn needs_literal(step: &str, error: &DataFusionError) -> DataFusionError {
+    DataFusionError::from(Error::ParameterPosition {
+        step: quoted(step),
+        position: "a place DataFusion plans from a literal",
+    })
+    .context(format!(
+        "in step {step}, which plans with its parameters as literals, while with them as \
+         parameters DataFusion says: {error}"
+    ))
+}
+
+/// Whether `statement` plans.
+async fn plans(state: &SessionState, statement: Statement) -> bool {
+    match state.statement_to_plan(statement).await {
+        Ok(logical) => state.create_physical_plan(&logical).await.is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// `statement` with each parameter replaced by its initial value, as a
-/// literal.
-fn with_literals(mut statement: Statement, params: &Params) -> Result<Statement> {
+/// literal, for SQL that fails to plan before it has a plan to rewrite.
+fn sql_with_literals(mut statement: Statement, params: &Params) -> Result<Statement> {
     let Statement::Statement(inner) = &mut statement else {
         return Ok(statement);
     };
@@ -644,95 +804,12 @@ fn params_table(store: &Arc<TableStore>, params: &[(String, ScalarValue)]) -> Re
     TableHandle::new_private(Arc::clone(store), name, schema, vec![row])
 }
 
-/// Rewrites each `$name` in a step into a scalar subquery of the
-/// parameters' table, so that a new value is read on each run without
-/// planning again.
-fn rewrite_params(statement: &mut Statement, step: &str, params: Option<&Params>) -> Result<()> {
-    let Statement::Statement(inner) = statement else {
-        return plan_err!("a program's step is a SELECT, and {step} isn't one");
-    };
-    if !matches!(inner.as_ref(), ast::Statement::Query(_)) {
-        return plan_err!("a program's step is a SELECT, and {step} isn't one");
-    }
-    if let ControlFlow::Break(position) = inner.visit(&mut PlannedPositions) {
-        return Err(Error::ParameterPosition {
-            step: quoted(step),
-            position,
-        }
-        .into());
-    }
-    let flow = visit_expressions_mut(inner.as_mut(), |expr| {
-        let ast::Expr::Value(value) = expr else {
-            return ControlFlow::Continue(());
-        };
-        let ast::Value::Placeholder(placeholder) = &value.value else {
-            return ControlFlow::Continue(());
-        };
-        let name = placeholder.trim_start_matches('$');
-        let Some(params) = params.filter(|p| p.values.iter().any(|(param, _)| param == name))
-        else {
-            return ControlFlow::Break(DataFusionError::from(Error::UnknownName {
-                name: placeholder.clone(),
-                kind: NameKind::Parameter,
-            }));
-        };
-        let sql = format!(
-            "SELECT {} FROM {}",
-            quote_ident(name),
-            quote_ident(params.handle.name())
-        );
-        match Parser::new(&GenericDialect {})
-            .try_with_sql(&sql)
-            .and_then(|mut parser| parser.parse_query())
-        {
-            Ok(query) => {
-                *expr = ast::Expr::Subquery(query);
-                ControlFlow::Continue(())
-            }
-            Err(error) => ControlFlow::Break(DataFusionError::from(error)),
-        }
-    });
-    match flow {
-        ControlFlow::Break(error) => Err(error),
-        ControlFlow::Continue(()) => Ok(()),
-    }
-}
+/// Finds a parameter in a table function's arguments, which DataFusion
+/// evaluates while it plans SQL, so a parameter there fails to plan.
+struct TableFunctionArguments;
 
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// Finds a parameter where planning needs its value, which a scalar
-/// subquery can't give: there DataFusion either fails to plan, or plans a
-/// step that fails on every run.
-struct PlannedPositions;
-
-impl Visitor for PlannedPositions {
+impl Visitor for TableFunctionArguments {
     type Break = &'static str;
-
-    fn pre_visit_query(&mut self, query: &ast::Query) -> ControlFlow<&'static str> {
-        if let Some(limit) = &query.limit_clause {
-            let (limit, offset) = match limit {
-                ast::LimitClause::LimitOffset { limit, offset, .. } => {
-                    (limit.as_ref(), offset.as_ref().map(|offset| &offset.value))
-                }
-                ast::LimitClause::OffsetCommaLimit { offset, limit } => (Some(limit), Some(offset)),
-            };
-            if limit.is_some_and(has_placeholder) {
-                return ControlFlow::Break("LIMIT");
-            }
-            if offset.is_some_and(has_placeholder) {
-                return ControlFlow::Break("OFFSET");
-            }
-        }
-        if query.fetch.as_ref().is_some_and(has_placeholder) {
-            return ControlFlow::Break("FETCH");
-        }
-        if values_have_placeholder(&query.body) {
-            return ControlFlow::Break("VALUES");
-        }
-        ControlFlow::Continue(())
-    }
 
     fn pre_visit_table_factor(&mut self, factor: &ast::TableFactor) -> ControlFlow<&'static str> {
         let arguments = match factor {
@@ -745,18 +822,6 @@ impl Visitor for PlannedPositions {
             return ControlFlow::Break("a table function's arguments");
         }
         ControlFlow::Continue(())
-    }
-}
-
-/// Whether a `VALUES` list in `body`, outside any subquery, has a
-/// parameter. Subqueries are visited as queries of their own.
-fn values_have_placeholder(body: &ast::SetExpr) -> bool {
-    match body {
-        ast::SetExpr::Values(values) => has_placeholder(values),
-        ast::SetExpr::SetOperation { left, right, .. } => {
-            values_have_placeholder(left) || values_have_placeholder(right)
-        }
-        _ => false,
     }
 }
 

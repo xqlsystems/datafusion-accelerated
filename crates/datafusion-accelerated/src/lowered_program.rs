@@ -14,8 +14,9 @@ use datafusion::physical_plan::{ExecutionPlan, displayable};
 
 use crate::handle_scan_exec::HandleScanExec;
 use crate::handle_table::HandleTable;
+use crate::step::StepKind;
 use crate::table_store::{HandleId, TableStore};
-use crate::{CompiledProgram, Error, TableHandle};
+use crate::{CompiledProgram, Error, Step, TableHandle};
 
 /// A program whose steps are planned, in the order their reads give
 /// (design §5.4). [`explain`](LoweredProgram::explain) shows it, and
@@ -53,7 +54,7 @@ pub(crate) struct SessionRead {
 #[derive(Debug)]
 pub(crate) struct LoweredStep {
     pub(crate) name: String,
-    pub(crate) sql: String,
+    pub(crate) step: Step,
     /// The other steps it reads.
     pub(crate) reads: Vec<String>,
     pub(crate) plan: Arc<dyn ExecutionPlan>,
@@ -160,7 +161,17 @@ impl LoweredProgram {
                 step.reads.join(", ")
             };
             let _ = writeln!(text, "step {}: {}{what}, reads {reads}", i + 1, step.name);
-            let _ = writeln!(text, "  sql: {}", step.sql.trim());
+            match &step.step.0 {
+                StepKind::Sql(sql) => {
+                    let _ = writeln!(text, "  sql: {}", sql.trim());
+                }
+                StepKind::Plan(plan) => {
+                    let _ = writeln!(text, "  logical plan:");
+                    for line in plan.display_indent().to_string().lines() {
+                        let _ = writeln!(text, "    {line}");
+                    }
+                }
+            }
             for line in displayable(step.plan.as_ref())
                 .indent(true)
                 .to_string()
@@ -211,7 +222,7 @@ pub(crate) fn runtime_reads(
 
 /// Whether two providers are one table: the same handle, for the runtime's
 /// tables, else the same provider.
-fn same_table(a: &Arc<dyn TableProvider>, b: &Arc<dyn TableProvider>) -> bool {
+pub(crate) fn same_table(a: &Arc<dyn TableProvider>, b: &Arc<dyn TableProvider>) -> bool {
     match (
         a.downcast_ref::<HandleTable>(),
         b.downcast_ref::<HandleTable>(),

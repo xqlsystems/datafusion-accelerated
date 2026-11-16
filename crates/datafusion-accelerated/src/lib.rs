@@ -50,6 +50,7 @@ mod run;
 mod run_args;
 mod run_outputs;
 mod snapshot;
+mod step;
 mod table_handle;
 mod table_store;
 
@@ -66,4 +67,5 @@ pub use run::Run;
 pub use run_args::{OnConflict, RunArgs};
 pub use run_outputs::RunOutputs;
 pub use snapshot::{Snapshot, TableVersion};
+pub use step::Step;
 pub use table_handle::TableHandle;

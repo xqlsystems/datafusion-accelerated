@@ -134,6 +134,18 @@ pub enum Error {
         /// The step's.
         found: SchemaRef,
     },
+    /// A step given as a plan scans one of the program's tables, by name,
+    /// with fields other than the table's.
+    ScanSchema {
+        /// The step's name.
+        step: String,
+        /// The table's name, as SQL writes it.
+        table: String,
+        /// The table's schema.
+        expected: SchemaRef,
+        /// The schema the plan's scan has.
+        found: SchemaRef,
+    },
     /// A run's next value for a state table has a null in a field the
     /// table's schema says isn't nullable.
     NullInState {
@@ -298,6 +310,18 @@ impl fmt::Display for Error {
                     f,
                     "the step {table} computes the state table {table}'s next value"
                 )?;
+                match first_difference(expected, found) {
+                    Some((want, got)) => write!(f, " with {got}, where the table has {want}"),
+                    None => write!(f, " with the schema {found}, not the table's {expected}"),
+                }
+            }
+            Error::ScanSchema {
+                step,
+                table,
+                expected,
+                found,
+            } => {
+                write!(f, "the step {step} scans the table {table}")?;
                 match first_difference(expected, found) {
                     Some((want, got)) => write!(f, " with {got}, where the table has {want}"),
                     None => write!(f, " with the schema {found}, not the table's {expected}"),
