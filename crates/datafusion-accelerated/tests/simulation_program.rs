@@ -243,9 +243,9 @@ fn generate(rng: &mut Rng) -> Generated {
         let others: Vec<String> = sources.iter().filter(|s| **s != x).cloned().collect();
         let sql = if !others.is_empty() && rng.chance(45) {
             let y = rng.pick(&others).clone();
-            fill(rng.pick(BINARY), &x, &y)
+            fill(rng.pick::<&str>(BINARY), &x, &y)
         } else {
-            fill(rng.pick(UNARY), &x, &x)
+            fill(rng.pick::<&str>(UNARY), &x, &x)
         };
         steps.push((name.clone(), sql));
         sources.push(name);
