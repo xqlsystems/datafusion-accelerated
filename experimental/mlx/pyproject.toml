@@ -16,8 +16,22 @@ requires-python = ">=3.12"
 dependencies = [
     # DenseProgram walks datafusion-python's logical plans.
     "datafusion==55.0.0",
+    # ddx differentiates the SQL the executors run: ddxdb.to_sql from
+    # 0.4.11, and ddxdb.ad.dataframe from 0.4.12 (ddx#291).
+    "ddxdb[datafusion]==0.4.12",
+    # einfold finds array operations in the plans. 0.3.0rc1 has the dense
+    # backend (einfold#167), and resets a decoded plan's state (#164).
+    # TODO: pin 0.3.0 once it's released.
+    "einfold[datafusion]==0.3.0rc1",
+    # MLX, Apple's array library. On Linux, its CPU backend runs the same
+    # code, so the tests need no Apple hardware.
+    "mlx==0.32.4; sys_platform == 'darwin'",
+    "mlx[cpu]==0.32.4; sys_platform == 'linux'",
     "numpy",
     "pyarrow",
+    # The executors run on an xarray-sql Context, through the records it
+    # made public in 0.8.0 (xarray-sql#323).
+    "xarray-sql==0.8.0",
 ]
 
 [project.optional-dependencies]

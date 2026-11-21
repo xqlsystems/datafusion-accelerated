@@ -35,8 +35,17 @@ moving that work here is
 |---|---|---|
 | `DenseProgram`, which interprets DataFusion's logical operators on compact arrays, and its proofs | einfold#157 and Ray's fork of einfold, to `3108f7a` | M6 (B-2) |
 | The native module, `_native`: `shared_ctes`, which splits a `SELECT` into its common table expressions, and `_SortedArrowTable`, a table that declares its sort order | xarray-sql's `src/shared.rs`, at `a1d237a` on Ray's branch `codex/numerical-value-identities` | with `SharedExecutor`, once DataFusion computes a shared CTE once (#39, xarray-sql#290) |
+| `SharedExecutor` (`shared.py`), which computes each shared CTE once per run | xarray-sql#302, to `a1d237a` | once DataFusion computes a shared CTE once (#39, xarray-sql#290) |
+| `DenseExecutor` (`dense.py`, `_dense_*.py`), which runs SQL on compact arrays, the MLX operators (`mlx.py`) and `register_erf` (`math.py`) | xarray-sql#303, to `a1d237a` | M2 on Apple's GPUs, then M5 |
 
 The milestones are in the design, [§12.2](../../docs/design.md).
+
+## What it depends on
+
+It uses only released, public APIs: xarray-sql 0.8.0's `Context` records,
+ddxdb 0.4.12's `to_sql` and `ad.dataframe`, and einfold 0.3.0rc1's dense
+backend. Ray's code reached private names and forks for these; issue #41
+lists what replaced each.
 
 ## Using it
 
@@ -47,3 +56,10 @@ toolchain, 1.94 or later.
 ```sh
 uv run --project experimental/mlx pytest experimental/mlx/tests
 ```
+
+The tests of the float32 path run only with `MLX_ENABLE_TF32=0` set before
+Python starts, as MLX reads it on first use. MLX has no GPU on Linux, so with
+MLX 0.32.4 on an x86-64 Linux machine (issue #41),
+26 of them fail, on Ray's code as on this package: 16 need a GPU
+stream, 7 differ in float32 by more than their tolerance, and 3 count GPU
+work that ran on the CPU.
