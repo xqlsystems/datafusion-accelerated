@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# The experimental MLX package's native module, `datafusion_accelerated_mlx._native`
+# (issue #41). maturin builds it into the package's wheel.
+#
+# It isn't a member of the repository's workspace: the package retires as a
+# whole (README), and its pins, such as pyo3's, never move the core's.
+[package]
+name = "datafusion-accelerated-mlx"
+description = "Experimental: the MLX package's native module."
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/xqlsystems/datafusion-accelerated"
+authors = ["Alexander Sky Merose <al@merose.com>", "Ray Cromwell"]
+rust-version = "1.94"
+publish = false
+
+[workspace]
+
+[lib]
+name = "_native"
+path = "rust/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Arrow and DataFusion as the core pins them (D15). datafusion-python 55.0.0,
+# which the package imports, is built on DataFusion 55.1; an extension built
+# on 55.2 loads into it (spike 4a).
+arrow = { version = "59", features = ["pyarrow"] }
+datafusion = "=55.2.0"
+datafusion-ffi = "=55.2.0"
+datafusion-python-util = "=55.0.0"
+# The stable ABI from 3.12, the package's requires-python, so one wheel per
+# platform serves every later CPython. maturin enables extension-module.
+pyo3 = { version = "0.29", features = ["abi3-py312"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "warn"
+needless_pass_by_value = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"
+return_self_not_must_use = "warn"
+wildcard_imports = "warn"
+exhaustive_enums = "warn"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

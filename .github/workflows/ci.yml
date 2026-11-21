@@ -69,3 +69,43 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - name: tests
         run: cargo test --workspace --no-fail-fast
+
+  # The experimental MLX package (issue #41). Its tests need no Apple
+  # hardware.
+  mlx:
+    name: experimental/mlx (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The package's native module is Rust, built by maturin when uv
+      # installs the package. Its checks are the workspace's.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: nightly-2026-10-10
+          components: rustfmt
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: experimental/mlx
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: rustfmt
+        run: cargo +nightly-2026-10-10 fmt --manifest-path experimental/mlx/Cargo.toml --check
+      - name: clippy
+        run: cargo clippy --manifest-path experimental/mlx/Cargo.toml --all-targets -- -D warnings
+      # The test binaries link libpython, as pyo3 does without
+      # extension-module, so they run against uv's CPython 3.12.
+      - name: Rust tests
+        run: |
+          uv python install 3.12
+          export PYO3_PYTHON="$(uv python find 3.12)"
+          export LD_LIBRARY_PATH="$(dirname "$(dirname "$PYO3_PYTHON")")/lib"
+          cargo test --manifest-path experimental/mlx/Cargo.toml
+      - name: tests
+        run: uv run --project experimental/mlx --python 3.12 --locked pytest experimental/mlx/tests
