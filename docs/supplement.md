@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 # DataFusion Accelerated: supplement
 
 _companion to_: [the design](design.md)
-_last updated_: 2026-11-07
+_last updated_: 2026-11-15
 
 This supplement holds the evidence behind the [design](design.md), the
 alternatives it rejected, and the reasoning behind its rules. The design
@@ -498,6 +498,100 @@ the promise broken, and every plan that reads the state planned again.
 Hence the design's rule that a table holding state reads the handle's
 current buffer when its plan runs, whichever path runs it.
 
+Reading at run time raises the question of what a run sees when another
+thread replaces a table during it. Without isolation, a plan that scans a
+table twice, as DataFusion's plan of a CTE read twice does
+(xarray-sql#267), could join one version of it with another, and a step
+could read one state table before an update and another after it. The
+runtime's users expect neither: SQL gives each query one snapshot, and a
+training step reads all of the previous step's state. So each run pins a
+snapshot (design D20). Replacing a table makes a new version map and
+leaves the pinned one intact, so a replace never waits for a run.
+
+A first version identified a run by the address of its `TaskContext`,
+since DataFusion passes one context to every node of an execution. The
+adversarial review of #40
+([comment](https://github.com/xqlsystems/datafusion-accelerated/pull/40#issuecomment-6887694007))
+showed that DataFusion promises no such thing, and that it failed both
+ways. A caller who kept one context and ran a plan with it on every
+training step read the first step's rows forever, with no error. And
+datafusion-ffi 55.2.0 builds a new context for every `execute` that
+crosses it (`src/execution/task_ctx.rs:184`), so a plan run from Python
+pinned a snapshot per scan. Under datafusion-distributed, a stage runs in
+another process, where no address of the coordinator's means anything.
+So a run is now a value: `begin_run` pins the snapshot and gives the run
+an id, and the id travels in the `accelerated.run` setting. Settings are
+what both boundaries carry. datafusion-ffi rebuilds a config from its
+`ConfigOptions` alone (`src/session/config.rs:132`), dropping typed
+extensions, and datafusion-distributed sends a `ConfigExtension` to its
+workers as strings. The pin is dropped when the run is, so nothing waits
+for a later scan to free it. A plan outside a run reads the current rows,
+which is what a caller who reuses a context expects of a table that
+changed. M1's atomic publication of several tables at once builds on the
+same version map.
+
+The same review found the runtime's map from names to tables drifting
+from the session's catalog: the session normalizes `W` to `w` and the
+runtime didn't, and `DROP TABLE` removed the provider while the runtime
+kept the name and the rows. So the catalog is now the only such map, and
+a table's rows live as long as something holds the table: the catalog, a
+plan or a handle. The review also proposed a schema of the runtime's own,
+`accelerated`, as iceberg-rust's DataFusion catalog has. That would
+prevent collisions with users' tables, but every frontend would then
+qualify every name, and torch-sql and xarray-sql write plain ones. A
+collision is already an error (`Error::NameTaken`).
+
+The adversarial reviews of #40 also settled what a program's step is. A
+first amendment let a step be `INSERT OVERWRITE w SELECT ...`, so that a
+write would be plain SQL any engine runs. It isn't: DataFusion 55.2.0's
+`MemTable`, the reference for the cross-engine check, takes only appends
+(`datafusion-catalog` 55.2.0, `src/memory/table.rs:257`), and the second
+round reports that DuckDB 2.0.0 doesn't parse `INSERT OVERWRITE`
+([comment](https://github.com/xqlsystems/datafusion-accelerated/pull/40#issuecomment-6900007496)).
+A write visible to later steps also made order matter between steps that
+read nothing of each other, which would have meant running steps in the
+order listed. A named `SELECT` whose state means its value at the start of
+the run avoids both: every engine runs a `SELECT`, and order follows from
+reads, so independent steps can run at once (ddx#157).
+
+The same reviews asked for versions. A process-local run id can't be
+logged, sent to a worker or used as a cache key, and "last writer wins" at
+publish hid a decision that nothing could show (R10). So a snapshot is a
+map from tables to versions, as Iceberg's snapshots and Delta's table
+versions are, and publishing checks the versions, as Iceberg's optimistic
+commits and Delta's conflict checks do. Each version carries the table's
+UUID, as Iceberg pairs a table's UUID with its snapshot ids, so that a
+table dropped and created again under the same name never repeats a
+version.
+
+The review of `Program` at `56be21c`
+([comment](https://github.com/xqlsystems/datafusion-accelerated/pull/40#issuecomment-6903589670))
+found that the limit `56be21c` documented, a compiled program not
+noticing a table registered again, gave a silent wrong answer: after
+`lookup` was registered again with `v = 2`, SQL read 2 and the program 1,
+and after `DROP TABLE lookup` the program still read 1. A plan holds the
+provider it was planned with, so nothing in DataFusion fails. The rule
+since is to fail where an answer could be silently wrong, not to document
+it: each run checks the names it reads against the session's catalog, at
+one lookup per table per run. The same review placed the conflict check
+as snapshot isolation, Delta Lake's default `WriteSerializable` level
+([Delta isolation levels](https://docs.databricks.com/en/optimizations/isolation-level.html)),
+and showed that a snapshot of every runtime table changed when an
+unrelated table was replaced, so a cache keyed on it would miss; a run's
+snapshot now lists only what the program reads.
+
+A parameter is rewritten into a scalar subquery of the parameters' table
+(S3.2), which isn't a literal everywhere. The same review tried 10
+positions against the same SQL with a literal: `VALUES (0, $k)` planned
+and then failed on every run with DataFusion 55.2.0's internal error
+`ScalarSubqueryExpr evaluated before the subquery was executed`, which
+plain DataFusion gives for `VALUES (0, (SELECT 1))` too (#48); `LIMIT`,
+`OFFSET` and `generate_series(0, $k)` failed to plan; `IN`, `JOIN ... ON`,
+`CASE`, `HAVING` and `FILTER` gave the literal's rows. So `lower` refuses
+the positions planning needs. Rewriting DataFusion's `Expr::Placeholder`
+in a `LogicalPlan`, once steps can be plans (#49), would serve every
+frontend with one rewrite.
+
 ### S3.4 Step boundaries and shared subplans
 
 ddx already draws its programs' step boundaries, for four reasons (S1.4).
@@ -645,7 +739,8 @@ Three costs on the other side are known:
   core would link DataFusion and einfold directly.
 - ddxdb's compiled path from Python (`in_place`) needs an xqlsystems fork
   of datafusion-python today, which the design's R2 rules out until the
-  change is upstream.
+  change is upstream. The runtime's own compiled path doesn't: spike 4a
+  found it can hold and rerun plans in Rust (S4.5).
 - Atomic state in Python needs an engine table that reads a handle's
   current buffer (S3.3).
 
@@ -718,6 +813,78 @@ tests, as torch-sql's suite does by running every op on both engines. The
 alternative, a single reference engine for all programs, would make every
 run on the other engine a comparison, and the reference would still have
 bugs of its own, such as DataFusion's `MAX` skipping NaN.
+
+### S4.5 Compiled plans from Python
+
+A compiled step runs its physical plan again on each run. From Python, that
+seemed to need `ExecutionPlan.reset_state`, which only the xqlsystems fork
+of datafusion-python has (S4.1). Spike 4a tested whether the runtime could
+hold the plan itself instead
+([report](spikes/s04a-python-compiled-plans/README.md)). It ran on
+datafusion-python 55.0.0 from PyPI, which is built on DataFusion 55.1.0,
+with the spike built on DataFusion 55.2.0, on an Intel i7-8700. The step
+was a layer norm and causal self-attention from demo 2, at 2 sequences of
+16 positions and 32 channels.
+
+**The planner works, and the rule doesn't.** datafusion-python offers an
+extension two places to see a physical plan:
+- **A query planner, installed by `with_extensions`**, which wraps the
+  session's own. The logical plan crosses into the runtime's library as
+  bytes, and the physical plan comes back as bytes, so the runtime decodes
+  a plan made of its own operators. It keeps that copy, resets it with
+  DataFusion's `reset_plan_states`, and runs it on its own Tokio runtime.
+  Every compiled run matched datafusion-python's result, including after
+  the batch changed its rows and its size, and no run called the planner.
+- **A physical optimizer rule**, added with `add_physical_optimizer_rule`,
+  which sees the plan as proxies into datafusion-python's library. A rule
+  can keep that plan, but running it later aborted the process: the
+  library's operators spawn tasks on its own Tokio runtime, and
+  datafusion-ffi's `ForeignPhysicalOptimizerRule` exports the plan with no
+  runtime handle (`FFI_ExecutionPlan::new(plan, None)` in datafusion-ffi
+  55.2).
+
+**Every table must cross the planner.** To reach a foreign planner,
+datafusion-python serializes the logical plan, and a table registered from
+Python's memory has no serialization. With the planner installed and
+nothing else, every query over such a table failed, compiled or not. The
+runtime's codec fixes that by carrying such a table by an id, valid within
+the process. On the way back, DataFusion's own serialization carried the
+in-memory tables' scans with their rows, so a compiled plan keeps the rows
+those tables held when it was compiled. State must be a runtime table,
+read at execution (design D16), for a compiled plan to see new values.
+
+**Statistics decide the joins, and exact ones give wrong answers.** A
+table that reports no statistics gets partitioned hash joins: all 30 of the
+step's joins, with 54 hash repartitions, against 30 `CollectLeft` joins
+over datafusion-python's in-memory tables. A runtime table that reports its
+row count gets the same joins as the in-memory ones. But a compiled
+`COUNT(*)` over a table with exact statistics returned the row count of
+compile time after the table grew, since DataFusion answers it from the
+statistics alone. Inexact statistics gave the right count.
+
+**What it cost**, as medians of 100 runs:
+
+| path | ms per run |
+|---|---|
+| compiled through the runtime, runtime tables with inexact statistics | 21.5 |
+| compiled through the runtime, the weights carried by reference | 18.9 |
+| compiled through the runtime, runtime tables without statistics | 37.4 |
+| planned and run each time, datafusion-python alone | 41.0 to 48.9 |
+| planning only, datafusion-python alone | 25.8 to 28.8 |
+| planning only, through the runtime's planner | 114 to 131 |
+
+Planning was more than half of each uncompiled run, partly because
+DataFusion plans a CTE again at every read (S1.3): the plan holds 5
+`power`s where the SQL writes one. Planning through the runtime's planner
+costs four to five times as much, since each plan crosses the FFI four
+times, twice as a logical plan and twice as a physical one. Compiling pays it once.
+
+Two costs remain inside a compiled plan. Its scalar functions are proxies
+that call back into datafusion-python: the same plan in a session of the
+runtime's own, with no FFI, ran in 33.0 ms against 40 to 45 ms. And a task
+context built across the FFI carries a `RuntimeEnv` of the runtime's
+library, not the session's, so reservations the runtime makes aren't
+counted in the session's memory pool.
 
 ---
 
@@ -1023,6 +1190,7 @@ question 11).
 | Attaching | `SessionStateBuilder`; `with_extensions` | `.with_accelerator`; `Accelerator` |
 | Hardware and libraries | none | integrations, each its own crate or package: `.with_accelerated_cuda()`, `Cuda()` |
 | Settings | `SessionConfig` namespaces | `accelerated.*` |
+| Per-session state | `SessionConfig`'s typed extensions | `Accelerator`: handles, programs |
 | Memory tiers | `RuntimeEnv`: `MemoryPool`, `DiskManager` | device pools, beside DataFusion's |
 | Tables | table providers | runtime tables, readable as rows or compact arrays |
 | Device placement | `PhysicalOptimizerRule`s | the runtime's rule, after einfold's |
@@ -1035,6 +1203,22 @@ question 11).
 | Programs and state | none | `Program`, `lower`, `compile`, `run` |
 
 The last row is the runtime's own layer, and the only one.
+
+A session's state can't live in its `RuntimeEnv`. In DataFusion 55.2,
+`RuntimeEnv` has fixed fields, a memory pool, a disk manager, a cache
+manager and an object store registry, and no place for an extension.
+`SessionConfig` has one: a map of objects keyed by their Rust type
+(`with_extension`, `get_extension`), which DataFusion documents for
+extensions' own state, such as caches. Each `TaskContext` carries the
+session's config, and the map holds its objects by `Arc`, so every query
+of the session shares one runtime. Device memory still goes in
+`RuntimeEnv`, as memory pools.
+
+From Python, the session belongs to datafusion-python's library, and the
+runtime can't reach its map: datafusion-ffi's `FFI_SessionConfig` carries
+a session's settings across the FFI, not its typed extensions. There, the session's state is held
+by the `Accelerator` extension object and the planner it installs, as in
+spike 4a (S4.5).
 
 ### S6.4 datafusion-distributed as the precedent
 
@@ -1343,7 +1527,18 @@ switch, there are no in-switch reductions; rings and trees do instead.
    ([#21](https://github.com/xqlsystems/datafusion-accelerated/issues/21)).
 3. **Tiers were named by Arrow device types**, and a TPU has none. They are
    now named by device family, and a TPU's tables cross into DataFusion only
-   through the host.
+   through the host. In code, a tier carries a device type and a device
+   id, as Arrow's `ArrowDeviceArray` does, and the device type is open, so a
+   TPU's integration names its family in its own crate. A closed enum of
+   families would have needed a core release naming each vendor (R13), as
+   the second adversarial review of #40 pointed out
+   ([comment](https://github.com/xqlsystems/datafusion-accelerated/pull/40#issuecomment-6900007496)).
+   A first version left negative codes to integrations. The third round
+   ([comment](https://github.com/xqlsystems/datafusion-accelerated/pull/40#issuecomment-6901455576))
+   showed that two integrations could pick the same one, and that no
+   `ArrowDeviceArray` consumer could read it: Arrow's codes follow
+   DLPack's, and Arrow reserves only `ARROW_DEVICE_EXT_DEV` for devices it
+   doesn't list. So a family Arrow doesn't list is named, by its crate.
 4. **The topology was a list of tiers.** It is now a graph, covering
    switched domains, full meshes and tori, taken from each platform's own
    discovery, with placement as an embedding of the partition grid into it

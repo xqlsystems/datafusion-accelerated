@@ -9,8 +9,8 @@ SPDX-License-Identifier: Apache-2.0
 _author_: Alex Merose
 _co-authors_: ⚡ Claude (datafusion-accelerated), formerly 🔥 Claude (torch-sql), and 🌀 Claude (xarray-sql), via Claude Code
 _reviewers_: 🪭 Claude (einfold) and ∂ Claude (ddx). Their reviews of v1.1 are in [reviews/](reviews/).
-_status_: Draft v1.9, for approval. Nothing is built. Collapsed sections (▸) hold background and detail.
-_last updated_: 2026-11-07
+_status_: v1.10. M0 is being built. Collapsed sections (▸) hold background and detail.
+_last updated_: 2026-11-15
 _supplement_: [supplement.md](supplement.md), with the evidence, the alternatives considered and the reasoning behind each rule. Citations such as "(S1.1)" point there. S6 compares the design with JAX, PyTorch and DataFusion, and S7 covers distributed training.
 _origin_: [xarray-sql#307](https://github.com/xqlsystems/xarray-sql/issues/307)
 
@@ -466,12 +466,37 @@ Rules:
 - **Settings live in the `accelerated` namespace** of `SessionConfig`, so
   SQL can set them: `SET accelerated.strict = true`,
   `SET accelerated.checking.sample = 0.01`.
-- **The runtime's state lives in DataFusion's.** Its device memory and
-  device handles are in the session's `RuntimeEnv` (§5.2), and its nodes
-  find them through the `TaskContext` DataFusion gives each running node.
+- **The runtime's state lives in DataFusion's.** Its device memory is in
+  the session's `RuntimeEnv`, as memory pools (§5.2). Its other state for
+  the session, such as table handles and compiled programs, is a typed
+  extension of the session's `SessionConfig`. Its nodes find both through
+  the `TaskContext` DataFusion gives each running node (S6.3).
+- **Each extension's trait is named after it**, as datafusion-distributed's
+  `DistributedExt` is, so that two extensions' traits never collide. The
+  runtime's is `AcceleratorExt`, and it is implemented for `SessionConfig`,
+  `SessionStateBuilder` and `SessionState`, the types a session is
+  assembled from. Attached to a `SessionConfig`, the runtime survives a
+  later `with_config()` on the builder.
 - **Frontends may assemble the session.** xarray-sql's context adds
   whichever XQL extensions are installed, so that, with ddxdb installed,
   its SQL understands `grad` with no other step.
+- **From Python, the runtime attaches as a query planner**, the one
+  `with_extensions` installs, never as a physical optimizer rule. The
+  planner wraps the session's own and keeps a copy of each plan in Rust,
+  which the runtime resets and runs itself, so Python never holds a plan
+  that must run again. A rule can't serve: the plan it sees belongs to
+  datafusion-python's library, whose operators need a Tokio runtime the
+  FFI doesn't pass on (spike 4a, S4.5).
+- **The runtime's codec carries what it can't serialize by reference.**
+  datafusion-python serializes the logical plan to reach the runtime's
+  planner, so a table it can't serialize, such as one registered from
+  Python's memory, would fail every query in the session. Within one
+  process, the codec carries it by an id instead, owned by the plans that
+  hold it (S4.5).
+- **From Python, settings come in through `SessionConfig.with_extension`**,
+  before the session is built, since `with_extensions` installs only codecs
+  and planners:
+  `SessionContext(SessionConfig().with_extension(AcceleratedConfig())).with_extensions(Accelerator())`.
 - **Workers are sessions too.** Under datafusion-distributed, each worker
   builds its session with the same extensions (§10.5).
 
@@ -481,7 +506,14 @@ The runtime extends `RuntimeEnv`'s memory hierarchy. DataFusion already has
 two tiers: host memory, through its `MemoryPool`, and disk, through its
 `DiskManager`. The runtime adds the device tiers. Tiers are named by device family:
 by Arrow's device type where one exists (§2.1), by a name the device
-integration defines where none does, and `storage` for files
+integration defines where none does, and `storage` for files. A device
+tier also carries its device's id, as the Arrow C Device Data Interface's
+`ArrowDeviceArray` does. The device type is open, so an integration in
+its own crate (§5.8) names its devices without a change to the core
+(R13): it is Arrow's code where Arrow has one, and otherwise a name
+namespaced by the integration's crate, such as `pjrt.tpu`. A named family
+has no Arrow code, so exporting it in an `ArrowDeviceArray` maps it to
+`ARROW_DEVICE_EXT_DEV` or refuses, explicitly
 ([#20](https://github.com/xqlsystems/datafusion-accelerated/issues/20)).
 
 | Tier | Device type | Accounting |
@@ -503,13 +535,22 @@ Rules:
   Arrow nor DLPack has a TPU device type, so device data on a TPU stays
   behind PJRT's handles.
 - **A table handle** refers to a table the runtime owns, as a buffer handle
-  refers to an allocation. It carries the table's schema, its lifetime (one
-  run, or until the caller releases it), and one or more *instances*. Each
-  instance has a tier; a layout, either Arrow rows or a compact array; and
+  refers to an allocation. It carries the table's schema and one or more
+  *instances*. Its rows live while the session's catalog, a plan or a
+  handle holds it, so `DROP TABLE` frees them once no plan or handle does.
+  A handle whose session no longer has it under its name, after
+  `DROP TABLE` or `CREATE OR REPLACE TABLE`, can't be replaced
+  (`Error::Detached`), and SQL's `INSERT`, `DELETE`, `UPDATE` and
+  `TRUNCATE` on it fail with `Error::SqlWrite`, which names what to use
+  instead. Each instance has a tier; a layout, either Arrow rows or a compact array; and
   an owner, either DataFusion (as one of its tables) or the runtime.
 - **Runtime tables are DataFusion table providers**, read as Arrow batches
   by DataFusion's operators, and as compact arrays by device nodes that
   scan them directly (§5.3).
+- **The session's catalog is the only map from names to runtime tables.**
+  Each is a provider in the session's default schema, so its name is
+  normalized as SQL normalizes names, and `DROP TABLE`, `SHOW TABLES` and
+  `information_schema` treat it as any other table (S3.3).
 - **A table's layout is chosen by what it would store** (S2.7). A
   compact array stores every cell of its block, so an absent cell costs
   its storage and its arithmetic, as a masked value. Only rows make
@@ -542,6 +583,34 @@ Rules:
 - **A table that holds state reads the handle's current buffer** each time
   its plan runs, so that publishing new state never forces a plan to be
   planned again (S3.3).
+- **Each run reads one snapshot of the runtime's tables** (D20). A run is
+  explicit: `Accelerator::begin_run`, or `Program::run`, begins one and
+  pins the current version of every handle, and the run's plans read
+  those versions to its end, whatever is replaced or dropped meanwhile.
+  The run's id travels in the `accelerated.run` setting, which crosses
+  datafusion-ffi as settings do. The setting is internal: set by hand, it
+  makes the session's queries read that run's snapshot while the run
+  lasts, and fail after it until it is set back to `0`. An id names a
+  snapshot only in the process that began the run, so on a
+  datafusion-distributed worker it fails with `RunEnded` until snapshots
+  are named by table versions (the `Program` sketch on #40).
+  `Run::execute_stream` returns a stream that holds the run, so a
+  function can return the stream of a run it began. The scan reads the id in whichever form the settings arrive: as
+  the runtime's own `AcceleratedConfig`, or as datafusion-ffi's
+  `FFI_ExtensionOptions` when datafusion-python executes the plan. A value
+  it can't read is an error, never "no run". A plan executed outside a run
+  reads each table's current rows when its scan starts. A plan given the
+  id of a run that has ended fails, never reads other rows. A table
+  created after a run began isn't in its snapshot, and reading it in that
+  run is an error, since its rows and the snapshot's are from different
+  moments. A run pins every table, not only those it reads,
+  so a table replaced during a long run keeps its old version in memory
+  until the run ends (S3.3).
+- **Runtime tables report statistics, and never exact ones.** Without row
+  counts, DataFusion plans every join partitioned, with a repartition on
+  each side. But a compiled plan outlives the rows it was planned on, and
+  DataFusion answers some queries, such as `COUNT(*)`, from exact
+  statistics without reading a row (spike 4a, S4.5).
 
 ### 5.3 Device plans
 
@@ -606,14 +675,24 @@ A program is *lowered*, then *compiled*, as a JAX function is (S6.1):
   and edited (§5.6).
 - **`compile`** fixes implementations and placements, runs the checks that
   need running only once, and returns a compiled program.
-- **`run`** runs it with new inputs and parameters. A run is asynchronous:
-  `run` returns at once with a future for its outputs. Runs of one
+- **`run`** runs it with new inputs and parameters. A run is asynchronous.
+  In Python, `run` returns at once with a future for its outputs. In
+  Rust, `run` is an `async fn`, which starts when it's first polled, so a
+  caller that wants other work done meanwhile spawns it. Runs of one
   compiled program execute in order.
 
 A compiled program is reused only while the session's *session key* is
 unchanged. ddx's `Backend` reports that key, which changes whenever the
 session's tables or settings change, and ddx's `prepare`, which plans a
-derivative once for many runs, follows the same rule.
+derivative once for many runs, follows the same rule. Until the ddx
+integration brings the key, each run checks that the session still gives
+every name the steps read, and each state table's name, the table `lower`
+found, and fails with `Error::Stale` if not, since a plan holds the table
+it was planned with and would otherwise give a wrong answer silently. It
+checks the state tables it writes again just before it publishes, so a
+table dropped during the run isn't published into. The session's catalog
+isn't under the store's lock, so a drop between that check and the
+publish still goes unseen.
 
 Rules:
 - **A training step can be one statement.** With the ddx integration in
@@ -627,6 +706,65 @@ Rules:
   reads, and a statement named after a state table computes that table's
   next value. Outputs name a statement or a label (§5.5). In Rust,
   `Program::from_steps(&ctx, [("grads", GRADS_SQL), ("w", UPDATE_SQL)])`.
+- **A step's meaning is functional** (D21). Every step is a `SELECT`. A
+  state table read anywhere in the program means its value when the run
+  began, and the step named after it computes its next value, as a loop's
+  carry does in JAX. No step sees another's result unless it reads it, so
+  no step can read the step named after a state table: a value computed
+  from the next state is the next run's to compute. The reference for the
+  cross-engine check (R1) is the steps' `SELECT`s run on plain tables in
+  the order their reads give, then assigned.
+- **A program's names are its own, and never hide the session's.** Steps
+  are planned against the session's catalog with the program's inputs,
+  state tables, parameters and earlier steps in front of it. `lower`
+  refuses two of the program's names that are the same, and a step or an
+  input named like a session table, naming both (`Error::NameClash`, with
+  each `NameKind`). A step read by a name qualified with the default
+  catalog or schema is still a read of that step. A new state table is
+  registered in the session when `lower` succeeds, so SQL reads it between
+  runs; its name must be free. `state_from(name)` instead takes a table
+  the runtime already owns, such as one an earlier program trained, so
+  training continues after a step is edited. A new state table's schema is
+  its first batch's, or is given with `state_with_schema` when it starts
+  empty.
+- **A state step's result fits its table by names and types.** A field may
+  be nullable in the step's result and not in the table, since a
+  parameter or an outer join makes a field nullable that never holds a
+  null. Each run then checks for nulls (`Error::NullInState`). Any other
+  difference fails at `lower` (`Error::StateSchema`), naming the field.
+  Every error from planning a step names the step.
+- **State is published all at once, and a conflict is an error** (D21, R5,
+  R10). A run's snapshot is a map from tables to versions, shown as
+  `w@4, x@1`. Each version pairs the table's identity, a UUID given when it
+  is created, with a counter that goes up by one with each replace or
+  publish. When every step has succeeded, the run publishes every state
+  table's next value under one lock, if each is still at the version the
+  run read. If another caller replaced one meanwhile, nothing is published
+  and the run fails with `Error::Conflict`, unless it was run with
+  `OnConflict::Overwrite`, which publishes and records what it
+  overwrote. A failed step publishes nothing. The counter's rules:
+  - a published version is one more than the table's current version,
+    under `Overwrite` too, so two states never share a version;
+  - a conflict or a failed step adds no version;
+  - a publish adds a version even if the rows are unchanged, since a
+    version counts publishes, not contents;
+  - a run checks only the tables it writes, so two runs that write
+    different state tables don't conflict.
+- **A run has snapshot isolation, as Delta Lake's default level,
+  `WriteSerializable`, does** (D21). A run reads one snapshot and
+  publishes with a check on the tables it writes, not the tables it reads.
+  So two runs can each read a table the other writes and both publish
+  ("write skew"): a run that reads the session table `stats` and writes
+  `w` doesn't conflict when `stats` is replaced during it. "All old or all
+  new" holds for each publish, not across publishes. A level that also
+  checks reads, as Delta's `Serializable` does, waits for a user who needs
+  it.
+- **A run's snapshot lists what the program reads**: its state tables and
+  the runtime tables its steps' plans scan, through a view too, by
+  version, sorted by name and then
+  identity (`RunOutputs::snapshot`). Replacing a table the program doesn't
+  read doesn't change it, so it serves as a key for checkpoints and
+  caches.
 - **Programs compose.** A program may also be ddx's program followed by
   update steps that read its gradient tables, written as statements by
   name. The runtime takes both as one program.
@@ -638,7 +776,19 @@ Rules:
   that run (§6.3, S3.1).
 - **Parameters are written as DataFusion's placeholders**, such as `$lr`.
   Where a placeholder can't reach ddx through Substrait, the runtime turns
-  it into a one-row table that the plans cross join (S3.2).
+  it into a one-row table that the plans cross join (S3.2). A parameter
+  may go wherever a value is read per row or per query: `SELECT`,
+  `WHERE`, `JOIN ... ON`, `GROUP BY`, `HAVING`, `ORDER BY`, `CASE`, `IN`
+  and an aggregate's `FILTER`. Where planning needs its value, `lower`
+  fails with `Error::ParameterPosition` (#48). It finds `VALUES`, `LIMIT`,
+  `OFFSET`, `FETCH` and a table function's arguments in the SQL, since
+  `VALUES` would otherwise fail on every run. Elsewhere, such as a window
+  frame's bounds or a function that needs a literal argument, a step that
+  fails to plan but plans with each parameter as its initial value fails
+  the same way, so no list has to be complete. A run's value is
+  for that run only, and must be of the parameter's type, or a number
+  that casts to it and back unchanged (`Error::ParameterType`); a value
+  given twice is an error (`Error::GivenTwice`).
 
 ### 5.5 Labels
 
@@ -788,23 +938,36 @@ pub trait Kernel: Send + Sync {
 ```rust
 #[cutile::module]
 mod kernels {
-    use cutile::core::*;
+    use cutile::core::Tensor;
+
     #[cutile::entry()]
     fn scale<const B: i32>(out: &mut Tensor<f32, { [B] }>, x: &Tensor<f32, { [-1] }>, a: f32) {
-        let tx = x.load_like(out);
-        out.store(tx * a);
+        let tile = x.load_like(out);
+        out.store(tile * a);
     }
 }
 
 struct Scale;
+
 #[async_trait]
 impl Kernel for Scale {
-    async fn prepare(&self, sig: &Signature) -> Result<()> {
-        // cuTile's .compile() on placeholder tensors of sig's shapes
+    async fn prepare(&self, signature: &Signature) -> Result<()> {
+        // cuTile's .compile() on placeholder tensors of the signature's shapes
     }
+
     async fn launch(&self, args: KernelArgs<'_>) -> Result<()> {
         // The glue: borrow the runtime's stream and buffers. cuTile keeps each owner alive.
-        let stream = unsafe { Stream::borrow_with_owner(args.stream().raw(), &args.context().borrow(), args.stream().owner()) };
+        // SAFETY: the stream and its context belong to the runtime, which keeps them
+        // alive until the launch's work completes; `owner()` ties their lifetime to it.
+        let stream = unsafe {
+            Stream::borrow_with_owner(
+                args.stream().raw(),
+                &args.context().borrow(),
+                args.stream().owner(),
+            )
+        };
+        // SAFETY: the runtime allocated these buffers for this launch, with the shapes
+        // `prepare` saw, and no other launch writes them until this one completes.
         let x = unsafe { Tensor::<f32>::from_foreign(Borrowed::new(args.input("x")?), ..) };
         let mut out = unsafe { Tensor::<f32>::from_foreign(Borrowed::new(args.output()?), ..) };
         kernels::scale((&mut out).partition([128]), &x, 2.0).sync_on(&stream)?;
@@ -1204,14 +1367,14 @@ ctx.sql("SET accelerated.strict = true")            # declines are errors (R8)
 ctx.register_table("features", features)
 ctx.register_table("target", target)
 
-STEP = """
-WITH pred AS (SELECT x.cell, ddx_name(SUM(x.v * w.v), 'predict') AS v
-              FROM features x JOIN w ON x.k = w.k GROUP BY x.cell),
-     loss AS (SELECT AVG((p.v - y.v) * (p.v - y.v)) AS l
-              FROM pred p JOIN target y USING (cell))
-SELECT k, v - $lr * grad(loss, v) AS v FROM w
-"""
-lowered = Program(ctx, STEP, state={"w": w0}, outputs=["loss"]).lower()
+STEPS = {
+    "pred": """SELECT x.cell, ddx_name(SUM(x.v * w.v), 'predict') AS v
+               FROM features x JOIN w ON x.k = w.k GROUP BY x.cell""",
+    "loss": """SELECT AVG((p.v - y.v) * (p.v - y.v)) AS l
+               FROM pred p JOIN target y USING (cell)""",
+    "w": "SELECT k, v - $lr * grad(loss, v) AS v FROM w",
+}
+lowered = Program(ctx, STEPS, state={"w": w0}, params={"lr": 1e-2}, outputs=["loss"]).lower()
 print(lowered.explain())                            # device plans, copies, who chose what
 
 schedule = lowered.schedule()                       # read, edit (§5.6)
@@ -1237,19 +1400,30 @@ let ctx = SessionContext::new_with_state(
         .with_accelerated_cuda()
         .build(),
 );
-let lowered = Program::new(&ctx, STEP).state("w", w0).output("loss").lower().await?;
+let lowered = Program::from_steps(&ctx, STEPS)
+    .state("w", w0)
+    .param("lr", ScalarValue::from(1e-2))
+    .output("loss")
+    .lower()
+    .await?;
 println!("{}", lowered.explain());
-let compiled = lowered.compile().await?;
+let compiled = lowered.compile()?;
 for i in 0..1_000 {
-    compiled.run(params! { "lr" => 1e-2 * 0.999f64.powi(i) }).await?;
+    let lr = ScalarValue::from(1e-2 * 0.999f64.powi(i));
+    let outputs = compiled.run(RunArgs::new().param("lr", lr)).await?;
+    if i == 999 {
+        println!("{}", f64::try_from(outputs.scalar("loss")?)?);
+    }
 }
 ```
 
 </details>
 
-- **torch-sql** gives ddx the runtime as its `Backend` at M0, with no other
-  change. From M1, a synced `device="sql"` tensor holds a table handle, and
-  a whole training step is one program.
+- **torch-sql** gives ddx the runtime as its `Backend` at M0. torch-sql
+  accepts any `ddxdb.Backend` its caller passes, so neither project
+  depends on the other: both depend on ddxdb's public protocol (D17).
+  From M1, a synced `device="sql"` tensor holds a table handle, and a
+  whole training step is one program.
 - **xarray-sql** adds the installed XQL extensions to its context (§5.1),
   so that its SQL understands `grad` when ddxdb is installed, and its
   Datasets can be state.
@@ -1437,7 +1611,12 @@ exchange uses, and a developer may override either (§5.6).
 
 More rules:
 - **Workers are sessions too**, built with the same extensions, devices
-  and kernels as the coordinating session (§5.1). The runtime's codec
+  and kernels as the coordinating session (§5.1). The coordinator and each
+  worker register `AcceleratedConfig` with datafusion-distributed's
+  `with_distributed_option_extension` after `with_accelerator`, since both
+  insert it and the later call's copy wins. That is how settings reach
+  the workers. A run's id (`accelerated.run`, §5.2) reaches them too, but
+  names a snapshot only on the coordinator. The runtime's codec
   ships a `KernelExec` as its kernel's name and tuning parameters, and the
   worker finds the kernel in its own session.
 - **A distributed device plan** holds datafusion-distributed's network
@@ -1487,7 +1666,9 @@ ctx.sql("""CREATE EXTERNAL TABLE ocean STORED AS ZARR LOCATION 'om4.zarr'
 ctx.sql("""CREATE EXTERNAL TABLE w STORED AS ACCELERATED
            OPTIONS ('accelerated.distribution' 'blocks(k)')""")              # sharded state
 
-compiled = Program(ctx, STEP, state={"w": w0}, outputs=["loss"]).lower().compile()
+compiled = Program(                             # STEPS as in §10.1
+    ctx, STEPS, state={"w": w0}, params={"lr": 1e-3}, outputs=["loss"]
+).lower().compile()
 print(compiled.explain())                      # the exchanges the planner added, and their links
 for i in range(10_000):
     compiled.run(lr=1e-3 * 0.999**i)
@@ -1524,7 +1705,7 @@ In short:
 
 | Code | Goes to |
 |---|---|
-| `SharedExecutor`'s caching of CTEs (xarray-sql#302) | ddx's SQL path (ddx#168) for gradients, and DataFusion's planned-once CTEs for forward queries; the executor retires |
+| `SharedExecutor`'s caching of CTEs (xarray-sql#302) | ddx's SQL path (ddx#168) for gradients. For forward queries, DataFusion's `WITH … AS MATERIALIZED` once it lands, and shared views stored as tables until then, since DataFusion 55 computes a CTE once per read (xarray-sql#267); the executor retires |
 | `DenseExecutor` (xarray-sql#303) | the runtime's device plans over compact arrays (§5.3); the executor retires |
 | MLX kernels and `DenseExecutor`'s MLX operators | the Metal integration's MLX array backend (§5.8), never the core |
 | `TrainingSession` (xarray-sql#305) | the runtime's programs (§5.4), with state kept on the device and published after validation (R5); the session retires |
@@ -1574,6 +1755,13 @@ Rules:
   `xarray-sql[accelerated]`.
 - **Linux on ARM wheels from the first release**, for the Beta cluster's
   Grace CPUs.
+- **Rust follows [Google's Rust style guide](https://google.github.io/styleguide/rustguide.html)**
+  (D19), as ddx's does. `rustfmt.toml` holds its formatting settings, and
+  the workspace's lints the rules clippy can check, such as no `unwrap`
+  outside tests, `#[must_use]` builders, no glob imports and
+  `#[non_exhaustive]` public enums. Review checks the rest, such as each
+  file named after its main item, and a `SAFETY:` comment on every
+  `unsafe` block, the design's samples included.
 
 ### 12.2 Milestones
 
@@ -1588,7 +1776,8 @@ on the cloud or on the Beta cluster, are available half a day a week.
 - *Builds:* `.with_accelerator()` and the `Accelerator` extension object,
   the `accelerated` settings, table handles and providers, `Program` with
   `lower`, `compile` and `run`, the ddx integration, implementing
-  `ddx_ad::Backend` with compiled plans and tables kept in place, the
+  `ddx_ad::Backend` with compiled plans and tables kept in place, tables
+  that read a handle's current buffer (§5.2), the
   counters of R8 as metrics, and the schedule and `explain()` in their
   first form, even while every step runs on DataFusion. They are cheap to
   build first and expensive to add later.
@@ -1598,8 +1787,9 @@ on the cloud or on the Beta cluster, are available half a day a week.
   fails compilation with a reason.
 
 **M1. Resident state.**
-- *Builds:* persistent tables, atomic publication, tables that read a
-  handle's current buffer (§5.2), device memory pools in `RuntimeEnv`,
+- *Builds:* persistent tables, atomic publication, device memory pools in
+  `RuntimeEnv`, the runtime's host tables counted in the session's
+  `MemoryPool`,
   `CopyExec`, the moves `prefetch`, `evict` and `pin`, and asynchronous
   runs.
 - *Done when:* torch-sql's nanoGPT training step is one compiled program,
@@ -1691,6 +1881,7 @@ are the first work for the GPU half days, since they wait on no decision.
 | 2 | Do rows between operators cost a GPU SQL engine what they cost GPU kernels? | One of demo 2's steps on Sirius | Whether a GPU engine is an alternative to B |
 | 3 | Can a B200 read Arrow buffers in place from Grace memory fast enough? | Read against copy, on the Beta cluster | Whether Grace memory is a tier worth spilling to (§7) |
 | 4 | What does crossing from Python cost? | datafusion-ffi's overhead for the runtime's nodes (S4.1); launching a Triton kernel from a `KernelExec` through Python, and whether the call holds Python's lock | Which Python kernels are worth binding, and whether some must be compiled ahead of time |
+| 4a | Can the runtime's Rust core plan, compile and run steps again against a datafusion-python session, without the xqlsystems fork of datafusion-python? | From Python, attach the runtime with `with_extensions`, plan a step, run it twice with new rows in its input, and record what crosses datafusion-ffi, on datafusion-python 55.0.0 against the core's pinned DataFusion | Whether M0's Python side runs compiled plans, or plans every step on every run until `ExecutionPlan.reset_state` is upstream. **Done:** compiled plans run on the released datafusion-python, through the planner `with_extensions` installs, with no fork and no upstream change, under four rules now in §5.1 and §5.2 ([report](spikes/s04a-python-compiled-plans/README.md)) |
 | 5 | Where does the remaining gap to PyTorch go, in time and in memory? | Start from the contributor's own ablations, which divide the step by kind of work (S1.1). Then trace one warm resident step on the M5 Ultra against PyTorch on MPS, for what they don't cover, peak memory included | What M2, M5 and M6 should fix first |
 | 6 | How much of each step does einfold already cover? | `EXPLAIN ANALYZE` with einfold on, for demo 2, demo 4 and torch-sql's nanoGPT: the share of time inside einfold's nodes, and how often a DataFusion operator sits between two of them (S2.5). The contributor's `DenseProgram` corpus and spike 5's ablations are its inputs. einfold's agent runs einfold's side | How far short B-0 stops, and so what M5 must recover (§6.2) |
 | 7 | Can handle batches carry device data between DataFusion nodes? | Two `KernelExec`s in one plan passing handle batches, through repartitioning and the planner's other rewrites, with a `CopyExec` where rows are needed | Whether §5.3's device plans work as written, or device work must stay inside single nodes. **Done:** they work, under three rules now in §5.3 ([report](spikes/s07-handle-batches/README.md)) |
@@ -1760,6 +1951,15 @@ are the first work for the GPU half days, since they wait on no decision.
     from whole compiled steps and values shared across steps (§6.2). The
     alternative is to hold the GPU milestone until B-1 lands. Alex decides
     ([#32](https://github.com/xqlsystems/datafusion-accelerated/issues/32)).
+15. **Handles' edges as Arrow streams.** Whether a handle's `replace`
+    takes, and its `read` returns, a stream rather than batches already in
+    host memory: a `RecordBatchReader` in Rust, `ArrowArrayStream` or
+    `ArrowDeviceArrayStream` across C, and the Arrow PyCapsule protocol's
+    `__arrow_c_stream__` in Python. Device tiers would then keep the same
+    signature, and other engines could read a handle directly. Raised in
+    the adversarial review of M0
+    ([#40](https://github.com/xqlsystems/datafusion-accelerated/pull/40#issuecomment-6887915671)),
+    to settle before M1.
 
 ---
 
@@ -1805,24 +2005,65 @@ are the first work for the GPU half days, since they wait on no decision.
   integration, with CUDA, ROCm, Metal, TPUs or a library such as libcudf,
   is a separate crate or package, mixed in as its own extension, so the
   core's goal outlives any of them (R13, §5.8).
+- **D14** (Alex, 2026-11-09, with the technical lead and the doc's primary
+  author). M0 starts. The proposals M0 rests on are decided, as choices
+  that can be revised: P-B (programs, lowered and compiled), P-D (ddx and
+  einfold through integrations), P-J (the engine a program runs on is the
+  reference), P-M (the schedule, with binding overrides) and P-R (one way
+  to attach).
+- **D15** (Alex, 2026-11-09). The core pins DataFusion 55, the newest
+  release datafusion-python supports.
+- **D16** (Alex, 2026-11-09). Tables that read a handle's current buffer
+  move from M1 to M0, since M0's compiled plans need them to read new
+  state without being planned again.
+- **D17** (Alex, 2026-11-09). torch-sql and the runtime don't depend on
+  each other. torch-sql accepts a `ddxdb.Backend` from its caller, and the
+  runtime runs torch-sql's suite as a test dependency. M0's exit runs that
+  suite on DataFusion through the runtime, and on DuckDB unchanged as the
+  reference. Demos 2 and 4's SQL become this repository's test fixtures.
+- **D18** (Alex, 2026-11-09). Spike 4a runs first, to settle whether M0's
+  Python side can run compiled plans without a fork. If it needs
+  `ExecutionPlan.reset_state`, Alex proposes it to datafusion-python.
+  Spike 4a found it doesn't (§12.3).
+- **D19** (Alex, 2026-11-14). The runtime's Rust follows Google's Rust
+  style guide, as ddx's does (§12.1).
+- **D20** (Alex, 2026-11-14, delegated to ⚡ Claude to decide from what
+  users expect). A run reads one snapshot of the runtime's tables, even
+  when another thread replaces one during it (§5.2). Amended the same day
+  after the adversarial review of #40: a run is explicit, and identified
+  by the `accelerated.run` setting, not by its `TaskContext`. Amended on
+  2026-11-15: a snapshot is a map from tables to versions, and each version
+  carries its table's identity (§5.4).
+- **D21** (Alex, 2026-11-15, after the adversarial reviews of #40). A
+  program's step is a named `SELECT` with functional meaning: a state
+  table means its value when the run began, and order comes from reads.
+  This supersedes the amendment, agreed and then reversed the same day,
+  that a step could also be `INSERT OVERWRITE`, which neither DataFusion's
+  `MemTable` nor DuckDB runs (S3.3). Publishing is a compare-and-set on
+  versions: a state table replaced during a run is `Error::Conflict`,
+  unless the run overrides it with `OnConflict::Overwrite` (§5.4).
+  Amended the same day, after the review of `Program`: a run has snapshot
+  isolation, Delta Lake's default `WriteSerializable` level, which Alex
+  chose as the default; the counter's rules are in §5.4; a compiled
+  program fails on a table dropped or registered again (`Error::Stale`)
+  instead of reading the old one; and a run's snapshot lists only what the
+  program reads. Steps may later be given as DataFusion `LogicalPlan`s as
+  well as SQL, which Alex accepted, to be sketched before the Python
+  binding (#49).
 
 ### Proposed
 
 <details>
-<summary>Proposals P-A to P-Y, for approval</summary>
+<summary>Proposals still open, for approval</summary>
 
-P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
+P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6, and P-B, P-D,
+P-J, P-M and P-R became D14.
 
 - **P-A.** The runtime is a separate project. einfold stays free of device
   execution, and keeps its CPU operator (xarray-sql#307).
-- **P-B.** The unit of work is a program with explicit state, lowered and
-  compiled as a JAX function is (R3, R5, §5.4).
 - **P-C.** Design B, staged from B-0 (§6.2). It needs an einfold design
   change approved by its maintainer. Spike 1 closed design C for the
   milestones.
-- **P-D.** ddx and einfold come in through integrations, which implement
-  their public interfaces and depend on their published types. Neither
-  depends on the runtime, and the core depends on neither (§5.8).
 - **P-E.** Where a value is held is the runtime's default, recorded in the
   schedule and open to the developer's override (R7, R10). ddx draws step
   boundaries, and the runtime changes them only through ddx's options and
@@ -1830,16 +2071,10 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
 - **P-I.** The runtime chooses save points with einfold's report, and
   passes them to ddx as options. No frontend runs a chain rule of its own
   (§6.4).
-- **P-J.** A program's reference is the engine it runs on, and
-  disagreements between engines are found in tests and filed upstream
-  (S4.4).
 - **P-K.** One label marker serves regions, policies, provenance, hints,
   bindings and metrics (§5.5).
 - **P-L.** Reproducibility is stated per implementation, and a session may
   require it (R9).
-- **P-M.** The schedule is the device plans plus what crosses steps, every
-  choice in it is visible, overrides are binding, and impossible ones fail
-  compilation (R10, §5.6).
 - **P-N.** Developers bind their own kernels to labelled nodes, from
   Python or Rust, with the node's SQL as the specification. einfold's
   nodes are bindings made automatically (§5.7).
@@ -1850,9 +2085,6 @@ P-F, P-G and P-H of earlier drafts became decisions D3, D4 and D6.
 - **P-Q.** A device plan is a DataFusion physical plan with `KernelExec`
   and `CopyExec` nodes, passing handle batches between device nodes, under
   the three rules spike 7 found (§5.3).
-- **P-R.** Every extension attaches to DataFusion the same way, the runtime,
-  its integrations and XQL's projects alike: a builder method in Rust, and
-  an extension object for `with_extensions` in Python (§5.1, §5.8).
 - **P-S.** Parallelism is partitioning. Base and state tables declare their
   distribution in SQL (D9), the planner derives intermediates through
   DataFusion's physical properties and a cost model, and collectives are

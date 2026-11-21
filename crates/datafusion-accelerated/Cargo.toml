@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 Alexander Sky Merose <al@merose.com> & datafusion-accelerated Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "datafusion-accelerated"
+description = "Runs Apache DataFusion physical plans on GPUs and other devices."
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+datafusion.workspace = true
+futures.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+datafusion-ffi.workspace = true
+tokio.workspace = true
