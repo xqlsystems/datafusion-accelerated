@@ -37,6 +37,7 @@ moving that work here is
 | The native module, `_native`: `shared_ctes`, which splits a `SELECT` into its common table expressions, and `_SortedArrowTable`, a table that declares its sort order | xarray-sql's `src/shared.rs`, at `a1d237a` on Ray's branch `codex/numerical-value-identities` | with `SharedExecutor`, once DataFusion computes a shared CTE once (#39, xarray-sql#290) |
 | `SharedExecutor` (`shared.py`), which computes each shared CTE once per run | xarray-sql#302, to `a1d237a` | once DataFusion computes a shared CTE once (#39, xarray-sql#290) |
 | `DenseExecutor` (`dense.py`, `_dense_*.py`), which runs SQL on compact arrays, the MLX operators (`mlx.py`) and `register_erf` (`math.py`) | xarray-sql#303, to `a1d237a` | M2 on Apple's GPUs, then M5 |
+| `TrainingSession` (`training.py`), which keeps a whole training step on the GPU | xarray-sql#305, to `a1d237a` | wrapped behind `Program` at M1; retires at M6 |
 
 The milestones are in the design, [§12.2](../../docs/design.md).
 
