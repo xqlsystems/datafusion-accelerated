@@ -32,5 +32,12 @@ dev = [
 ]
 
 [build-system]
-requires = ["uv_build>=0.9.30,<0.10.0"]
-build-backend = "uv_build"
+# maturin builds the native module, datafusion_accelerated_mlx._native, from
+# the Rust in rust/ (Cargo.toml).
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "src"
+module-name = "datafusion_accelerated_mlx._native"
+features = ["pyo3/extension-module"]

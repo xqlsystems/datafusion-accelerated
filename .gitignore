@@ -15,3 +15,5 @@ wheels/
 
 # Rust build output
 /target/
+/experimental/mlx/target/
+/experimental/mlx/src/**/*.so

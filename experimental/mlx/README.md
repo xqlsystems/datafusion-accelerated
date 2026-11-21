@@ -34,10 +34,15 @@ moving that work here is
 | Part | From | Retires at |
 |---|---|---|
 | `DenseProgram`, which interprets DataFusion's logical operators on compact arrays, and its proofs | einfold#157 and Ray's fork of einfold, to `3108f7a` | M6 (B-2) |
+| The native module, `_native`: `shared_ctes`, which splits a `SELECT` into its common table expressions, and `_SortedArrowTable`, a table that declares its sort order | xarray-sql's `src/shared.rs`, at `a1d237a` on Ray's branch `codex/numerical-value-identities` | with `SharedExecutor`, once DataFusion computes a shared CTE once (#39, xarray-sql#290) |
 
 The milestones are in the design, [§12.2](../../docs/design.md).
 
 ## Using it
+
+The package has a native module in Rust (`rust/`), which maturin builds
+when uv installs the package, so installing it from source needs a Rust
+toolchain, 1.94 or later.
 
 ```sh
 uv run --project experimental/mlx pytest experimental/mlx/tests
